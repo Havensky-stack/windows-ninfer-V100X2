@@ -3,6 +3,9 @@
 2026-10-14，本机的主要性能差距是默认关闭 MTP，以及 GRID/WDDM、无 P2P 环境下
 频繁小块跨卡交换的延迟。已测得跨卡路径的成本；尚未把它进一步拆分为驱动版本、
 WDDM 调度、主机内存中转和平台拓扑各自的贡献，不能承诺升级驱动即可达到上游速度。
+同日切换双卡 TCC 后，短输入数数的普通解码、MTP3、DFlash7 分别测得
+36.19、122.69、189.50 committed tok/s，较优化后的 WDDM 提高 23%–30%；
+P2P 仍不可用，见下文 TCC 对照。这些结果不代表长上下文或一般问答速度。
 
 ## 完整请求
 
@@ -226,26 +229,65 @@ target 2532 对 speculative 561、logit deficit 0.125（1/64）。严格测试�
 
 ## TCC 和 llama.cpp
 
-本机补查：CUDA Driver API `cuDeviceCanAccessPeer` 双向均返回 0；NVML 的双向
+切换前 WDDM 补查：CUDA Driver API `cuDeviceCanAccessPeer` 双向能力值均为 0；NVML 的双向
 P2P read/write 状态均为 `IOH_TOPOLOGY_NOT_SUPPORTED`，PCI P2P 状态为
-`NOT_SUPPORTED`，NVLink 链路均 inactive。当前和待生效驱动模式均为 WDDM。
+`NOT_SUPPORTED`，NVLink 链路均 inactive。当时当前和待生效驱动模式均为 WDDM。
 在场设备的 Windows PnP 路径分别为 `PCIROOT(0)#PCI(0300)#PCI(0000)` 和
 `PCIROOT(80)#PCI(0200)#PCI(0000)`；主板 JGINYUE X99-8D3/2.5G Server，
 两颗 Xeon E5-2696 v3。两卡确实分属不同 PCIe 根。
 
 [CUDA 12.8 P2P 文档](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html#peer-to-peer-memory-access)
 以设备 peer-capability 查询和实际 PCIe/NVLink 拓扑为准。当前 NInfer 无法绕过这个
-不支持结果启用真正 P2P；mapped-host 通信仍经过主机内存。TCC 后需重新查询并验证
-双向访问，不能承诺切模式就能解决。如果仍报拓扑不支持，下一步是核实同一 CPU/PCIe
-根下的槽位连接方案；NVLink 则需检查 SXM2 底板/转接方案是否有实际互联。当前证据
-尚未分离驱动模式与跨根拓扑各自的影响，不说明两张 V100 本身永久不支持 P2P。
+不支持结果启用真正 P2P；mapped-host 通信仍经过主机内存。
+
+2026-10-14，使用原 GRID 553.62 的普通 `-dm 1` 成功设置两卡，重启后已核实
+current/pending 均为 **TCC**。CUDA 双向 peer 查询 API 调用成功，但能力值仍为 **0**；
+NVML 双向 read/write 仍为 **`IOH_TOPOLOGY_NOT_SUPPORTED`**，PCI 为
+`NOT_SUPPORTED`，所有 NVLink 链路仍 inactive。结果保存于本地
+`build-tools/driver-mode/p2p-after-tcc.json`。因此本机在当前驱动及固定拓扑下，
+切 TCC 没有启用 P2P；不能将这个结果推广为所有跨根平台或 V100 永久不支持 P2P。
+用户已明确无法换槽；若继续调查 NVLink，需要先核实 SXM2 底板/转接板型号和
+实际互联布线，不能假设普通桥接器可用。没有尝试绕过驱动能力检查。
 
 [CUDA 12.8 Windows 安装指南](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-installation-guide-microsoft-windows/index.html)
 及 [NVIDIA SMI 文档](https://docs.nvidia.com/deploy/nvidia-smi/index.html)说明：TCC 面向
 计算、可降低内核启动延迟，但不能承担 Windows 显示/游戏图形渲染。用户已选择推理用
-TCC、游戏恢复 WDDM，并接受重启；应在同负载软件对照后再测，不能把更换驱动或
-切换 TCC 当成已证明的提速。当前 553.62 的命令选项应以本机 help 为准，不能套用
-新版文档才有的自动重启控制选项。没有更改驱动、模式、功耗或时钟。
+TCC、游戏恢复 WDDM，并接受重启。当前 553.62 的命令选项应以本机 help 为准，不能套用
+新版文档才有的自动重启控制选项。本次只切换驱动模式，没有更换驱动、CUDA、功耗或时钟。
+本机恢复入口为 `build-tools/driver-mode/restore-wddm.cmd`，会通过 UAC 对已记录的
+两张 V100 UUID 执行 `-dm 0`，随后需重启。也可在管理员终端对已核实的两卡分别
+执行 `nvidia-smi -i <GPU-UUID> -dm 0`；脚本不自动重启电脑。
+
+### TCC 同负载对照
+
+复用上述 Release 二进制和 Coder390 v3，TP2、Graph、INT8 group-64 KV、chunk 256，
+同一“从1数到300”提示和采样参数。每次输入 19、输出 1391 tokens，无前缀缓存命中。
+每种模式的请求和 Engine 配置均已与其 WDDM 记录核对相同；普通/MTP3 的容量为
+131072，DFlash7 为 98304，容量不代表实际占用。各后端之间空闲至少三分钟。
+
+| 模式 | 优化后 WDDM decode tok/s | TCC decode tok/s | 提升 | TCC 客户端耗时 |
+|---|---:|---:|---:|---:|
+| 普通解码 | 28.08 | 36.19 | 28.9% | 38.51 秒 |
+| MTP3，optimized proposal head | 94.68 | 122.69 | 29.6% | 11.44 秒 |
+| DFlash7，full proposal head | 153.70 | 189.50 | 23.3% | 7.43 秒 |
+
+每种模式分别与对应 WDDM 答案逐字节一致，均完整数到 300；这不表示三个模式
+彼此输出完全相同。MTP 接受 1044/1044 drafts、348 轮；DFlash 接受 1217/1218、
+174 轮，均与各自 WDDM 相同。decode 吞吐为 1390 个已提交 decode tokens 除以
+服务端 decode 时间；客户端耗时包括 prefill/传输但不含模型加载或冷却。
+TCC 三次模型启动分别耗时 131.19、22.77、30.76 秒，第一项为重启后首次加载；
+没有控制磁盘缓存状态，不能据此归因驱动模式对加载速度的影响。
+
+这是当前产品自动路由的端到端模式对照：WDDM 使用小消息 mapped-host 优化，
+TCC 使用现有非 P2P DMA 中转路径，不是固定通信实现后的纯驱动调度微基准。
+TCC 没有启用 P2P；提升不能归因于 P2P，也未进一步拆分调度和传输贡献。
+每个结果只有一次完整请求，未建立跨次波动范围。高度可预测的短输入数数结果
+不能证明一般问答、85K 占用或相对 LM Studio 的收益；此前 MTP/DFlash 的
+1/64 严格行为门失败仍有效，应用默认仍为普通解码。
+本地结果为 `build-tools/count300-tcc/`、`count300-tcc-mtp/`、
+`count300-tcc-dflash7/`，对照摘要为 `build-tools/driver-mode/tcc-comparison.json`。
+
+### llama.cpp 对照边界
 
 [llama.cpp 参数定义](https://github.com/ggml-org/llama.cpp/blob/master/common/arg.cpp)
 默认 split-mode 为 layer，按层拆分模型；它与 NInfer 每层做双卡张量并行的通信模式
