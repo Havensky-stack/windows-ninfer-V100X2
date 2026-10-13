@@ -842,10 +842,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    // Keep the existing module/executable margin, plus 12 MiB for the second
-                    // greedy definition/executable topology. Model/state/workspace and loaded
-                    // forward modules are shared by the two routes, not reserved twice.
-                    return ((final_visible <= 4096 ? 12ULL : 82ULL) + 12ULL) * kMiB;
+                    // TP2 needs the ordinary two-device module/executable margin as well:
+                    // WDDM SM70 mapped-host collectives use kernel nodes instead of copy nodes
+                    // and measured 26 MiB at C=1, 4096 capacity, MTP3 (old bound: 24 MiB).
+                    // Add 12 MiB for the greedy topology; model/state/workspace remain shared.
+                    const std::uint64_t small_context = impl->tp == 2 ? 20ULL : 12ULL;
+                    return ((final_visible <= 4096 ? small_context : 82ULL) + 12ULL) * kMiB;
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,

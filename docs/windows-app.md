@@ -37,7 +37,7 @@ HTTP 调用既有 `ninfer-serve.exe`；没有第二套推理实现，也不改�
 真实模型集成检查通过启动器的环境检测、服务启动、健康检查、Chat Completions 和停止路径：
 
 ```powershell
-$app = (Resolve-Path '.\build-release\NInfer-Windows-V100X2-0.1.0\NInfer.exe').Path
+$app = (Resolve-Path '.\build-release\NInfer-Windows-V100X2-0.1.1\NInfer.exe').Path
 $model = (Resolve-Path '.\models\Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer').Path
 $log = Join-Path $PWD 'build-release\launcher-smoke.log'
 $process = Start-Process $app -ArgumentList '--smoke', ('"' + $model + '"'), ('"' + $log + '"') -WindowStyle Hidden -PassThru -Wait

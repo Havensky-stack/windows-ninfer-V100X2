@@ -3,6 +3,8 @@
 普通用户优先使用[中文首页的便携应用](../README.md#小白使用下载解压双击)，无需安装编译环境。
 启动器与发行打包说明见 [Windows 应用维护](windows-app.md)。本文面向自行编译和复查验证的用户。
 
+本机测速与跨卡延迟归因见 [Windows 性能诊断](windows-performance.md)。
+
 本 fork 的 Windows 工作以 `tuxKOH/ninfer-V100X2` 的双卡执行路径为基础，参考
 [ww485000 的 Windows 单卡分支](https://github.com/ww485000/ninfer-windows-v100/tree/v100-sm70)
 的平台适配。Windows CLI/API 已完成整个引擎的编译、链接和 `--help` 启动检查。
@@ -175,6 +177,10 @@ Coder390 真实容器的 DFlash2 v3 load-plan 检查通过，包括 66 个投影
 这个结果不能认定 MTP 满足本项目的严格行为契约，也不证明源模型微调/量化质量。
 因此 `serve.ps1` 默认关闭投机解码。上面的 MTP 容量数据只说明内存和短请求能够执行，
 不构成对 MTP 正确性的认证；DFlash、Vision 和长期满容量请求也未做本机验收。
+
+0.1.1 mapped-host 通信优化后的复核结果相同：Graph/eager 与采样路线检查通过，
+普通对照 0/64；MTP 仍在 probe 1、位置 31 发生同一处 0.125-logit 差异。
+4K MTP 的 Graph 预算已从 24 MiB 修正为 32 MiB，以容纳新增的传输内核节点。
 
 复现实际模型检查（模型路径必须显式指定）：
 

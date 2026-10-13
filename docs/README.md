@@ -11,6 +11,7 @@ Windows; the Windows guide identifies the actual local evidence.
 |---|---|
 | [Windows application](windows-app.md) | portable launcher, bundled dependencies, model download, tests and release packaging |
 | [Windows toolchain](windows-toolchain.md) | local GRID/WDDM, isolated CUDA 12.8/MSVC, native build, real inference and capacity checks |
+| [Windows performance](windows-performance.md) | measured cross-card bottleneck, mapped-host transport, counting workload and TCC comparison limits |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, dual-GPU (`--tp 2`) execution, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, dual-GPU serving, and YaRN extended context |
 | [PyQt 控制台](gui.md) | 图形化启动/停止 API、TP/设备、上下文/KV、MTP/DFlash、缓存、并发和采样参数 |

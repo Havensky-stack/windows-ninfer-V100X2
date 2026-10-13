@@ -105,7 +105,9 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 ## Current product contract
 
 This fork additionally targets native Windows 11 on two V100-SXM2 16 GB cards in GRID/WDDM
-mode. Keep the user's graphics/game configuration and existing system CUDA installation intact.
+mode. The user also authorizes evaluating TCC for inference and switching back to WDDM for
+games, including driver changes and a planned reboot when required. Keep the existing system
+CUDA installation intact. Mode/driver changes must retain a concrete return-to-gaming path.
 Use the isolated CUDA 12.8/MSVC 14.44 environment under `tools/windows`; Windows platform
 adaptations preserve the existing Engine, TP2 schedules, artifact formats and numerical Ops.
 The Windows qualification scope and commands live in `docs/windows-toolchain.md`. Linux or

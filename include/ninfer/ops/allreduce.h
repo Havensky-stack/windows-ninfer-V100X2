@@ -16,9 +16,11 @@
 // the driver grants peer access and startup validates it, the copy is a direct device-to-device
 // PCIe transfer. On this V100 topology the translated IOMMU domain prevents direct P2P; CUDA's
 // UVA D2D implementation then selects its driver-managed staging path. Startup validates the
-// exact UVA D2D route in either case. The collectives never allocate or copy through an explicit
-// host buffer, and callers need no peer-access branch; enable_peer_access() only reports whether
-// direct peer access was qualified.
+// exact UVA D2D route in either case. Windows WDDM SM70 TP2 without direct peers uses
+// startup-owned mapped pinned mailboxes for reductions up to 80 KiB. Each rank publishes its
+// original bytes with a system fence before inputs_ready; the peer reads those bytes into its
+// device staging before pull_done. The same barriers protect mailbox reuse. Larger reductions
+// and gathers retain DMA. TCC retains its existing transport. Callers need no transport branch.
 // Small qualified SM70 allreduces may read the peer operand directly in a sum kernel, writing
 // only their own staging. Both reads retire before either original operand is overwritten.
 //
@@ -82,12 +84,14 @@
 // device's own stream, or lets subsequent stream-ordered work depend on it, as usual.
 
 #include "core/device.h" // DeviceContext, ExecutionContext
+#include "core/mapped_peer_transfer.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaEvent_t
 
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <span>
 
 namespace ninfer::ops {
@@ -144,6 +148,9 @@ public:
     }
 
     [[nodiscard]] bool direct_peer_access() const noexcept { return direct_peer_access_; }
+    [[nodiscard]] const MappedPeerTransfer* mapped_transfer() const noexcept {
+        return mapped_transfer_ ? &*mapped_transfer_ : nullptr;
+    }
     [[nodiscard]] int ranks() const noexcept { return ranks_; }
 
     // False for a moved-from instance.
@@ -156,6 +163,7 @@ public:
     }
 
 private:
+    std::optional<MappedPeerTransfer> mapped_transfer_;
     std::array<cudaEvent_t, kMaximumExecutionDevices> inputs_ready_{};
     std::array<cudaEvent_t, kMaximumExecutionDevices> pull_done_{};
     bool direct_peer_access_ = false;

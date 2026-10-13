@@ -101,8 +101,70 @@ cudaGraph_t capture_both(const ExecutionContext& ec, Body&& body) {
     return graph;
 }
 
-// `ne0` is the contiguous dimension and `ne1` the outer one, so a 1-D buffer passes ne1 == 1 and
-// the real row-parallel residual passes {5120, 48}.
+int run_mapped_bytes(const ExecutionContext& ec, const ops::PeerEvents& events) {
+    const auto* mapped = events.mapped_transfer();
+    if (!mapped) { return 0; }
+    int failures = 0;
+    // Exact byte oracle, including unaligned addresses and the final partial word.
+    for (const std::size_t bytes : {std::size_t{1}, std::size_t{10240}, std::size_t{81918},
+                                   std::size_t{81919}, std::size_t{81920}}) {
+        set_device(ec, 0);
+        GuardedDeviceBuffer source0(bytes + 4), destination0(bytes + 4);
+        set_device(ec, 1);
+        GuardedDeviceBuffer source1(bytes + 4), destination1(bytes + 4);
+        std::array<GuardedDeviceBuffer*, 2> source{&source0, &source1};
+        std::array<GuardedDeviceBuffer*, 2> destination{&destination0, &destination1};
+        const std::size_t offset = bytes % 2;
+        auto body = [&] {
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                mapped->publish(rank, static_cast<unsigned char*>(source[rank]->data()) + offset,
+                                bytes, ec.dev[rank]->stream);
+                cuda_check(cudaEventRecord(events.inputs_ready(rank), ec.dev[rank]->stream), "publish bytes");
+            }
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                cuda_check(cudaStreamWaitEvent(ec.dev[rank]->stream, events.inputs_ready(1-rank), 0), "wait bytes");
+                mapped->pull(rank, static_cast<unsigned char*>(destination[rank]->data()) + offset,
+                             bytes, ec.dev[rank]->stream);
+            }
+        };
+        auto graph = capture_both(ec, body);
+        cudaGraphExec_t executable;
+        cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "byte graph");
+        for (int replay = 0; replay < 3; ++replay) {
+            std::array<std::vector<unsigned char>, 2> input;
+            for (int rank = 0; rank < 2; ++rank) {
+                input[rank].resize(bytes);
+                for (std::size_t i = 0; i < bytes; ++i) {
+                    input[rank][i] = static_cast<unsigned char>(i * 37 + rank * 71 + replay * 19);
+                }
+                set_device(ec, rank);
+                source[rank]->copy_from_host(input[rank].data(), bytes, offset);
+                destination[rank]->fill(0xa5);
+            }
+            retire_staging(ec);
+            set_device(ec, 0);
+            cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "byte replay");
+            synchronize_both(ec);
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                std::vector<unsigned char> actual(bytes + 4), expected(bytes + 4, 0xa5);
+                std::copy(input[1-rank].begin(), input[1-rank].end(), expected.begin() + offset);
+                destination[rank]->copy_to_host(actual.data(), actual.size());
+                if (actual != expected) { ++failures; std::cerr << "mapped bytes differ at size " << bytes << '\n'; }
+                failures += source[rank]->verify_guards("mapped source");
+                failures += destination[rank]->verify_guards("mapped destination");
+            }
+        }
+        cuda_check(cudaGraphExecDestroy(executable), "byte graph destroy");
+        cuda_check(cudaGraphDestroy(graph), "byte definition destroy");
+    }
+    std::cout << (failures ? "FAIL" : "PASS") << " exact mapped byte transfers\n";
+    return failures;
+}
+
+// `ne0` is contiguous, `ne1` outer: a vector uses ne1 == 1; the residual uses {5120, 48}.
 int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::uint32_t seed,
                        const ExecutionContext& ec, const ops::PeerEvents& events) {
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
@@ -561,6 +623,7 @@ int main() {
     const ops::PeerEvents events(ec, peer_access);
 
     int failures = 0;
+    failures += run_mapped_bytes(ec, events);
     // Real decode shape first: 5120 is the hidden dimension all-reduced 128 times per token.
     failures += run_allreduce_case("allreduce_sum [5120]", 5120, 1, 101u, ec, events);
     failures += run_allreduce_case("allreduce_sum [5120,4]", 5120, 4, 111u, ec, events);

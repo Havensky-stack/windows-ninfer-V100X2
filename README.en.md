@@ -11,6 +11,13 @@ MSVC 14.44 build, exact Coder390 v3 artifact/template admission, focused regress
 and a portable Chinese launcher with hardware checks, resumable model download, SHA-256
 verification, service lifecycle controls and a simple single-turn chat interface.
 
+Current source and the local 0.1.1 build use mapped-host transfers for small WDDM TP2
+reductions. On the same count-to-300 request, committed ordinary decode rose from 16.49
+to 28.08 tok/s; experimental MTP3 rose from 57.07 to 94.68 tok/s. Answers were byte-identical
+before and after. The input occupied only 19 tokens, and MTP accepted all drafts; this is not
+a long-context or general-chat claim. See [Windows performance](docs/windows-performance.md).
+The published 0.1.0 ZIP does not include this optimization.
+
 Download and extract the complete Windows ZIP, then run `NInfer.exe`. Runtime dependencies
 are bundled: no Python, CUDA Toolkit or Visual Studio installation is needed. Install a suitable
 NVIDIA driver first. The optional model download is 23.8GB and is not included in the ZIP.

@@ -223,7 +223,7 @@ namespace NInferWindows {
         internal Launcher(bool preview = false) {
             Directory.CreateDirectory(Runtime.StateDir);
             runtime = new Runtime(AppDomain.CurrentDomain.BaseDirectory, AddLog);
-            Text = "NInfer · Windows 双 V100 · 0.1.0 预览版";
+            Text = "NInfer · Windows 双 V100 · 0.1.1 预览版";
             Font = new Font("Microsoft YaHei UI", 10); Size = new Size(1000, 800); MinimumSize = new Size(850, 680);
             StartPosition = FormStartPosition.CenterScreen;
             var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 9 };

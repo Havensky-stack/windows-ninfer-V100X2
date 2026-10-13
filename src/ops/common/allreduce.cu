@@ -400,6 +400,16 @@ PeerEvents::PeerEvents(const ExecutionContext& ec, bool direct_peer_access)
     : direct_peer_access_(direct_peer_access), ranks_(ec.tp) {
     require_collective_devices(ec, "PeerEvents: requires two or four distinct devices");
     const CurrentDeviceGuard guard;
+#if defined(_WIN32)
+    // Narrow WDDM reductions avoid the driver's high-latency implicit staging.
+    // TCC and direct peers retain their established transport.
+    if (ec.tp == 2 && !direct_peer_access && ec.dev[0]->sm() == 70 &&
+        !ec.dev[0]->props.tccDriver && !ec.dev[1]->props.tccDriver &&
+        ec.dev[0]->props.canMapHostMemory && ec.dev[1]->props.canMapHostMemory) {
+        mapped_transfer_.emplace(std::array<int, 2>{ec.dev[0]->device, ec.dev[1]->device}, 81920);
+        std::fprintf(stderr, "[ninfer] WDDM SM70 TP2: mapped-host allreduce up to 80 KiB\n");
+    }
+#endif
     // Create through a local table so a mid-way failure destroys what was already created instead
     // of leaking it; only a fully constructed set is published into the members.
     std::array<cudaEvent_t, 2 * kMaximumExecutionDevices> created{};
@@ -448,7 +458,8 @@ PeerEvents::~PeerEvents() {
 }
 
 PeerEvents::PeerEvents(PeerEvents&& other) noexcept
-    : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_),
+    : mapped_transfer_(std::move(other.mapped_transfer_)),
+      inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_),
       direct_peer_access_(other.direct_peer_access_), ranks_(other.ranks_) {
     other.inputs_ready_ = {};
     other.pull_done_    = {};
@@ -461,6 +472,7 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     // held, in exactly one place.
     inputs_ready_.swap(other.inputs_ready_);
     pull_done_.swap(other.pull_done_);
+    mapped_transfer_.swap(other.mapped_transfer_);
     std::swap(direct_peer_access_, other.direct_peer_access_);
     std::swap(ranks_, other.ranks_);
     return *this;
@@ -513,18 +525,20 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
     // measured small-message launch-latency benefit reverses for wide prefill transfers.
     bool direct_sum = events.direct_peer_access() && bytes <= 81920;
     for (int rank = 0; rank < ec.tp; ++rank) { direct_sum &= ec.dev[rank]->sm() == 70; }
+    const auto* mapped = events.mapped_transfer();
+    const bool mapped_copy = mapped && bytes <= mapped->capacity();
 
     // Phase A: publish "my operand is complete" on each stream, before any wait observes it.
     for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
+        if (mapped_copy) { mapped->publish(rank, buffer[rank].data, bytes, local.stream); }
         CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
     }
 
-    // Phase B: each rank pulls the peer operand through CUDA's UVA device-to-device path. On
-    // translated IOMMU domains the driver transparently stages this copy through host memory;
-    // keeping it as one captured D2D node avoids the extra D2H/H2D event chain and is materially
-    // faster on the V100 PCIe bridge.
+    // Phase B: narrow WDDM payloads pull from the peer's published mailbox. The
+    // other DMA routes use CUDA UVA D2D and retain driver-managed host staging
+    // where peer access is unavailable.
     for (int rank = 0; rank < ec.tp; ++rank) {
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
@@ -533,7 +547,9 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
                 CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(other), 0));
             }
         }
-        if (direct_sum) {
+        if (mapped_copy) {
+            mapped->pull(rank, staging[rank].data, bytes, local.stream);
+        } else if (direct_sum) {
             if (ec.tp == 2) {
                 detail::allreduce_peer_sum_launch(buffer[rank], buffer[1 - rank], staging[rank],
                                                   local.stream);

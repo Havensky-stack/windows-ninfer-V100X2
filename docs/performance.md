@@ -1,5 +1,8 @@
 # Serving performance
 
+Windows/GRID measurements and the local dual-V100 latency diagnosis are documented in
+[Windows performance](windows-performance.md). The inherited Linux results below are separate measurements.
+
 ## V100X2 measurement and acceptance
 
 ### Separate NVLink deployment: TP2 stage
