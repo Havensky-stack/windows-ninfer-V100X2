@@ -181,10 +181,10 @@ private:
  * sum routes use FP32 accumulation and one round-to-nearest-even on
  * store. The Op holds no persistent state and allocates nothing.
  *
- * Requires `ec.tp` in {2,4} and live events for the same rank count. Consecutive calls need no
+ * Requires `ec.device_count` in {2,4} and live events for the same rank count. Consecutive calls need no
  * host synchronization between them.
  */
-// Both spans have ec.tp entries. TP4 staging is contiguous BF16 with at least
+// Both spans have ec.device_count entries. TP4 staging is contiguous BF16 with at least
 // 4 * buffer[r].numel() elements: the DMA route retains all contributions until
 // every source read has retired, then reduces once in rank order 0,1,2,3.
 // The independent oracle is the FP64 sum of all represented BF16 operands;
@@ -213,7 +213,7 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
  * pulls the peer's block. The transformation is a pure relocation of storage, so it is verified by
  * exact byte comparison. The Op holds no persistent state and allocates nothing.
  *
- * Requires `ec.tp` in {2,4} and live events for the same rank count. Consecutive calls need no
+ * Requires `ec.device_count` in {2,4} and live events for the same rank count. Consecutive calls need no
  * host synchronization between them.
  */
 void allgather_rows(std::span<const Tensor> destination, std::span<const Tensor> part,
@@ -231,7 +231,7 @@ void gather_columns_rank0(const Tensor& destination, std::span<const Tensor> par
                           const ExecutionContext& ec, const PeerEvents& events);
 
 // Exact relocation from rank 0 to each other active rank. Destinations are indexed by
-// rank minus one and contain ec.tp - 1 entries. All tensors have the same contiguous
+// rank minus one and contain ec.device_count - 1 entries. All tensors have the same contiguous
 // dtype and shape. Uses the qualified UVA D2D transport and orders rank 0's next overwrite after
 // rank 1 has consumed the source, including under CUDA Graph capture.
 void broadcast_rank0(const Tensor& source, std::span<const Tensor> destinations,

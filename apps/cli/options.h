@@ -29,6 +29,8 @@ struct Options {
     std::uint32_t prefill_chunk  = 1024;
     int device                   = 0;
     int tp                       = 1;
+    int pp                       = 1;
+    std::uint32_t pipeline_chunks = 8;
     int storage_device           = -1;
     // Resolved device ids, one per tp rank. Always populated by parse_options() (from --devices,
     // or synthesized as {device} when --devices is omitted) so it is safe to forward directly to
@@ -37,6 +39,7 @@ struct Options {
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     RamKvOptions ram_kv;
+    bool volta_long_attention = false;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;

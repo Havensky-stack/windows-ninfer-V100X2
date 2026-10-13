@@ -73,18 +73,30 @@ std::vector<int> resolve_execution_device_ids(const EngineOptions& options) {
     if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
         throw std::invalid_argument("EngineOptions.tp must be 1, 2 or 4");
     }
+    if (options.pp != 1 && options.pp != 2) {
+        throw std::invalid_argument("EngineOptions.pp must be 1 or 2");
+    }
+    if (options.pp == 2 && (options.tp != 1 || options.max_concurrency != 1 ||
+                           options.enable_vision ||
+                           options.storage_device >= 0 ||
+                           options.speculative.backend == SpeculativeBackend::DFlash)) {
+        throw std::invalid_argument("PP2 requires TP1 single-request Text/None/MTP without storage mode");
+    }
+    if (options.pipeline_chunks == 0 || options.pipeline_chunks > 8) {
+        throw std::invalid_argument("pipeline_chunks must be between 1 and 8");
+    }
     require_supported_tp_features(options);
     if (options.storage_device >= 0 && options.tp != 1) {
         throw std::invalid_argument("--storage-device requires --tp 1");
     }
     if (options.devices.empty()) {
-        if (options.tp != 1) {
-            throw std::invalid_argument("tensor-parallel execution requires an explicit --devices list");
+        if (options.tp * options.pp != 1) {
+            throw std::invalid_argument("parallel execution requires an explicit --devices list");
         }
         return {options.device};
     }
-    if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
-        throw std::invalid_argument("EngineOptions.devices size must equal tp");
+    if (options.devices.size() != static_cast<std::size_t>(options.tp * options.pp)) {
+        throw std::invalid_argument("EngineOptions.devices size must equal tp * pp");
     }
     return options.devices;
 }
@@ -225,7 +237,7 @@ public:
 
     ~Impl() noexcept {
         executor.emplace<std::monostate>();
-        for (int rank = execution.tp - 1; rank >= 0; --rank) {
+        for (int rank = execution.device_count - 1; rank >= 0; --rank) {
             try {
                 execution.dev[static_cast<std::size_t>(rank)]->synchronize();
             } catch (...) {}

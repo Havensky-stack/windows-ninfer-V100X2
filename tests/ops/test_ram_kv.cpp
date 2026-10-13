@@ -2,6 +2,7 @@
 #include "core/device.h"
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/kv_retrieval.h"
 #include "ops/gqa_attention_fixture.h"
 
 #include <cstring>
@@ -12,6 +13,129 @@ using namespace ninfer::test;
 using namespace ninfer::test::gqa;
 
 namespace {
+
+int retrieval_oracles(int heads, DType dtype, int base) {
+    const Geometry geometry{"retrieval", heads * 6, heads};
+    const int tokens = 193, end = base + tokens;
+    auto host = make_cache(geometry, dtype, end, 773);
+    DeviceCache cache(host, MappingPattern::Fragmented);
+    const auto view = cache.batch_view();
+    const int pages = view.block_tables.ne[0];
+    std::vector<int> positions(tokens);
+    for (int t = 0; t < tokens; ++t) { positions[t] = base + t; }
+    const int span[2] = {base + 13, base + 129};
+    const auto q = make_bf16_values(256 * heads * 6 * tokens, 81, -0.5f, 0.5f);
+    const auto qb = to_bf16_bits(q);
+    GuardedDeviceBuffer dq(qb.size() * 2), dp(tokens * 4), ds(8),
+        dsum(heads * 256 * 4), dfallback(heads * 256 * 4), dc(4),
+        dk(pages * heads * 256 * 4);
+    dq.copy_from_host(qb.data(), qb.size() * 2);
+    dp.copy_from_host(positions.data(), tokens * 4);
+    ds.copy_from_host(span, 8);
+    CUDA_CHECK(cudaMemset(dsum.data(), 0, heads * 256 * 4));
+    CUDA_CHECK(cudaMemset(dc.data(), 0, 4));
+    CUDA_CHECK(cudaMemset(dk.data(), 0, pages * heads * 256 * 4));
+    Tensor tq(dq.data(), DType::BF16, {256, heads * 6, tokens}),
+        tp(dp.data(), DType::I32, {tokens}), ts(ds.data(), DType::I32, {2}),
+        sum(dsum.data(), DType::FP32, {256, heads}), fallback(dfallback.data(), DType::FP32, {256, heads}),
+        count(dc.data(), DType::I32, {1}), keys(dk.data(), DType::FP32, {256, heads, pages});
+    ops::kv_retrieval_query_summary(tq, tp, ts, sum, fallback, count, nullptr);
+    ops::kv_retrieval_key_summary(view, tp, {}, keys, {}, nullptr);
+    cuda_synchronize();
+    const auto actual_q = copy_from_guarded<float>(dsum, heads * 256);
+    const auto actual_f = copy_from_guarded<float>(dfallback, heads * 256);
+    const auto actual_k = copy_from_guarded<float>(dk, pages * heads * 256);
+    int failures = copy_from_guarded<int>(dc, 1)[0] != 116;
+    double max_q = 0, max_k = 0;
+    for (int h = 0; h < heads; ++h) {
+        for (int d = 0; d < 256; ++d) {
+            double expected_q = 0, expected_f = 0;
+            for (int t = 0; t < tokens; ++t) {
+                for (int g = 0; g < 6; ++g) {
+                    const double x = q[q_index(geometry, h * 6 + g, d, t)];
+                    expected_f += x;
+                    if (t >= 13 && t < 129) { expected_q += x; }
+                }
+            }
+            max_q = std::max({max_q, std::abs(actual_q[h * 256 + d] - expected_q),
+                                       std::abs(actual_f[h * 256 + d] - expected_f)});
+            for (int p = base / 64; p <= (end - 1) / 64; ++p) {
+                double expected_k = 0;
+                const int n = std::min(64, end - p * 64);
+                for (int t = 0; t < n; ++t) {
+                    const int position = p * 64 + t;
+                    double x = cache_value(host, true, h, position, d);
+                    if (d < 64) {
+                        const int partner = d < 32 ? d + 32 : d - 32;
+                        const double y = cache_value(host, true, h, position, partner);
+                        const double angle = position * std::pow(1e7, -2.0 * (d % 32) / 64);
+                        x = x * std::cos(angle) + (d < 32 ? y : -y) * std::sin(angle);
+                    }
+                    expected_k += x / n;
+                }
+                max_k = std::max(max_k, std::abs(actual_k[(p * heads + h) * 256 + d] - expected_k));
+            }
+        }
+    }
+    failures += max_q > 2e-5 || max_k > (base == 0 ? 2e-6 : 3e-4);
+    // Recompute an overwritten/truncated partial page with a masked provisional suffix.
+    const int valid = 7;
+    GuardedDeviceBuffer dv(4); dv.copy_from_host(&valid, 4);
+    ops::kv_retrieval_key_summary(view, tp, Tensor(dv.data(), DType::I32, {1}), keys, {}, nullptr);
+    cuda_synchronize();
+    const auto overwritten = copy_from_guarded<float>(dk, pages * heads * 256);
+    for (int h = 0; h < heads; ++h) {
+        for (int d = 64; d < 256; ++d) {
+            double expected = 0;
+            const int page = base / 64, n = base + valid - page * 64;
+            for (int t = 0; t < n; ++t) { expected += cache_value(host, true, h, page * 64 + t, d) / n; }
+            failures += std::abs(overwritten[(page * heads + h) * 256 + d] - expected) > 2e-6;
+        }
+    }
+    std::cout << "retrieval FP64 Q/K oracle H=" << heads << " base=" << base
+              << " " << cache_name(dtype) << " max Q=" << max_q << " K=" << max_k
+              << " failures=" << failures << '\n';
+    return failures;
+}
+
+int score_oracle(int heads) {
+    const int pages = 8, layers = 3, blocks = 4;
+    auto keys = make_bf16_values(256 * heads * pages * layers, 45, -0.25f, 0.25f);
+    auto query = make_bf16_values(256 * heads * layers, 46, -0.5f, 0.5f);
+    auto fallback = make_bf16_values(256 * heads * layers, 47, -0.5f, 0.5f);
+    const int counts[] = {19, 0, 5};
+    GuardedDeviceBuffer dk(keys.size()*4), dq(query.size()*4), df(query.size()*4), dc(12), ds(16);
+    dk.copy_from_host(keys.data(), keys.size()*4); dq.copy_from_host(query.data(), query.size()*4);
+    df.copy_from_host(fallback.data(), fallback.size()*4); dc.copy_from_host(counts, 12);
+    ops::kv_retrieval_scores(Tensor(dk.data(), DType::FP32, {256, heads, pages, layers}),
+        Tensor(dq.data(), DType::FP32, {256, heads, layers}),
+        Tensor(df.data(), DType::FP32, {256, heads, layers}), Tensor(dc.data(), DType::I32, {layers}),
+        391, Tensor(ds.data(), DType::FP32, {blocks}), nullptr);
+    cuda_synchronize();
+    const auto actual = copy_from_guarded<float>(ds, blocks);
+    double maximum = 0;
+    for (int b = 0; b < 3; ++b) {
+        double expected = 0;
+        for (int l = 0; l < layers; ++l) {
+            for (int h = 0; h < heads; ++h) {
+                double dot = 0, nq = 0, nk = 0;
+                for (int d = 0; d < 256; ++d) {
+                    const auto qi = (l*heads+h)*256+d;
+                    const auto ki = ((l*pages+b*2)*heads+h)*256+d;
+                    const double q = counts[l] ? query[qi] : fallback[qi];
+                    const double k = (static_cast<double>(keys[ki])+keys[ki+heads*256])/2;
+                    dot += q*k; nq += q*q; nk += k*k;
+                }
+                expected += dot/(std::sqrt(nq)*std::sqrt(nk)+1e-6)/(layers*heads);
+            }
+        }
+        maximum = std::max(maximum, std::abs(actual[b]-expected));
+    }
+    int failures = maximum > 2e-7 || actual[3] > -1e20;
+    std::cout << "retrieval FP64 cosine oracle H=" << heads << " max=" << maximum
+              << " failures=" << failures << '\n';
+    return failures;
+}
 
 int archive_roundtrip() {
     LayoutBuilder builder;
@@ -143,6 +267,14 @@ int sparse_attention(DType dtype, int tokens, bool cached) {
 int main() {
     if (cuda_unavailable()) { return 77; }
     int failures = archive_roundtrip();
+    for (int heads : {2, 4}) {
+        failures += score_oracle(heads);
+        for (auto dtype : {DType::BF16, DType::I8}) {
+            failures += retrieval_oracles(heads, dtype, 0);
+            failures += retrieval_oracles(heads, dtype, 85019);
+            failures += retrieval_oracles(heads, dtype, 260013);
+        }
+    }
     for (auto dtype : {DType::BF16, DType::I8}) {
         failures += sparse_attention(dtype, 4, false);
         failures += sparse_attention(dtype, 4, true);

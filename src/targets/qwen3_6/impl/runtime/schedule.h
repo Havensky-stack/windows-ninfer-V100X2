@@ -50,15 +50,14 @@ private:
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDevice restore;
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
         body(rank);
     }
 }
 
-// Rank 1's half of a tensor-parallel execution. Null at tp == 1, in which case every schedule
-// entry point below behaves exactly as it always has.
-struct TpPeerCore {
+// Non-primary device resources, bound either as a TP shard or a PP stage.
+struct PeerCore {
     const ExecutionContext* execution          = nullptr;
     const ops::PeerEvents* events              = nullptr;
     DeviceContext* device                      = nullptr;
@@ -99,7 +98,10 @@ struct ExecutionCore {
     // its text rope call sites, MTP ones included. All-null is the native constant-table path,
     // bit-for-bit, which is why the default value is the pre-YaRN behavior.
     std::array<ops::RopeFrequencyOverride, kMaximumExecutionDevices> rope_frequency{};
-    std::span<const TpPeerCore> peers;
+    std::span<const PeerCore> peers;
+    const PeerCore* pipeline = nullptr;
+    TokenId* pipeline_upload = nullptr;
+    bool volta_long_attention = false;
 };
 
 template <class Body>
@@ -113,12 +115,12 @@ auto rank_views(const ExecutionCore& execution, Body&& body) {
 }
 
 // Assembles the TextContext-side view of `peer`. Returns an empty optional at tp == 1.
-[[nodiscard]] inline std::array<TpExecution, kMaximumExecutionDevices - 1>
+[[nodiscard]] inline std::array<PeerExecution, kMaximumExecutionDevices - 1>
 tp_execution(const ExecutionCore& execution) {
-    std::array<TpExecution, kMaximumExecutionDevices - 1> result{};
+    std::array<PeerExecution, kMaximumExecutionDevices - 1> result{};
     for (std::size_t index = 0; index < execution.peers.size(); ++index) {
-    const TpPeerCore& peer = execution.peers[index];
-    TpExecution& out = result[index];
+    const PeerCore& peer = execution.peers[index];
+    PeerExecution& out = result[index];
     out.execution      = peer.execution;
     out.events         = peer.events;
     out.device         = peer.device;
@@ -132,6 +134,16 @@ tp_execution(const ExecutionCore& execution) {
     out.replay_records = peer.replay_records;
     }
     return result;
+}
+
+[[nodiscard]] inline std::optional<PeerExecution> pipeline_execution(const ExecutionCore& execution) {
+    if (execution.pipeline == nullptr) { return std::nullopt; }
+    const PeerCore& peer = *execution.pipeline;
+    return PeerExecution{.execution = peer.execution, .events = peer.events,
+                         .device = peer.device, .weights = peer.model, .work = peer.work,
+                         .state = peer.linear_attention, .io = peer.io,
+                         .prefill_hidden = peer.prefill_hidden, .batch_kv = peer.text_cache,
+                         .replay_records = peer.replay_records};
 }
 
 struct PrefillContext {
@@ -153,6 +165,7 @@ struct PrefillContext {
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_6::DFlashDecodeIngress* dflash_host_ingress = nullptr;
     std::int32_t rope_delta = 0;
+    bool capture_retrieval_query = true;
 };
 
 struct OrdinaryBatchContext {
@@ -164,7 +177,7 @@ struct OrdinaryBatchContext {
     Tensor& continuation_hidden_store;
     // Rank 1's own pinned copy of `host_ingress`, with every row's sampling counter pointer
     // nulled (ProgramImplCore::publish_peer_ordinary_ingress). Required whenever
-    // `execution.tp` is engaged; null at tp1.
+    // `execution.device_count` is engaged; null at tp1.
 };
 
 struct MtpBatchContext {

@@ -190,6 +190,8 @@ public:
     void release() noexcept;
     // Ranking is storage-policy input supplied by the model family, not interpreted by core.
     void prefer_pages(std::span<const std::int32_t> ranked_pages);
+    // A PP prefill wave may contain multiple not-yet-written chunks in already mapped pages.
+    void require_pages(std::uint32_t begin, std::uint32_t end);
     [[nodiscard]] std::uint64_t ram_transfer_bytes() const noexcept;
 
 private:

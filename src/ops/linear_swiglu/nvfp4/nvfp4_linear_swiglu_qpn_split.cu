@@ -38,6 +38,18 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), x_fp16, activation_count);
 
+    if (weight.layout == QuantLayout::VoltaQpnPrepacked && kIntermediate == 8704 &&
+        k == 5120 && t >= 4 && t <= 6) {
+        nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4PairedSwiGluOutput, half, true>
+            <<<kIntermediate / 32, 512, 0, stream>>>(
+                static_cast<const std::uint8_t*>(weight.qdata),
+                static_cast<const std::uint8_t*>(weight.scales), x_fp16,
+                kIntermediate, k, t, inverse_weight_divisor,
+                Nvfp4PairedSwiGluOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate});
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
     Weight gate_weight = weight;
     gate_weight.n      = kIntermediate;
 

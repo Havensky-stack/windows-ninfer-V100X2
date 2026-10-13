@@ -5,6 +5,7 @@
 #include "targets/qwen3_6/impl/runtime/yarn_rope.h"
 #include "targets/qwen3_6/impl/runtime/ram_kv_selection.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/kv_retrieval.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
@@ -15,6 +16,8 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -45,8 +48,8 @@ std::array<std::int32_t, 3> prompt_rope_position(const PreparedPromptData& promp
 // Makes one device current for the duration of a statement and restores the caller's. Peer-side
 // pool operations issue memsets and copies on the peer's stream, which must be done with the
 // peer's device current.
-// Sums this device's GDN recurrent + convolution state. At tp 2 the pool is planned with halved
-// value heads and halved conv channels, so this is already the per-device number.
+// Sums this device's GDN recurrent + convolution state: TP splits heads/channels,
+// whereas PP splits layers. This is already the per-device number.
 // The single construction of this Program's YaRN parameters. Both readers -- the `yarn_mscale`
 // member initializer and the per-device table upload -- go through here, so the factor/origin/theta
 // /rotary-pair tuple the descriptor's mscale describes is by construction the tuple the uploaded
@@ -244,10 +247,15 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
 ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                                  std::span<const LoadedModelData* const> peer_models, const SequencePlanImpl& plan,
                                  ExecutionContext& execution_in)
-    : model(model_in), execution(execution_in), device(execution_in.primary()), tp(execution_in.tp),
+    : model(model_in), execution(execution_in), device(execution_in.primary()), device_count(execution_in.device_count),
+      pp(plan.pp), pipeline_chunks(plan.pipeline_chunks),
+      pipeline_upload(plan.pp == 2
+                          ? std::make_optional<PinnedHostBuffer>(2ULL * plan.prefill_chunk * plan.pipeline_chunks * sizeof(TokenId))
+                          : std::nullopt),
       capacity(plan.capacity), kv_capacity(plan.kv_capacity),
       max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
-      draft_window(plan.draft_window), ram_kv(plan.ram_kv), speculative_backend(plan.speculative_backend),
+      draft_window(plan.draft_window), ram_kv(plan.ram_kv), volta_long_attention(plan.volta_long_attention),
+      speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
@@ -290,11 +298,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     if (model.dflash.has_value() && model.vision.has_value()) {
         throw std::invalid_argument("DFlash and Vision model views are mutually exclusive");
     }
-    if (tp != plan.tp || peer_models.size() != static_cast<std::size_t>(tp - 1)) {
+    if (device_count != plan.tp * plan.pp || peer_models.size() != static_cast<std::size_t>(device_count - 1)) {
         throw std::invalid_argument("Qwen3.6 program tensor-parallel width is inconsistent");
     }
-    peers.reserve(tp - 1);
-    for (int rank = 1; rank < tp; ++rank) {
+    peers.reserve(device_count - 1);
+    for (int rank = 1; rank < device_count; ++rank) {
         if (!execution.dev[rank] || peer_models[rank - 1] == nullptr) {
             throw std::invalid_argument("tensor-parallel program requires every rank's model and device");
         }
@@ -305,7 +313,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             peers.back()->graph_bridge.emplace(device.device, execution.dev[rank]->device);
         }
     }
-    if (tp > 1) {
+    if (device_count > 1) {
         const bool direct_peer_access = ops::enable_peer_access(execution);
         peer_events.emplace(execution, direct_peer_access);
     }
@@ -313,7 +321,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         // ONE resident 32-float corrected inverse-frequency table PER DEVICE, uploaded once, here.
         // cudaMalloc is neither stream-ordered nor capturable, and CUDA Graph capture bakes this
         // pointer into the replayed rope launch node, so the allocation has to happen exactly once
-        // at construction and stay valid for the life of the Program. At tp 2 each rank ropes its
+        // at construction and stay valid for the life of the Program. At device_count 2 each rank ropes its
         // own head-local q/k on its own device and stream: rank 1 cannot dereference rank 0's
         // table, so each device gets its own copy of the same 128 bytes.
         const std::vector<float> table =
@@ -322,7 +330,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
             throw std::logic_error("YaRN frequency table does not match the rotary geometry");
         }
         const std::size_t table_bytes = table.size() * sizeof(float);
-        for (int rank = 0; rank < tp; ++rank) {
+        for (int rank = 0; rank < device_count; ++rank) {
             const auto slot            = static_cast<std::size_t>(rank);
             DeviceContext& rank_device = *execution.dev[slot];
             const ScopedDevice scope(rank_device.device);
@@ -452,7 +460,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
         set_peer_i32(peer->io.text_kv_table_row, 0, peer->device);
         set_peer_i32(peer->io.backend_kv_table_row, 0, peer->device);
         CUDA_CHECK(cudaSetDevice(previous));
-        peer_cores[peer->rank - 1] = schedule::TpPeerCore{.execution        = &execution,
+        peer_cores[peer->rank - 1] = schedule::PeerCore{.execution        = &execution,
                                                .events           = &*peer_events,
                                                .device           = &peer->device,
                                                .model            = &peer->model,
@@ -752,16 +760,27 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : backend_kv_cache() != nullptr ? prompt_tokens : 0U;
         if (ram_kv.gpu_tokens != 0) {
-            const auto ranking = qwen3_6::detail::rank_ram_kv_pages(prompt.token_ids,
-                                                                  prompt.retrieval_tokens);
-            sequence.kv->text.prefer_pages(ranking);
-            if (sequence.kv->backend) { sequence.kv->backend->prefer_pages(ranking); }
-            for (auto& peer : peers) {
-                sequence.kv->text_peers[peer->rank - 1]->prefer_pages(ranking);
-                if (sequence.kv->backend_peers[peer->rank - 1]) {
-                    sequence.kv->backend_peers[peer->rank - 1]->prefer_pages(ranking);
+            const auto query = prompt.retrieval_query;
+            const bool retain_query = base >= query.begin + query.count &&
+                sequence.ram_query.begin == query.begin && sequence.ram_query.count == query.count;
+            const std::array<int, 2> span{static_cast<int>(query.begin),
+                                          static_cast<int>(query.begin + query.count)};
+            const auto configure = [&](qwen3_6::PagedKVCache& cache, DeviceContext& ctx) {
+                if (!retain_query) {
+                    CUDA_CHECK(cudaMemsetAsync(cache.retrieval_query.data, 0, cache.retrieval_query.bytes(), ctx.stream));
+                    CUDA_CHECK(cudaMemsetAsync(cache.retrieval_counts.data, 0, cache.retrieval_counts.bytes(), ctx.stream));
                 }
+                CUDA_CHECK(cudaMemcpyAsync(cache.retrieval_span.data, span.data(), sizeof(span), cudaMemcpyHostToDevice, ctx.stream));
+                CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+            };
+            configure(decoder->text_kv, device);
+            for (auto& peer : peers) {
+                const ScopedDevice scope(peer->device.device);
+                configure(peer->decoder->text_kv, peer->device);
             }
+            sequence.ram_query = query;
+            sequence.ram_rank_frontier = base;
+            refresh_ram_kv(sequence, base);
             // Cold prefill materializes one execution unit at a time. A retained prefix may
             // need cold pages reloaded when the query ranking changes, even without growth.
             materialize_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -936,11 +955,7 @@ void ProgramImplCore::resolve_pending_batch(std::span<const std::uint32_t> lanes
         ops::gdn_replay_fold(*replay_records, decoder->linear_attention.all_layers_view(),
                              std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
-        // Rank 1 folds ITS OWN records into ITS OWN halved GDN state, with the identical row set
-        // and commit counts: the accepted prefix is a property of the round, not of a device, and
-        // the two records differ only in which heads and conv channels they cover. The shard
-        // geometry FoldGeometry<48, 8, 24, 5120> this call resolves to is registered explicitly;
-        // without that registration the fold would reject the peer's record shape outright.
+        // Every peer folds its own layer/head records using the same committed token prefix.
         for (auto& peer : peers) {
             if (!peer->replay_records) {
                 throw std::logic_error("peer speculative round has no ReplaySSM records");
@@ -1285,6 +1300,37 @@ void ProgramImplCore::unbind_sequence_kv(SequenceState& sequence) noexcept {
     sequence.kv->text.unbind_row();
 }
 
+void ProgramImplCore::refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier) {
+    if (ram_kv.gpu_tokens == 0 || frontier <= ram_kv.gpu_tokens) { return; }
+    std::vector<double> combined(frontier / 128, 0);
+    const auto score = [&](qwen3_6::PagedKVCache& cache, DeviceContext& ctx) {
+        const ScopedDevice scope(ctx.device);
+        ops::kv_retrieval_scores(cache.retrieval_keys, cache.retrieval_query,
+            cache.retrieval_fallback, cache.retrieval_counts, frontier, cache.retrieval_scores, ctx.stream);
+        std::vector<float> scores(combined.size());
+        CUDA_CHECK(cudaMemcpyAsync(scores.data(), cache.retrieval_scores.data,
+            scores.size() * sizeof(float), cudaMemcpyDeviceToHost, ctx.stream));
+        CUDA_CHECK(cudaStreamSynchronize(ctx.stream));
+        for (std::size_t b = 0; b < scores.size(); ++b) { combined[b] += scores[b] / device_count; }
+    };
+    score(decoder->text_kv, device);
+    for (auto& peer : peers) { score(peer->decoder->text_kv, peer->device); }
+    const auto ranking = qwen3_6::detail::rank_ram_kv_pages(combined);
+    sequence.kv->text.prefer_pages(ranking);
+    if (sequence.kv->backend) { sequence.kv->backend->prefer_pages(ranking); }
+    for (auto& peer : peers) {
+        sequence.kv->text_peers[peer->rank - 1]->prefer_pages(ranking);
+        if (sequence.kv->backend_peers[peer->rank - 1]) {
+            sequence.kv->backend_peers[peer->rank - 1]->prefer_pages(ranking);
+        }
+    }
+    sequence.ram_rank_frontier = frontier;
+    if (std::getenv("NINFER_RAM_KV_TRACE")) {
+        std::fprintf(stderr, "RAM_KV_RETRIEVAL frontier=%u blocks=%zu query=%zu:%zu\n",
+            frontier, combined.size(), sequence.ram_query.begin, sequence.ram_query.count);
+    }
+}
+
 void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                               std::uint32_t backend_tokens) {
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
@@ -1301,6 +1347,15 @@ void ProgramImplCore::materialize_sequence_kv(SequenceState& sequence, std::uint
             sequence.kv->text_peers[peer->rank - 1]->materialize_tokens(
                 std::min(capacity, std::max(main_tokens,
                     sequence.kv->text_peers[peer->rank - 1]->mapped_token_capacity())), peer->device.stream);
+        }
+        if (ram_kv.gpu_tokens != 0 && std::getenv("NINFER_RAM_KV_TRACE") &&
+            main_tokens >= sequence.ram_query.begin) {
+            std::fprintf(stderr, "RAM_KV_RESIDENT frontier=%u pages=", main_tokens);
+            const auto pages = sequence.kv->text.page_ids();
+            for (std::size_t p = 0; p < pages.size(); ++p) {
+                if (pages[p] >= 0) { std::fprintf(stderr, "%zu,", p); }
+            }
+            std::fprintf(stderr, "\n");
         }
     }
     if (backend_tokens != 0 && (ram_kv.gpu_tokens != 0 ||
@@ -1702,7 +1757,7 @@ void ProgramImplCore::prepare_graphs() {
                                        prefill_chunk,
                                        proposal_head,
                                        rope_frequency,
-                                       peer_views()};
+                                       peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention};
     };
 
     if (speculative_backend == SpeculativeBackend::None) {
@@ -1725,7 +1780,7 @@ void ProgramImplCore::prepare_graphs() {
                                         nullptr);
         synchronize_all();
 
-        if (tp > 1) {
+        if (device_count > 1) {
             // Batch shape selects kernels, and a module first touched INSIDE a capture region
             // cannot be loaded there. At tp1 the code-warm pass above has always been enough in
             // practice (with one observed allowance flake, documented, consistent with a late
@@ -1771,7 +1826,7 @@ void ProgramImplCore::prepare_graphs() {
         // both topologies, including TP2 batch-shape module selection, before capturing either.
         for (bool greedy_target : {false, true}) {
             mtp_state.greedy_target = greedy_target;
-            const std::uint32_t warm_batches = tp > 1 ? max_concurrency : 1U;
+            const std::uint32_t warm_batches = device_count > 1 ? max_concurrency : 1U;
             for (std::uint32_t batch_size = 1; batch_size <= warm_batches; ++batch_size) {
                 prepare_representative(code_warm.min, batch_size);
                 synchronize_all();
@@ -1935,7 +1990,7 @@ void ProgramImplCore::prepare_graphs() {
     on_peer([&](PeerRuntime& p) { free_after[p.rank] = free_device_bytes(); });
     // The allowance is a per-device budget, so each device is checked against it separately
     // rather than against a doubled or summed figure.
-    const int ranks = tp;
+    const int ranks = device_count;
     for (int rank = 0; rank < ranks; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         const std::size_t consumed =
@@ -2042,6 +2097,7 @@ void ProgramImplCore::publish_peer_ordinary_ingress() {
 }
 
 void ProgramImplCore::enable_peer_egress_check(bool enabled) noexcept {
+    if (pp != 1) { enabled = false; }
     peer_egress_check_enabled = enabled;
 }
 
@@ -2126,7 +2182,7 @@ void ProgramImplCore::copy_round_token() {
                                device.stream));
 }
 
-// See logits_capture's declaration comment. io.logits is [vocab,1] BF16 regardless of tp; this
+// See logits_capture's declaration comment. io.logits is [vocab,1] BF16 regardless of device_count; this
 // is the same rank-0 destination copy_round_token() reads io.token from, so no tp2-specific code
 // is needed here. Inert unless the debug capture was explicitly enabled.
 void ProgramImplCore::copy_round_logits() {
@@ -2242,7 +2298,19 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
     const auto started                    = Clock::now();
     try {
         if (ram_kv.gpu_tokens != 0 && staged.cursor < staged.prompt_tokens) {
-            const auto end = std::min(staged.prompt_tokens, staged.cursor + prefill_chunk);
+            if (staged.cursor >= sequence.ram_rank_frontier + 8192) {
+                refresh_ram_kv(sequence, staged.cursor);
+            }
+            const auto end = std::min(staged.prompt_tokens, staged.cursor + prefill_chunk * pipeline_chunks);
+            const auto require = [&](PagedKVAllocation& a) {
+                a.require_pages(staged.cursor / 64, (end + 63) / 64);
+            };
+            require(sequence.kv->text);
+            if (sequence.kv->backend) { require(*sequence.kv->backend); }
+            for (auto& peer : peers) {
+                require(*sequence.kv->text_peers[peer->rank - 1]);
+                if (sequence.kv->backend_peers[peer->rank - 1]) { require(*sequence.kv->backend_peers[peer->rank - 1]); }
+            }
             const auto backend_end = staged.prepare_mtp ? std::min(capacity, end +
                 (end == staged.prompt_tokens && staged.initial_mtp_extent != 0
                     ? staged.initial_mtp_extent - 1 : 0U)) : 0U;
@@ -2251,7 +2319,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         schedule::PrefillContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_views()},
+             proposal_head, rope_frequency, peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             mtp_kv_views_peer(sequence),
@@ -2299,7 +2367,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
 
         if (staged.cursor < staged.prompt_tokens) {
             const std::uint32_t nominal =
-                std::min(prefill_chunk, staged.prompt_tokens - staged.cursor);
+                std::min(prefill_chunk * pipeline_chunks, staged.prompt_tokens - staged.cursor);
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -2311,6 +2379,30 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 staged.rewrite_checkpoint_capture
                     ? std::optional<std::uint32_t>(staged.rewrite_checkpoint_capture->frontier)
                     : std::nullopt;
+            // Capture Q once on the final suffix, then replay from the SAME recurrent state
+            // with query-selected history. The preview does not sample or publish tokens.
+            if (ram_kv.gpu_tokens != 0 && final_candidate && staged.cursor > ram_kv.gpu_tokens) {
+                const auto copy_state = [&](bool restore) {
+                    const auto copy = [&](qwen3_6::DecoderState& state, DeviceContext& ctx) {
+                        const ScopedDevice scope(ctx.device);
+                        state.linear_attention.copy_slot(restore ? 2 : 0, restore ? 0 : 2, ctx.stream);
+                    };
+                    copy(*decoder, device);
+                    for (auto& peer : peers) { copy(*peer->decoder, peer->device); }
+                };
+                copy_state(false);
+                const auto preview = schedule::prefill_text_chunk(schedule_state,
+                    staged.prompt.token_ids, nominal, std::nullopt, false);
+                if (preview.processed_tokens != nominal) {
+                    throw std::logic_error("RAM KV query preview did not complete the suffix");
+                }
+                copy_state(true);
+                refresh_ram_kv(sequence, staged.cursor);
+                materialize_sequence_kv(sequence, staged.prompt_tokens,
+                    staged.prepare_mtp ? staged.prompt_tokens : 0U);
+                // Do not double-count Q on replay; the captured preview is the retrieval query.
+                schedule_state.capture_retrieval_query = false;
+            }
             if (staged.vision) {
                 mark_workspace_usage(workspace_plan.vision_encode);
                 result = schedule::prefill_multimodal_chunk(
@@ -2346,7 +2438,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 throw std::logic_error("staged prefill sampled before the prompt frontier");
             }
             copy_tail(sequence, prefill_hidden.slice(
-                                    1, static_cast<std::int32_t>(result.processed_tokens) - 1, 1));
+                                    1, static_cast<std::int32_t>(result.tail_column), 1));
         } else {
             mark_workspace_usage(workspace_plan.ordinary_round);
             if (!sequence.tail_hidden_valid) {
@@ -2387,6 +2479,14 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                                        cudaMemcpyDeviceToHost, device.stream));
         }
         device.synchronize();
+        if (ram_kv.gpu_tokens != 0) {
+            sequence.kv->text.require_pages(0, 0);
+            if (sequence.kv->backend) { sequence.kv->backend->require_pages(0, 0); }
+            for (auto& peer : peers) {
+                sequence.kv->text_peers[peer->rank - 1]->require_pages(0, 0);
+                if (sequence.kv->backend_peers[peer->rank - 1]) { sequence.kv->backend_peers[peer->rank - 1]->require_pages(0, 0); }
+            }
+        }
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         const double vision_seconds = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::optional<RewriteCheckpointSpec> rewrite_checkpoint_capture =
@@ -2523,7 +2623,7 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         schedule::OrdinaryBatchContext schedule_state{
             {device, model, work, decoder->linear_attention,
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, rope_frequency, peer_views()},
+             proposal_head, rope_frequency, peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -2663,7 +2763,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                   replay_records ? &*replay_records : nullptr, io,
                                                   prefill_hidden, prefill_chunk, proposal_head,
                                                   rope_frequency,
-                                                  peer_views()},
+                                                  peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention},
                                                  decoder->text_kv,
                                                  *decoder->mtp_cache(),
                                                  *io.mtp_decode,
@@ -2842,7 +2942,7 @@ ProgramImplCore::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                      replay_records ? &*replay_records : nullptr,
                                                      io, prefill_hidden, prefill_chunk,
                                                      proposal_head, rope_frequency,
-                                                     peer_views()},
+                                                     peer_views(), pipeline_view(), pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr, volta_long_attention},
                                                     decoder->text_kv,
                                                     *dflash,
                                                     *io.dflash_decode,
@@ -2994,7 +3094,7 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     if (ram_kv.gpu_tokens != 0) {
         out.ram_kv_archive_bytes = decoder->text_kv.pool().ram_archive_bytes();
         if (decoder->mtp_cache()) { out.ram_kv_archive_bytes += decoder->mtp_cache()->pool().ram_archive_bytes(); }
-        out.ram_kv_archive_bytes *= tp;
+        out.ram_kv_archive_bytes *= device_count;
         for (const auto& sequence : sequences) {
             if (!sequence.kv) { continue; }
             out.ram_kv_transfer_bytes += sequence.kv->text.ram_transfer_bytes();

@@ -419,8 +419,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                           << " layer=" << layer << " row=" << row << "\n";
                 return failures + 1;
             }
-            if (layer == 0 && row == 0 && profile.layers == 30 && width == 2 && rows == 1 &&
-                commits[0] == 2) {
+            if (layer == 0 && row == 0 && rows == 1 &&
+                ((profile.layers == 30 && width == 2 && commits[0] == 2) ||
+                 (profile.layers == 24 && commits[0] > 0))) {
                 failures += verify_fold_oracle(profile, width, commits[0], seed, key_records,
                                                value_records, gate_records, actual_recurrent);
             }
@@ -721,6 +722,9 @@ int main() {
 
     int failures = 0;
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U);
+    failures += run_case({24, 48, 10240}, 4, 1, {0}, 1802U);
+    failures += run_case({24, 48, 10240}, 4, 1, {2}, 1803U);
+    failures += run_case({24, 48, 10240}, 4, 1, {4}, 1804U);
     failures += run_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1811U);
     failures += run_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1821U);
     failures += run_case({48, 12, 2560, 4}, 4, 4, {0, 1, 3, 4}, 1822U);

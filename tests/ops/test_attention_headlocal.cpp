@@ -244,7 +244,8 @@ struct RunResult {
 RunResult run_a1(int device, const Geometry& geometry, DType dtype, const HostCache& initial,
                  MappingPattern mapping, const std::vector<float>& q, const std::vector<float>& k,
                  const std::vector<float>& v, const std::vector<std::int32_t>& positions,
-                 ops::GqaExecutionEnvelope envelope, const std::string& label) {
+                 ops::GqaExecutionEnvelope envelope, const std::string& label,
+                 std::int32_t valid_tokens = -1) {
     const CurrentDeviceScope scope(device);
     const auto tokens = static_cast<std::int32_t>(positions.size());
     DeviceCache cache(initial, mapping);
@@ -274,12 +275,20 @@ RunResult run_a1(int device, const Geometry& geometry, DType dtype, const HostCa
     Tensor ttable_row(dtable_row.data(), DType::I32, {1});
     Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
 
+    // MTP's single-row proposal carries an explicit valid-column mask even at B=1.
+    GuardedDeviceBuffer dvalid(sizeof(std::int32_t));
+    if (valid_tokens < 0) valid_tokens = tokens;
+    dvalid.copy_from_host(&valid_tokens, sizeof(valid_tokens));
+    Tensor tvalid(dvalid.data(), DType::I32, {1});
+
     const std::size_t workspace_bytes = ops::gqa_attention_workspace_capacity_bytes(
         geometry.q_heads, dtype, envelope, 1, tokens, tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
 
-    ops::gqa_attention(tq, tk, tv, tp, Tensor{}, ttable_row, kAttentionScale, cache.batch_view(),
+    ops::gqa_attention(tq, tk, tv, tp,
+                       envelope.volta_long_attention || valid_tokens != tokens ? tvalid : Tensor{},
+                       ttable_row, kAttentionScale, cache.batch_view(),
                        envelope, workspace, tout, nullptr);
     cuda_synchronize();
 
@@ -352,6 +361,7 @@ struct HeadLocalCase {
     MappingPattern mapping;
     std::uint32_t seed;
     bool check_head_mapping = true;
+    std::int32_t valid_tokens = -1;
 };
 
 std::string case_label(const HeadLocalCase& test_case, DType dtype) {
@@ -466,9 +476,11 @@ std::vector<Value> select_query_columns(const std::vector<Value>& source, std::i
     return selected;
 }
 
-int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_oracle = false) {
+int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_oracle = false,
+             bool volta_long_attention = false) {
     const bool append              = std::string(test_case.entry) == "gqa_attention";
     const std::int32_t tokens      = test_case.tokens;
+    const std::int32_t valid_tokens = test_case.valid_tokens < 0 ? tokens : test_case.valid_tokens;
     const std::int32_t total       = test_case.base + tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -484,28 +496,38 @@ int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_o
     inject_codec_edges(kGlobalGeometry, tokens, k, v);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
     for (std::int32_t token = 0; token < tokens; ++token) {
-        positions[static_cast<std::size_t>(token)] = test_case.base + token;
+        positions[static_cast<std::size_t>(token)] =
+            test_case.base + (token < valid_tokens ? token : std::max(0, valid_tokens - 1));
     }
 
     const HostCache initial = make_cache(kGlobalGeometry, dtype, max_context, test_case.seed + 10u);
     HostCache expected      = initial;
-    if (append) { append_cache(expected, k, v, positions); }
+    if (append) {
+        append_cache(expected, k, v,
+                     std::vector<std::int32_t>(positions.begin(), positions.begin() + valid_tokens));
+    }
     const auto oracle_columns = sampled_prefill_oracle ? prefill_oracle_columns(tokens)
                                                         : std::vector<std::int32_t>{};
     std::vector<std::int32_t> oracle_positions;
     for (const auto column : oracle_columns) { oracle_positions.push_back(positions[column]); }
-    const std::vector<double> oracle =
+    std::vector<double> oracle =
         sampled_prefill_oracle
             ? ideal_attention(select_query_columns(q, kGlobalGeometry.q_heads, oracle_columns),
                               expected, oracle_positions)
             : ideal_attention(q, expected, positions);
+    if (!sampled_prefill_oracle) {
+        const auto column_size = static_cast<std::size_t>(kHeadDim) * kGlobalGeometry.q_heads;
+        std::fill(oracle.begin() + valid_tokens * column_size, oracle.end(), 0.0);
+    }
     if (sampled_prefill_oracle) {
         std::cout << label << ": full-width GPU/cache checks, FP64 oracle on "
                   << oracle_columns.size() << " query columns x 24 heads\n" << std::flush;
     }
 
-    const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
-                                             test_case.envelope_max};
+    const ops::GqaExecutionEnvelope envelope{
+                                             static_cast<std::uint32_t>(test_case.base +
+                                                                       std::max(1, valid_tokens)),
+                                             test_case.envelope_max, volta_long_attention};
     const ReductionCriterion criterion = attention_criterion(dtype);
 
     int failures = 0;
@@ -513,7 +535,7 @@ int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_o
     // (1) The single-device tp1 run over the whole 24|4 geometry.
     const RunResult reference =
         append ? run_a1(0, kGlobalGeometry, dtype, initial, test_case.mapping, q, k, v, positions,
-                        envelope, label + " tp1")
+                        envelope, label + " tp1", valid_tokens)
                : run_a3(0, kGlobalGeometry, dtype, initial, test_case.mapping, q, positions,
                         envelope, label + " tp1");
     failures += reference.failures;
@@ -559,7 +581,7 @@ int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_o
 
         const RunResult observed =
             append ? run_a1(rank, kLocalGeometry, dtype, local_initial[rank], test_case.mapping,
-                            local_q, local_k, local_v, positions, envelope, rank_label)
+                            local_q, local_k, local_v, positions, envelope, rank_label, valid_tokens)
                    : run_a3(rank, kLocalGeometry, dtype, local_initial[rank], test_case.mapping,
                             local_q, positions, envelope, rank_label);
         failures += observed.failures;
@@ -585,6 +607,78 @@ int run_case(DType dtype, const HeadLocalCase& test_case, bool sampled_prefill_o
     return failures;
 }
 
+int run_long_split_graph_boundary(int device, int tokens, bool long_attention = true) {
+    const CurrentDeviceScope device_scope(device);
+    constexpr int first_window = 65536;
+    constexpr int last_window = first_window + 8;
+    const auto host = make_cache(kLocalGeometry, DType::I8, last_window + 8, 1701u + tokens);
+    DeviceCache cache(host, MappingPattern::Fragmented);
+    const auto query = make_bf16_values(kHeadDim * kLocalGeometry.q_heads * tokens,
+                                       1711u + tokens, -0.25f, 0.25f);
+    const auto query_bits = to_bf16_bits(query);
+    GuardedDeviceBuffer dq(query_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(tokens * sizeof(std::int32_t));
+    GuardedDeviceBuffer eager(query_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer replay(query_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(query_bits.data(), query_bits.size() * sizeof(std::uint16_t));
+    Tensor q(dq.data(), DType::BF16, {kHeadDim, kLocalGeometry.q_heads, tokens});
+    Tensor pos(dp.data(), DType::I32, {tokens});
+    Tensor eager_out(eager.data(), DType::BF16,
+                     {kHeadDim, kLocalGeometry.q_heads, tokens});
+    Tensor replay_out(replay.data(), DType::BF16,
+                      {kHeadDim, kLocalGeometry.q_heads, tokens});
+    const ops::GqaExecutionEnvelope envelope{first_window, last_window, long_attention};
+    const auto bytes = ops::gqa_attention_workspace_capacity_bytes(
+        kLocalGeometry.q_heads, DType::I8, envelope, 1, tokens, tokens);
+    GuardedDeviceBuffer scratch(std::max<std::size_t>(bytes, 256));
+    WorkspaceArena work(DeviceSpan{scratch.data(), scratch.bytes()});
+    cudaStream_t stream = nullptr;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "split graph stream");
+    auto invoke = [&](Tensor& output, ops::GqaExecutionEnvelope range) {
+        ops::gqa_attention_cached(q, pos, kAttentionScale, cache.view(), range, work, output, stream);
+    };
+    std::vector<std::int32_t> positions(tokens);
+    for (int token = 0; token < tokens; ++token) positions[token] = first_window - tokens + token;
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    invoke(replay_out, envelope);
+    cuda_synchronize(stream);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "split capture");
+    invoke(replay_out, envelope);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "split capture end");
+    cuda_check(cudaGraphInstantiate(&executable, graph, 0), "split graph instantiate");
+    int failures = 0;
+    for (int window : {first_window, last_window}) {
+        for (int token = 0; token < tokens; ++token) positions[token] = window - tokens + token;
+        dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+        invoke(eager_out, {static_cast<std::uint32_t>(window), static_cast<std::uint32_t>(window), long_attention});
+        cuda_check(cudaGraphLaunch(executable, stream), "split graph replay");
+        cuda_synchronize(stream);
+        const auto observed = copy_from_guarded<std::uint16_t>(replay, query_bits.size());
+        const auto expected = copy_from_guarded<std::uint16_t>(eager, query_bits.size());
+        const std::string label = "TP2 INT8 split graph T=" + std::to_string(tokens) +
+                                  " keys=" + std::to_string(window);
+        if (observed != expected) {
+            std::cerr << label << ": eager/replay outputs differ\n";
+            ++failures;
+        }
+        failures += verify_attention(label + " FP64", bf16_bits_to_double(observed),
+                                     ideal_attention(query, host, positions), kAttentionInt8Criterion);
+        failures += verify_positions(label + " positions unchanged", dp, positions);
+    }
+    cuda_check(cudaGraphExecDestroy(executable), "split graph destroy");
+    cuda_check(cudaGraphDestroy(graph), "split capture destroy");
+    cuda_check(cudaStreamDestroy(stream), "split stream destroy");
+    failures += verify_input("split graph query unchanged", dq, query_bits);
+    failures += verify_cache("split graph cache unchanged", cache.snapshot(), host);
+    failures += cache.verify_guards("split graph cache");
+    failures += eager.verify_guards("split graph eager output");
+    failures += replay.verify_guards("split graph replay output");
+    failures += scratch.verify_guards("split graph workspace");
+    return failures;
+}
+
 // --- batched (speculative-verify) route ------------------------------------------------------
 //
 // B>1 is the only way a 12-head geometry reaches GqaAttentionRoute::ChunkedSmallT, and it is the
@@ -598,6 +692,7 @@ struct BatchHeadLocalCase {
     std::vector<std::int32_t> table_rows;
     MappingPattern mapping;
     std::uint32_t seed;
+    bool persistent_v_head_bias = false;
 };
 
 struct BatchRunResult {
@@ -704,6 +799,19 @@ int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
     for (std::int32_t row = 0; row < batch; ++row) {
         global_rows.push_back(make_cache(kGlobalGeometry, dtype, max_context,
                                          test_case.seed + 20u + 3u * row));
+        if (test_case.persistent_v_head_bias) {
+            auto& cache = global_rows.back();
+            const auto scale = f32_to_f16_bits(1.0f / 128.0f);
+            std::fill(cache.v_scale.begin(), cache.v_scale.end(), scale);
+            // Keep distinct KV heads distinguishable after long-history averaging.
+            for (int head = 0; head < kGlobalGeometry.kv_heads; ++head) {
+                const std::size_t slab = static_cast<std::size_t>(kHeadDim) * cache.logical_capacity;
+                for (std::size_t index = 0; index < slab; ++index) {
+                    cache.v_i8[head * slab + index] = static_cast<std::int8_t>(
+                        16 + 32 * head + static_cast<int>(index % 9) - 4);
+                }
+            }
+        }
     }
 
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(maximum_visible),
@@ -840,8 +948,10 @@ int verify_rejections() {
 int main(int argc, char** argv) {
     const bool prefill_only = argc == 2 && std::string(argv[1]) == "--prefill-only";
     const bool long_context_only = argc == 2 && std::string(argv[1]) == "--long-context-only";
-    if (argc != 1 && !prefill_only && !long_context_only) {
-        std::cerr << "usage: " << argv[0] << " [--prefill-only|--long-context-only]\n";
+    const bool default_single_only = argc == 2 && std::string(argv[1]) == "--default-single-only";
+    if (argc != 1 && !prefill_only && !long_context_only && !default_single_only) {
+        std::cerr << "usage: " << argv[0]
+                  << " [--prefill-only|--long-context-only|--default-single-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -865,7 +975,7 @@ int main(int argc, char** argv) {
         {"gqa_attention", 1024, 0, 1024, MappingPattern::Identity, 1502u},
         {"gqa_attention", 512, 512, 1024, MappingPattern::Fragmented, 1503u},
     };
-    if (!long_context_only) {
+    if (!long_context_only && !default_single_only) {
         for (const auto& test_case : prefill_cases) {
             failures += run_case(DType::I8, test_case, true);
         }
@@ -876,24 +986,69 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
 
-    // Four decode queries at the acceptance workload's occupied context, with the full
+    // One/four/five/six decode queries at the acceptance workload's occupied context, with the full
     // 180K capacity envelope. Evaluate every head/key against FP64 without subsampling.
     // Averaging 85K zero-mean V rows need not separate different heads by the fixture's
     // anti-permutation margin; the short cases retain that distinct-input requirement.
     // Oracle, per-head parity, and exact cache checks keep their original criteria here.
-    const HeadLocalCase long_context_case{
-        .entry = "gqa_attention",
-        .tokens = 4,
-        .base = 84996,
-        .envelope_max = 180000,
-        .mapping = MappingPattern::Identity,
-        .seed = 1601u,
-        .check_head_mapping = false,
-    };
-    std::cout << "head-local INT8 85K decode: full FP64 oracle, 4 queries x 24 heads; "
-                 "180K capacity\n" << std::flush;
-    failures += run_case(DType::I8, long_context_case);
-    if (long_context_only) {
+    for (const int width : {1, 4, 5, 6}) {
+        if (default_single_only && width != 1) { continue; }
+        const HeadLocalCase long_context_case{
+            .entry = "gqa_attention",
+            .tokens = width,
+            .base = 85000 - width,
+            .envelope_max = 180000,
+            .mapping = MappingPattern::Identity,
+            .seed = static_cast<std::uint32_t>(1601 + width),
+            .check_head_mapping = false,
+        };
+        std::cout << "head-local INT8 85K decode: full FP64 oracle, " << width
+                  << " queries x 24 heads; 180K capacity\n" << std::flush;
+        if (!default_single_only) {
+            failures += run_case(DType::I8, long_context_case, false, true);
+        }
+        if (width == 1 || width == 5) {
+            failures += run_case(DType::I8, long_context_case, false, false);
+        }
+    }
+    if (!default_single_only) {
+        failures += run_long_split_graph_boundary(1, 5, false);
+        failures += run_case(DType::I8,
+            {"gqa_attention", 5, 16386, 180000, MappingPattern::Fragmented, 1741u, false, 3}, false, false);
+        failures += run_case(DType::I8,
+            {"gqa_attention", 5, 16386, 180000, MappingPattern::Offset, 1742u, false, 0}, false, false);
+        failures += run_case(DType::I8,
+            {"gqa_attention_cached", 5, 32763, 32768, MappingPattern::Offset, 1743u, false}, false, false);
+        failures += run_batch_case(DType::I8,
+            {5, {16386, 32763}, {3, 0}, {1, 0}, MappingPattern::Fragmented, 1744u, true});
+        failures += run_long_split_graph_boundary(0, 1);
+        failures += run_long_split_graph_boundary(1, 5);
+        failures += run_long_split_graph_boundary(1, 6);
+        failures += run_case(DType::I8,
+            {"gqa_attention", 1, 16390, 16391, MappingPattern::Fragmented, 1721u, false}, false, true);
+        failures += run_case(DType::I8,
+            {"gqa_attention_cached", 1, 32767, 32768, MappingPattern::Offset, 1722u, false}, false, true);
+        failures += run_case(DType::I8,
+            {"gqa_attention", 6, 16385, 16391, MappingPattern::Fragmented, 1723u, false}, false, true);
+        failures += run_case(DType::I8,
+            {"gqa_attention", 6, 16385, 16391, MappingPattern::Fragmented, 1724u, false, 4}, false, true);
+        failures += run_case(DType::I8,
+            {"gqa_attention", 6, 16385, 16391, MappingPattern::Offset, 1725u, false, 0}, false, true);
+    }
+    failures += run_long_split_graph_boundary(1, 1, false);
+    failures += run_case(DType::I8,
+        {"gqa_attention", 1, 16390, 16391, MappingPattern::Fragmented, 1731u, false}, false, false);
+    failures += run_case(DType::I8,
+        {"gqa_attention_cached", 1, 32767, 32768, MappingPattern::Offset, 1732u, false}, false, false);
+    failures += run_case(DType::I8,
+        {"gqa_attention", 1, 16390, 180000, MappingPattern::Offset, 1733u, false, 0}, false, false);
+    failures += run_batch_case(DType::I8,
+        {1, {16390, 32767}, {1, 0}, {1, 0}, MappingPattern::Fragmented, 1734u, true});
+    failures += run_case(DType::I8,
+        {"gqa_attention", 1, 0, 180000, MappingPattern::Fragmented, 1735u, false}, false, false);
+    failures += run_case(DType::I8,
+        {"gqa_attention_cached", 1, 64, 180000, MappingPattern::Offset, 1736u, false}, false, false);
+    if (long_context_only || default_single_only) {
         std::cout << (failures == 0 ? "PASS" : "FAIL")
                   << " head-local INT8 85K decode (independent FP64 oracle)\n";
         return failures == 0 ? 0 : 1;

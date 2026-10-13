@@ -156,6 +156,13 @@ std::vector<GraphExecutionProfile> Variant::mtp_graph_profiles(std::uint32_t cap
     for (const std::uint32_t visible_end : {128U, 512U, 2048U, 4096U, 8198U, 16390U, 32768U}) {
         add_shifted(visible_end, 2 * draft_window);
     }
+#ifdef NINFER_VOLTA_BUILD
+    // Volta's producer grid keeps growing beyond 32K. Bound the idle CTAs without changing
+    // the device-side active split partition; 268800 keys reaches its fixed split cap.
+    for (const std::uint32_t visible_end : {65536U, 98304U, 131072U, 196608U, 268800U}) {
+        add_shifted(visible_end, 2 * draft_window);
+    }
+#endif
     // Target verify and MTP batch both have T=K+1 and W=E+K+1. Preserve one concrete INT8
     // implementation per range at the T=4/5/6 launch boundaries.
     if (draft_window == 3) {
@@ -671,14 +678,14 @@ require_same_alternative(std::span<const Weights* const> w, const char* label) {
 
 template <class T, std::size_t N>
 auto active(const std::array<T, N>& values, const ExecutionContext& ec) {
-    return std::span(values).first(ec.tp);
+    return std::span(values).first(ec.device_count);
 }
 
 template <class Range, class Payload>
 std::array<Weight, kMaximumExecutionDevices>
 weight_shards(const Range& payloads, Weight Payload::* member, const ExecutionContext& ec) {
     std::array<Weight, kMaximumExecutionDevices> out{};
-    for (int rank = 0; rank < ec.tp; ++rank) { out[rank] = payloads[rank]->*member; }
+    for (int rank = 0; rank < ec.device_count; ++rank) { out[rank] = payloads[rank]->*member; }
     return out;
 }
 
@@ -723,7 +730,7 @@ private:
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDevice restore;
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
         body(rank);
     }
@@ -788,7 +795,7 @@ void Variant::gdn_input_projection(std::span<const Tensor> hidden,
     // exactly as the tp1 leaf above does. The shard's value_dim is read off the tensor rather than
     // assumed, so this stays correct if the head split ever changes.
     std::array<Tensor, kMaximumExecutionDevices> output_gate_flat{};
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         output_gate_flat[rank] = output_gate[rank].view(
             {output_gate[rank].ne[0] * output_gate[rank].ne[1], hidden[rank].ne[1]});
     }
@@ -860,7 +867,7 @@ void Variant::gdn_control_projection(std::span<const Tensor> hidden,
     // hidden directly.
     const auto control = payload_shards(w, &GdnProjectionWeights::control_projection);
     std::array<Tensor, kMaximumExecutionDevices> a_log{}, dt_bias{};
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         a_log[rank] = w[rank]->a_log;
         dt_bias[rank] = w[rank]->dt_bias;
     }
@@ -887,14 +894,14 @@ void Variant::post_mixer(std::span<const Tensor> hidden,
     // The activation width is this rank's own gate/up shard, read off the weight rather than
     // assumed: `gate_up` is [2 * intermediate_shard, hidden], so half its rows is the shard.
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         if (w[rank]->gate_up.n != w[0]->gate_up.n) {
         throw std::logic_error("post_mixer: tp2 gate/up shards disagree on width");
         }
     }
     std::array<Tensor, kMaximumExecutionDevices> activation{};
     auto scopes = workspace_scopes(workspace);
-    for (std::size_t rank = 0; rank < ec.tp; ++rank) {
+    for (std::size_t rank = 0; rank < ec.device_count; ++rank) {
         activation[rank] =
             workspace[rank]->alloc(DType::BF16, {shard_intermediate, hidden[0].ne[1]});
     }
@@ -940,19 +947,19 @@ void Variant::mtp_attention_projection(
     std::span<const Tensor> query, std::span<const Tensor> gate,
     std::span<const Tensor> key, std::span<const Tensor> value,
     std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         require_mtp_shard(w[0]->packed, w[rank]->packed, "MTP attention projection");
     }
     const std::int32_t columns   = hidden[0].ne[1];
     const std::int32_t attn_rows = w[0]->packed.n;
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         if (hidden[rank].ne[1] != columns) {
         throw std::logic_error("MTP attention projection: tp2 ranks disagree on token count");
         }
     }
     std::array<Tensor, kMaximumExecutionDevices> packed{};
     auto scopes = workspace_scopes(workspace);
-    for (std::size_t rank = 0; rank < ec.tp; ++rank) {
+    for (std::size_t rank = 0; rank < ec.device_count; ++rank) {
         packed[rank] = workspace[rank]->alloc(DType::BF16, {attn_rows, columns});
     }
     ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::packed, ec), ec), active(packed, ec), ops::LinearPolicy::A16Only, workspace, ec);
@@ -980,10 +987,10 @@ void Variant::mtp_kv_projection(std::span<const Tensor> hidden,
                                 std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
     // The tp1 leaf fuses these two into one `linear_pair`; the shard's key and value row views
     // are separate blocks of the same packed shard, so at tp2 they are two column-parallel calls.
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         require_mtp_shard(w[0]->key, w[rank]->key, "MTP key projection");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         require_mtp_shard(w[0]->value, w[rank]->value, "MTP value projection");
     }
     ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::key, ec), ec), key, ops::LinearPolicy::A16Only, workspace, ec);
@@ -996,10 +1003,10 @@ void Variant::mtp_q_gate_projection(std::span<const Tensor> hidden,
                                     std::span<const Tensor> gate,
                                     std::span<WorkspaceArena* const>,
                                     const ExecutionContext& ec) {
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         require_mtp_shard(w[0]->query, w[rank]->query, "MTP query projection");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         require_mtp_shard(w[0]->output_gate, w[rank]->output_gate, "MTP gate projection");
     }
     ops::linear_column_parallel(hidden, active(weight_shards(w, &MtpAttentionProjectionWeights::query, ec), ec), query, ec);
@@ -1020,10 +1027,10 @@ void Variant::mtp_post_mixer(std::span<const Tensor> hidden,
     // the same reason. `tests/ops/test_mtp_split.cpp`'s Leg A proves this exact composition at
     // tp2 -- column-parallel gate_up, a shard-local silu_mul over the shard's own gate/up halves,
     // then row-parallel down plus the all-reduce.
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         require_mtp_shard(w[0]->gate_up, w[rank]->gate_up, "MTP post mixer gate/up");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         require_mtp_shard(w[0]->down, w[rank]->down, "MTP post mixer down");
     }
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
@@ -1032,7 +1039,7 @@ void Variant::mtp_post_mixer(std::span<const Tensor> hidden,
     std::array<Tensor, kMaximumExecutionDevices> activation{};
     std::array<Tensor, kMaximumExecutionDevices> delta{};
     auto scopes = workspace_scopes(workspace);
-    for (std::size_t rank = 0; rank < ec.tp; ++rank) {
+    for (std::size_t rank = 0; rank < ec.device_count; ++rank) {
         gate_up[rank]    = workspace[rank]->alloc(DType::BF16, {w[rank]->gate_up.n, columns});
         activation[rank] = workspace[rank]->alloc(DType::BF16, {shard_intermediate, columns});
         delta[rank]      = workspace[rank]->alloc(DType::BF16, {TextConfig::hidden, columns});

@@ -111,13 +111,13 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
-    if (binder.device_count() != options.tp) {
-        throw std::invalid_argument("artifact binder device count does not match EngineOptions.tp");
+    if (binder.device_count() != options.tp * options.pp) {
+        throw std::invalid_argument("artifact binder device count does not match tp * pp");
     }
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options),
-                              options.tp),
+                              options.tp, options.pp),
         options.tp));
 }
 
@@ -155,14 +155,14 @@ Package::create_program(const LoadedModel& model, SequencePlan&& plan,
                         ExecutionContext& execution) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     const detail::LoadedModelData& data = model.impl_->data;
-    if (data.tp != execution.tp) {
+    if (data.tp * data.pp != execution.device_count) {
         throw std::invalid_argument(
             "loaded model shard width does not match the execution context");
     }
     std::array<const detail::RuntimeModelView*, kMaximumExecutionDevices - 1> peers{};
-    for (int rank = 1; rank < data.tp; ++rank) { peers[rank - 1] = &data.view(rank); }
+    for (int rank = 1; rank < execution.device_count; ++rank) { peers[rank - 1] = &data.view(rank); }
     return qwen3_6::create_program<detail::Variant>(
-        data.runtime, std::span(peers).first(data.tp - 1),
+        data.runtime, std::span(peers).first(execution.device_count - 1),
                                                    model.impl_->weights_profile, std::move(plan),
                                                    execution);
 }

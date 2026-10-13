@@ -15,7 +15,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 13;
+inline constexpr int kSchemaVersion                   = 15;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -68,6 +68,10 @@ struct BenchOptions {
     ProposalHead proposal_head     = ProposalHead::Full;
     int device                     = 0;
     int tp                         = 1;
+    int pp                         = 1;
+    std::uint32_t pipeline_chunks   = 8;
+    RamKvOptions ram_kv;
+    bool volta_long_attention = false;
     std::vector<int> devices;
     bool use_cuda_graph            = true;
     bool profile_measured          = false;
@@ -109,6 +113,8 @@ struct BenchEnvironment {
     std::string cuda_driver_version;
     int device_id = 0;
     int tp = 1;
+    int pp = 1;
+    std::uint32_t pipeline_chunks = 1;
     std::vector<int> devices{0};
 
     std::string artifact_path;
@@ -123,6 +129,7 @@ struct BenchEnvironment {
     std::uint32_t mtp_draft_tokens                 = 0;
     ProposalHead proposal_head                     = ProposalHead::Full;
     bool use_cuda_graph                            = true;
+    bool volta_long_attention                      = false;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
     int repetitions                                = 0;

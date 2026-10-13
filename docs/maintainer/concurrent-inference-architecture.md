@@ -36,6 +36,29 @@ model execution：一次 model traversal、一次 CUDA Graph replay 和一组 ba
 - 面向数十至数百请求的通用 continuous batching；
 - serving 期间为新 shape 动态捕获 CUDA Graph。
 
+### 1.2.1 Single-request PP2 experiment
+
+SM70 Qwen3.8-27B NVFP4/QUASAR additionally admits startup-fixed `tp=1, pp=2, C=1`
+Text/None/MTP. Device 1 owns the first 32 layers, device 0 the last 32 layers,
+final norm, vocabulary and MTP; embeddings are replicated. Each stage owns its
+complete head/channel geometry, half the text KV/GDN layers, and a private workspace.
+The peer's unused backend/control reservation remains allocated symmetrically.
+
+One executor submits at most `pipeline_chunks` chronological prefill chunks per wave
+(1..8). The first stage can compute chunk i+1 while the second computes chunk i.
+Cross-device events guard residual production, copying and arena reuse. At the wave
+boundary the primary stream retires the final dependent chunk before progress is
+published or the pinned ingress is overwritten. Rewrite checkpoints copy both stages'
+GDN states at the same token frontier; prefix reserve/commit/truncate uses matching
+page identifiers in the two layer-local KV pools.
+
+Ordinary/MTP target verification visits both stages serially, including one captured
+multi-device CUDA Graph. MTP proposal, acceptance and output publication remain primary
+owned; each stage folds its own GDN replay records for the committed prefix.
+Vision/DFlash/expert storage and C>1 are not admitted. Optional RAM-KV pins every wave's
+write pages and freezes both stages' read tables until the wave completes. This is not a second
+Engine lane and does not introduce request-time TP/PP migration.
+
 ### 1.3 Required sequence-state substrate
 
 并发引擎要求下层提供 concurrent-capable sequence-state substrate，并以该 contract 已满足为前提。

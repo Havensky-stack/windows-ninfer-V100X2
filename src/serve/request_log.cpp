@@ -473,6 +473,8 @@ std::string format_server_start_json(
           // second GPU, so a downstream reader can tell a dual-device run from a single-device
           // one without parsing argv. `devices` always has exactly `tp` entries.
           {"tp", options.tp},
+          {"pp", options.pp},
+          {"pipeline_chunks", options.pipeline_chunks},
           {"devices", options.devices},
           {"max_context", options.max_context},
           {"rope_mode", options.rope_mode == RopeMode::Yarn ? "yarn" : "native"},
@@ -485,6 +487,7 @@ std::string format_server_start_json(
           {"ram_kv_gpu_tokens", memory.ram_kv_gpu_tokens},
           {"ram_kv_archive_bytes", memory.ram_kv_archive_bytes},
           {"ram_kv_budget_bytes", options.ram_kv.budget_bytes},
+          {"volta_long_attention", options.volta_long_attention},
           {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
           {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
           {"max_concurrency", options.max_concurrency},

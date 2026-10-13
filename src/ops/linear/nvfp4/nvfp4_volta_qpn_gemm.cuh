@@ -46,6 +46,8 @@
 // output.
 
 #include "core/device.h"
+#include "core/arena.h"
+#include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/common/volta_mma.cuh"
 #include "ops/linear/nvfp4/nvfp4_output.cuh"
 
@@ -289,28 +291,33 @@ __global__ __launch_bounds__(
 // Load-time-prepacked companion. Codes are [N/32 tile][K/16 group][lane32][8B], with
 // the nibble order chosen so the shift decoder's structural (i,i+4) pairs become adjacent K.
 // This is v100-skinny's QPN2 main loop: no activation PRMTs and one scale byte per group.
-template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation>
+template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation,
+          bool PairedProjection = false>
 __global__ __launch_bounds__(
-    SPLITK * 32, (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK < 1
+    SPLITK * 32 * (PairedProjection ? 2 : 1),
+    (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / (SPLITK * (PairedProjection ? 2 : 1)) < 1
         ? 1
-        : (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / SPLITK)
+        : (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / (SPLITK * (PairedProjection ? 2 : 1)))
 void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
                                       const std::uint8_t* __restrict__ scales,
                                       const Activation* __restrict__ x, int n, int k, int t,
                                       float inverse_weight_divisor, OutputPolicy output) {
     using S = Nvfp4VoltaQpnSchedule;
-    __shared__ float cs[SPLITK][kTiles * S::kRowsPerTile * S::kColsPerCta];
+    constexpr int kProjectionGroups = PairedProjection ? 2 : 1;
+    __shared__ float cs[SPLITK * kProjectionGroups][kTiles * S::kRowsPerTile * S::kColsPerCta];
 
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int k_warp = PairedProjection ? warp % SPLITK : warp;
+    const int projection = PairedProjection ? warp / SPLITK : 0;
     const int qp   = (lane >> 2) & 3;
     const int r    = (lane & 3) + ((lane & 16) ? 4 : 0);
     const int groups = k / S::kGroupK;
     const int quotient = groups / SPLITK;
-    const int g0       = warp * quotient;
-    const int gend     = warp == SPLITK - 1 ? groups : g0 + quotient;
+    const int g0       = k_warp * quotient;
+    const int gend     = k_warp == SPLITK - 1 ? groups : g0 + quotient;
     const std::int64_t tile_base =
-        static_cast<std::int64_t>(blockIdx.x) * groups * 32 + lane;
+        (static_cast<std::int64_t>(blockIdx.x) + projection * (n / 32)) * groups * 32 + lane;
     const half2 rebias   = __float2half2_rn(16384.0f);
     const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
 
@@ -324,6 +331,9 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         }
     }
 
+    // Paired TP2 gate/up overlaps four unchanged groups; MMA and K reduction
+    // associations stay intact. The unpaired route retains two-group scheduling.
+#pragma unroll (PairedProjection ? 4 : 2)
     for (int group = g0; group < gend; ++group) {
         const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
         const uint2 q2 = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
@@ -394,7 +404,7 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     __syncthreads();
 
     constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
-    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * 32) {
+    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * kProjectionGroups * 32) {
         const int row  = e / S::kColsPerCta;
         const int col  = e % S::kColsPerCta;
         const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
@@ -402,7 +412,16 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
             float value = 0.0f;
 #pragma unroll
             for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
-            output.store(ocol, row, value);
+            if constexpr (PairedProjection) {
+                // Separate warp groups preserve each projection's accumulator/register
+                // schedule and FP32 K reduction. The caller owns the paired epilogue.
+                float up = 0.0f;
+#pragma unroll
+                for (int w = 0; w < SPLITK; ++w) { up += cs[w + SPLITK][e]; }
+                output.store(ocol, row, value, up);
+            } else {
+                output.store(ocol, row, value);
+            }
         }
     }
 }
@@ -497,6 +516,17 @@ void launch_nvfp4_volta_qpn_with_fp16_activation(const Tensor& x, const Weight& 
                                                  cudaStream_t stream) {
     launch_nvfp4_volta_qpn_with_activation(x, w, x_fp16, output, n, inverse_weight_divisor,
                                            stream);
+}
+
+template <class OutputPolicy>
+void launch_nvfp4_volta_qpn_with_precast_output(const Tensor& x, const Weight& w,
+                                                OutputPolicy output, std::int32_t n,
+                                                WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope = workspace.scope();
+    Tensor activation = workspace.alloc(DType::FP16, {x.ne[0], x.ne[1]});
+    nvfp4_volta_qpn_cast_activation(x, activation, stream);
+    launch_nvfp4_volta_qpn_with_fp16_activation(x, w, static_cast<const half*>(activation.data),
+                                                output, n, 1.0F / w.weight_scale_divisor, stream);
 }
 
 #endif // sm_70

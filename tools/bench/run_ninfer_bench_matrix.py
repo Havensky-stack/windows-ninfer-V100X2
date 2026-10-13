@@ -40,7 +40,7 @@ CONTEXT_CORE = ((512, 512), (2048, 512), (8192, 512))
 CONTEXT_FULL_EXTRA = ((32768, 256), (65536, 128))
 PRIMARY_KS = (0, 3, 5)
 SWEEP_KS = (0, 1, 2, 3, 4, 5)
-REPORT_SCHEMA_VERSION = 13
+REPORT_SCHEMA_VERSION = 15
 REPORT_ARTIFACT_TYPE = "ninfer_bench_report"
 REPORT_TOOL = "ninfer_bench"
 
@@ -292,6 +292,7 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "speculative_backend": config.get("speculative_backend"),
             "draft_tokens": config.get("draft_tokens", config.get("mtp_draft_tokens")),
             "proposal_head": config.get("proposal_head"),
+            "volta_long_attention": config.get("volta_long_attention"),
             "decode_path": config.get("decode_path"),
             "decode_graph_primed": config.get("decode_graph_prime", {}).get("primed"),
             "decode_graph_prime_output_tokens": config.get("decode_graph_prime", {}).get(
@@ -333,6 +334,8 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             ),
             "gpu_name": report.get("environment", {}).get("gpu_name"),
             "tp": report.get("environment", {}).get("tp"),
+            "pp": report.get("environment", {}).get("pp"),
+            "pipeline_chunks": report.get("environment", {}).get("pipeline_chunks"),
             "devices": json.dumps(report.get("environment", {}).get("devices", [])),
         }
         rows.append(row)

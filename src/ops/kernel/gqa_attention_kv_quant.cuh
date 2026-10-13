@@ -77,16 +77,25 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8_from(const std::int8_t* code
 // Same contract as gqa_kv_dequant_i8x8_from, but packs fp16 instead of bf16: Volta's
 // mma.sync.m8n8k4 accepts fp16 operands only, so the tensor-core decode path needs its staged
 // K/V in fp16, while the SIMT path wants bf16 to match its accumulators. Still one 64-bit load.
-__device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16_from(const std::int8_t* codes8, float s) {
-    const int2 raw       = load_vec<int2>(codes8);
-    const std::int8_t* c = reinterpret_cast<const std::int8_t*>(&raw);
-    __half2 packed[4];
+__device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16_from(const std::int8_t* codes8, __half s) {
+    const int2 raw = load_vec<int2>(codes8);
+    const unsigned words[2] = {static_cast<unsigned>(raw.x) ^ 0x80808080U,
+                               static_cast<unsigned>(raw.y) ^ 0x80808080U};
+    const unsigned bias_bits = 0x64806480U;
+    const __half2 bias = *reinterpret_cast<const __half2*>(&bias_bits);
+    const __half2 scale = __half2half2(s);
+    unsigned packed[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        packed[i] = __floats2half2_rn(static_cast<float>(c[2 * i]) * s,
-                                      static_cast<float>(c[2 * i + 1]) * s);
+        // 0x6400 encodes 1024; biased unsigned bytes encode 1024 + (code + 128).
+        // Subtracting 1152 is exact, then the half product performs the original final cast.
+        const unsigned bits = __byte_perm(words[i / 2], 0x64646464U,
+                                          (i & 1) ? 0x4342U : 0x4140U);
+        const __half2 value = *reinterpret_cast<const __half2*>(&bits);
+        const __half2 product = __hmul2(__hsub2(value, bias), scale);
+        packed[i] = *reinterpret_cast<const unsigned*>(&product);
     }
-    return *reinterpret_cast<const int4*>(packed);
+    return make_int4(packed[0], packed[1], packed[2], packed[3]);
 }
 
 } // namespace ninfer::ops

@@ -156,7 +156,20 @@ decode once into transient FP16 weights for CUTLASS and distribute the BF16 pare
 The `.ninfer` file remains unchanged. These implementation profiles require operator-oracle
 and whole-model evidence; exact packing preservation alone is not a quality claim.
 
-The trial admits SM70 TP2 Text/None/MTP/DFlash. TP1/TP4 and Vision are rejected. The 66 stored
+SM70 W8 vocabulary output heads also use an in-place load-time permutation. Codes are ordered
+as `[N/32 tile][K/8 slice][QPN lane][8 code bytes]` and the unchanged FP16 scales as
+`[N/32 tile][K/32 group][QPN lane]`. Token embedding and non-vocabulary W8 matrices retain
+RowSplit storage. One/two-column output calls transpose packed tiles into shared memory and
+retain the original FP32 SIMT accumulation association; three through eight-column calls retain the
+four-partition QPN association, and wider calls decode the same packed planes into the Volta
+MMA staging tiles. No second resident weight copy or request-time repacking is added.
+
+The trial admits SM70 TP2 Text/None/MTP/DFlash and experimental TP1/PP2 Text/None/MTP.
+Standalone TP1, TP4 and Vision are rejected. PP2 uses the same registered artifact and
+complete immutable parents: layers 0..31 reside on the second device, layers 32..63
+and output/MTP on the primary; token embedding is replicated. No TP shard repacking
+or new quantization is performed. See the [runtime ownership contract](concurrent-inference-architecture.md#121-single-request-pp2-experiment).
+The 66 stored
 DFlash2 objects retain W8 projections and BF16 auxiliaries, use the same text-only TP2 runtime
 as the official v3 package, and become resident only when DFlash is selected. MTP and DFlash
 are mutually exclusive; the DFlash window is at most seven.

@@ -73,6 +73,8 @@ enum class LinearPolicy : std::uint8_t {
  * MTP packed-weight problems accept every positive column extent T. Registered Vision problems
  * accept raw-patch P in `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does
  * not inherently represent a text token. FP32_CTRL is unsupported.
+ * SM70 W8 vocabulary heads additionally admit an exact load-time VoltaQpnPrepacked layout;
+ * codes and FP16 scales are permuted without requantization, with consumers for all positive T.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
@@ -137,7 +139,7 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 //
 // Every requirement of linear() applies per rank. `x[r]`, `w[r]`, `out[r]`, and `workspace[r]`
 // must be resident on `ec.dev[r]`, and rank r's work is enqueued on `ec.dev[r]->stream`. They
-// are active-rank spans of exactly ec.tp entries, with ec.tp in {2,4}. The spans hold views,
+// are active-rank spans of exactly ec.device_count entries, with ec.device_count in {2,4}. The spans hold views,
 // not device allocations; graph recording performs no host or device allocation here. Per-format
 // shard-shape admission still applies; accepting four ranks does not register a new weight shape.
 // The CALLER OBLIGATION of include/ninfer/ops/allreduce.h applies here too: inputs staged

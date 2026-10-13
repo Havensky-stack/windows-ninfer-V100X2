@@ -124,6 +124,21 @@ int main() {
                         primary_plan.device_capacity_bytes[1] == 0,
                     "primary-only tensor was replicated or omitted");
         }
+        {
+            ninfer::artifact::Binder stage_binder(reader, 2);
+            stage_binder.set_device_mask_resolver([](std::string_view) { return 2U; });
+            const auto stage = ninfer::artifact::bind_tensor(
+                stage_binder, "weights/test", ninfer::artifact::NumericFormat::BF16, {2},
+                ninfer::artifact::TensorPlacement::Device);
+            stage_binder.validate_unconsumed_matching();
+            const auto plan = stage_binder.finish();
+            require(plan.device_objects.size() == 1 &&
+                        plan.device_objects.front().object.index == stage.index &&
+                        plan.device_objects.front().device == 1 &&
+                        plan.device_capacity_bytes[0] == 0 &&
+                        plan.device_capacity_bytes[1] == kTensor.size(),
+                    "pipeline tensor placement changed its bytes or resident owner");
+        }
         // A sharded placement that names no range for a device is a shard-map bug, not a request
         // to replicate: the binder must refuse it rather than quietly reserving a full copy.
         {

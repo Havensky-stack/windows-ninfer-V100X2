@@ -2,8 +2,8 @@
 
 [English](README.md) · [详细评测方法](docs/performance.md) · [HTTP API](docs/serving.md)
 
-原生 RAM-KV 实验入口：`--ram-kv-window N`，支持 27B SM70、TP1/TP2、单请求 Text/MTP。
-首版采用免训练 **token 匹配检索**，并非 KVMem 的 Q/K 向量检索移植。RAM 无损存储 packed KV，
+原生 RAM-KV 实验入口：`--ram-kv-window N`，支持 27B SM70、TP1/TP2/PP2、单请求 Text/MTP。
+采用免训练 **Q/K 均值向量检索**，参考 KVMem。RAM 无损存储 packed KV，
 但未选中的历史页不参与注意力，长 prefill 也会淘汰，可能漏召回；默认完整历史路径不变。
 详见 [存储与状态合同](docs/maintainer/paged-kv-cache.md#15-optional-native-ram-kv-experiment) 和
 [启动选项](docs/cli.md)。外部 KVMem 成绩不能当作这条原生路径的性能数据。
@@ -16,7 +16,8 @@
 实现结合而来。本文介绍本分支的改动和实测；外部源模型质量评测单独标明，
 不把上游 RTX 5090 等平台的结果当作 V100 成绩。
 
-采用 TP2 **分张量**执行，不是 32/32 层的分层卸载。**纯文本推理主推 QUASAR NVFP4 v3**，
+默认采用 TP2 **分张量**执行；另有可选的实验性 PP2 32/32 层流水线。
+**纯文本推理主推 QUASAR NVFP4 v3**，
 通用任务用 180000-token 容量、完整 INT8 group-64 KV、CUDA Graph 和 MTP3；高接受率
 结构化输出可选 98304 容量的 DFlash7。官方 NVFP4 和 GGUF 衍生 Q4_K_M 仍可使用。
 启动脚本未传模型时仍默认 Q4_K_M；下方[推荐启动命令](#cli-和-api-启动)显式选择 QUASAR。
@@ -29,10 +30,11 @@ Decode 只统计已提交输出，不把被拒绝的草稿算入吞吐。NVFP4 �
 ## 主推模型：QUASAR NVFP4
 
 使用 [QUASAR NInfer v3 成品](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/v3)。
-本机[实测](#quasar-nvfp4) MTP3 在 3072-token 代码输入下达到 **139.80 tok/s**，
-85K-token 代码输入热请求为 **100.34 tok/s**，均为已提交 wall decode。
-DFlash7 在原生 32 条 JSONL 任务达到 **249.00 tok/s**，85K 输入为 **153.12 tok/s**。
-这些是具体任务成绩，DFlash 并非所有任务都比 MTP 快。
+本机[最终评测](#最终-decode-与质量评测)在 85K-token 代码输入下，默认 MTP4 为
+**126.89 tok/s**，可选实验注意力为 **143.46 tok/s**，prefill 约 **1310 tok/s**。
+DFlash7 在原始短上下文 32 条 JSONL 测评达到 **255.31 tok/s**；此前 85K JSONL 为
+**153.12 tok/s**。均统计已提交输出，速度取决于任务。
+实验注意力默认关闭；DFlash 并非所有任务都比 MTP 快。
 
 维护者个人实际体验是跟 FP8 一档的。
 
@@ -78,6 +80,9 @@ TP2 Vision 是 [PR #1](https://github.com/tuxKOH/ninfer-V100X2/pull/1) 引入的
   修复了预打包 FP8 词表头在单 token 和 chunk 尾部错误走 row-major GEMV 的问题。
 - 长上下文注意力：共享 QK 分块和 softmax 权重，协作读取 split 向量，保留原有 FP32 累加顺序。
   不裁剪历史，不用检索子集代替完整注意力，不额外降低 KV 精度。
+- 可选实验注意力：`--volta-long-attention` 保留完整 INT8 KV，调整长 TP2 分片、online
+  softmax 和 FP32 PV 累加。支持 SM70 单请求 Text/普通解码/MTP，不支持 DFlash、RAM-KV
+  或视觉；输出可能变化，默认关闭。详见[数值及本机 GPQA 对照](docs/performance.md#quasar-v3-final-long-context-decode-evaluation)。
 - DFlash 局部注意力：V100 在分片数量足够时采用每行一个 warp，并以 FP32 保存 split
   numerator；极短窗口仍走 CTA 路径。支持 2048/4096 窗口，主模型完整历史 KV 不变。
 - GDN prefill：Q/K 每行只做一次 FP32 归一化，供状态 tile 复用；FP32 递推顺序不变。
@@ -89,6 +94,10 @@ TP2 Vision 是 [PR #1](https://github.com/tuxKOH/ninfer-V100X2/pull/1) 引入的
   已验证 P2P 的 SM70 小消息（≤80 KiB）直接读取对卡并求和到本卡 staging，
   两卡读完才覆盖原输入；宽 prefill 和 P2P 关闭时继续走 DMA。
 - Volta 残差路径：Q5 与 BF16 TP2 row-shard 使用可在 SM70 执行的 kernel，并通过独立数值检查。
+- 实验性 PP2：`--tp 1 --pp 2 --devices 0,1`，支持 SM70 Qwen3.8 NVFP4/QUASAR。
+  两卡各持有完整的 32 层，按时间顺序重叠执行 prefill chunk；decode 串行经过两卡。
+  支持单请求 Text、普通解码、MTP、前缀复用和可选稀疏 RAM-KV，不支持 Vision 或 DFlash。
+  TP2 仍是默认推荐路线，详见[同输入流水线评测](docs/performance.md#experimental-pp2-layer-pipeline)。
 - NVFP4 v3：读取官方 `NINFER\x00\x03` 单文件容器，映射到已注册的
   `qwen3.8-27b/nvfp4` 身份，不重打包权重字节；使用容器原始 chat template。
   容器可选的五层 DFlash2 组件已绑定为 text-only TP2 实验路径。
@@ -367,6 +376,50 @@ LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64" \
 
 DFlash 改用 `--max-context 98304 --prefill-chunk 1024 --spec dflash --draft-tokens 7`，
 去掉 `--lm-head-draft`，即可匹配上面 full-head 的测量配置。
+
+### 最终 Decode 与质量评测
+
+2026-10-13，同机双 V100-SXM2 16 GB、PCIe P2P **无 NVLink**、CUDA 12.8 / SM70。
+使用保存的 85000-token 代码输入、180000 容量、完整 INT8 group-64 KV、chunk 2560、
+greedy optimized-head MTP4、CUDA Graph。每条路线测两次冷请求，无前缀复用或额外请求
+预热；输出 512 个计时提交 token 加一个 prefill token。均值 ± 样本标准差：
+
+| 路线 | Prefill tok/s | 已提交 wall decode tok/s | 接受率 |
+|---|---:|---:|---:|
+| 默认 QUASAR / MTP4 | 1313.37 ± 3.89 | 126.89 ± 0.03 | 79.02% |
+| `--volta-long-attention` / MTP4 | 1307.41 ± 2.96 | 143.46 ± 0.01 | 76.74% |
+
+实验开关保留完整历史，调整长 KV 分片并使用 FP32 PV 累加，本组 decode 提升 **13.05%**。
+浮点结合顺序变化，输出可能改变，继续**默认关闭**。支持 SM70 27B TP2 单请求
+Text/普通解码/MTP、INT8 KV，不支持 DFlash、RAM-KV 或视觉；宽 prefill 不变。
+完整请求为 68.756 / 68.585 秒，不能把 decode 增益当成同幅度的端到端加速。
+各路线两轮输出／草稿计数一致，也与自己的原控制组一致。
+150 tok/s 没有达到；维护者接受当前结果，本轮优化到此结束。
+
+本机 GPQA-Diamond 为**相同 104 题、85K 无关代码填充版本**，容量 131072、输出上限
+32768、greedy MTP4、`xhigh` thinking：
+
+| 本机路线 | 正确 / 104 | 准确率 | 输出预算截断 |
+|---|---:|---:|---:|
+| QUASAR 默认 | 88 | 84.62% | 11 |
+| QUASAR 实验注意力 | 90 | 86.54% | 8 |
+| 官方 NVFP4 | 90 | 86.54% | 5 |
+| Q4_K_M | 87 | 83.65% | 5 |
+
+截断／缺答案按错题计。默认→实验为两题变错、四题变对，配对 p=0.6875。
+该样本没有观察到准确率下降，但不是统计非劣证明或无损证明。
+不是标准短上下文 GPQA，也不是完整 198 题成绩；未测本机 BF16/FP8 参照。
+实验路线仍未通过更严格的共享历史 logits 等价门槛，因此保留开关供用户取舍。
+
+原始**118-token 输入、生成 32 条带算术字段 JSONL**的测评，DFlash7 现为
+**255.31 ± 0.11 已提交 tok/s**，原来是 **249.00 ± 0.08**，提升 2.53%，没有突破 300。
+容量 98304、chunk 1024、完整 KV、full proposal head，完整预热一次后正式测两次。
+接受率 99.05%；记录／算术／字段顺序全过，输出 IDs 和草稿计数与原测评完全一致。
+这是原来的测评题目，不是演示页 JSON→JSONL 转换任务。
+
+[完整阶段耗时、数值限制与复现方法](docs/performance.md#quasar-v3-final-long-context-decode-evaluation)。
+本轮健康日志未见重启或 volatile ECC 未纠正错误；按用户要求已解除测评冷却。
+原始报告、模型和本地演示 HTML 不提交。
 
 ### NVFP4 v3：实际上下文占用
 
@@ -726,7 +779,7 @@ env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD
 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。DFlash2 实验参考
 [Inco AI](https://inco.ai/blog/dflash2/) 及其[草稿模型](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)。
 [KVMem](https://github.com/kvmem/kvmem-llama.cpp) 为可选 RAM-KV 实验提供了参考。
-原生原型采用 token 匹配检索，不是其 Q/K 向量检索移植；只让部分历史参与注意力是近似模式，
+原生实现将 Q/K 均值向量检索适配到按时间排序的分页 KV；只让部分历史参与注意力是近似模式，
 必须显式开启，默认完整上下文注意力不变。
 
 感谢 [Li3age](https://github.com/Li3age) 在

@@ -311,6 +311,10 @@ std::string usage_text(std::string_view program) {
         << "  --lm-head-draft             use the optimized proposal head; requires speculation\n"
         << "  --device <id>               CUDA device ordinal (default: 0)\n"
         << "  --tp <1|2|4>                tensor-parallel width (default: 1)\n"
+        << "  --pp <1|2>                  pipeline degree; PP2 requires TP1 SM70 NVFP4/QUASAR\n"
+        << "  --pipeline-chunks <1..8>    PP prefill wave; 1 is serial (default: 8)\n"
+        << "  --ram-kv-window <tokens>   Optional approximate Q/K retrieval GPU window\n"
+        << "  --volta-long-attention    Experimental complete-history SM70 TP2 INT8 attention\n"
         << "  --devices <id,...>          one CUDA device per rank; required for parallel execution\n"
         << "  --no-cuda-graph             use eager decode\n"
         << "  --profile-measured          bracket one measured repetition with CUDA profiler API\n"
@@ -396,6 +400,16 @@ BenchOptions parse_args(int argc, char** argv) {
             if (options.tp != 1 && options.tp != 2 && options.tp != 4) {
                 throw std::invalid_argument("--tp must be 1, 2 or 4");
             }
+        } else if (arg == "--pp") {
+            options.pp = parse_positive(value("--pp"), "pp");
+            if (options.pp != 1 && options.pp != 2) { throw std::invalid_argument("--pp must be 1 or 2"); }
+        } else if (arg == "--pipeline-chunks") {
+            options.pipeline_chunks = parse_positive(value("--pipeline-chunks"), "pipeline-chunks");
+            if (options.pipeline_chunks > 8) { throw std::invalid_argument("--pipeline-chunks must be 1..8"); }
+        } else if (arg == "--volta-long-attention") {
+            options.volta_long_attention = true;
+        } else if (arg == "--ram-kv-window") {
+            options.ram_kv.gpu_tokens = parse_positive(value("--ram-kv-window"), "ram-kv-window");
         } else if (arg == "--devices") {
             options.devices = parse_devices(value("--devices"));
             devices_explicit = true;
@@ -427,14 +441,14 @@ BenchOptions parse_args(int argc, char** argv) {
         throw std::invalid_argument("--capture-generation requires --output json");
     }
     if (devices_explicit) {
-        if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
-            throw std::invalid_argument("--devices must list exactly --tp device ids");
+        if (options.devices.size() != static_cast<std::size_t>(options.tp * options.pp)) {
+            throw std::invalid_argument("--devices must list exactly --tp * --pp device ids");
         }
         if (device_explicit && options.device != options.devices.front()) {
             throw std::invalid_argument("--device and --devices disagree on the primary device");
         }
         options.device = options.devices.front();
-    } else if (options.tp == 1) {
+    } else if (options.tp * options.pp == 1) {
         options.devices = {options.device};
     } else {
         throw std::invalid_argument("parallel execution requires --devices");
@@ -666,7 +680,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << "  target:     " << env.load.target << '\n'
         << "  weights:    " << env.load.weights_id << '\n'
         << "  gpu:        " << env.gpu_name << " (device " << env.device_id << ")\n"
-        << "  parallel:   tp=" << env.tp << " devices=" << device_list(env.devices) << '\n'
+        << "  parallel:   tp=" << env.tp << " pp=" << env.pp << " devices=" << device_list(env.devices) << '\n'
         << "  cuda:       runtime " << env.cuda_runtime_version << ", driver "
         << env.cuda_driver_version << '\n'
         << "  artifact:   " << env.artifact_path << " (" << env.artifact_file_size_bytes
@@ -687,6 +701,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " spec=" << speculative_backend_name(env.speculative_backend)
         << " draft_k=" << env.mtp_draft_tokens
         << " proposal_head=" << proposal_head_name(env.proposal_head)
+        << " volta_long_attention=" << env.volta_long_attention
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative_backend,
                                                 env.mtp_draft_tokens)
         << " graph_prime="
@@ -746,6 +761,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "\", \"cuda_runtime_version\": \"" << json_escape(env.cuda_runtime_version)
         << "\", \"cuda_driver_version\": \"" << json_escape(env.cuda_driver_version)
         << "\", \"device_id\": " << env.device_id << ", \"tp\": " << env.tp
+        << ", \"pp\": " << env.pp << ", \"pipeline_chunks\": " << env.pipeline_chunks
         << ", \"devices\": [" << device_list(env.devices) << "]},\n"
         << "  \"artifact\": {\"path\": \"" << json_escape(env.artifact_path)
         << "\", \"file_size_bytes\": " << env.artifact_file_size_bytes << "},\n"
@@ -763,6 +779,9 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"memory\": {\n"
         << "    \"device\": " << env.memory.device << ",\n"
         << "    \"max_context\": " << env.memory.max_context << ",\n"
+        << "    \"ram_kv_gpu_tokens\": " << env.memory.ram_kv_gpu_tokens << ",\n"
+        << "    \"ram_kv_archive_bytes\": " << env.memory.ram_kv_archive_bytes << ",\n"
+        << "    \"ram_kv_transfer_bytes\": " << env.memory.ram_kv_transfer_bytes << ",\n"
         << "    \"kv_capacity_mode\": \""
         << (env.memory.kv_capacity_mode == KvCapacityMode::Automatic ? "auto" : "explicit")
         << "\",\n"
@@ -789,9 +808,24 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"cuda_graph_allowance_bytes\": " << env.memory.cuda_graph_allowance_bytes << ",\n"
         << "    \"cuda_graph_observed_bytes\": " << env.memory.cuda_graph_observed_bytes << ",\n"
         << "    \"cuda_graph_rank_observed_bytes\": [";
-    for (int rank = 0; rank < env.tp; ++rank) {
+    for (int rank = 0; rank < env.tp * env.pp; ++rank) {
         if (rank != 0) { out << ','; }
         out << env.memory.cuda_graph_rank_observed_bytes[rank];
+    }
+    out << "],\n"
+        << "    \"devices\": [";
+    for (int rank = 0; rank < env.tp * env.pp; ++rank) {
+        if (rank != 0) { out << ','; }
+        const auto& row = env.load.devices[rank];
+        out << "{\"device\": " << row.device
+            << ", \"weights_bytes\": " << row.weights_bytes
+            << ", \"kv_pool_bytes\": " << row.kv_pool_bytes
+            << ", \"gdn_state_bytes\": " << row.gdn_state_bytes
+            << ", \"sequence_bytes\": " << row.sequence_bytes
+            << ", \"workspace_bytes\": " << row.workspace_bytes
+            << ", \"cuda_graph_bytes\": " << row.cuda_graph_bytes
+            << ", \"reserved_bytes\": " << row.reserved_bytes
+            << ", \"free_after_startup_bytes\": " << row.free_after_startup_bytes << '}';
     }
     out << "],\n"
         << "    \"kv_payload_bytes\": " << env.memory.kv_payload_bytes << "\n"
@@ -799,6 +833,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "  \"config\": {\n"
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
+        << "    \"volta_long_attention\": " << (env.volta_long_attention ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"speculative_backend\": \""
         << speculative_backend_name(env.speculative_backend) << "\",\n"
@@ -880,8 +915,8 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
-    out << "label,kind,n_prompt,n_gen,target,weights_id,tp,devices,max_context,prefill_chunk,speculative_backend,mtp_draft_tokens,"
-           "proposal_head,decode_path,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
+    out << "label,kind,n_prompt,n_gen,target,weights_id,tp,pp,pipeline_chunks,devices,max_context,prefill_chunk,speculative_backend,mtp_draft_tokens,"
+           "proposal_head,decode_path,volta_long_attention,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "request_transient_capacity_bytes,cuda_graph_allowance_bytes,"
            "workspace_peak_bytes,workspace_allocator_peak_bytes,"
@@ -903,11 +938,12 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
                                                     static_cast<double>(spec.drafted_tokens));
         out << result.test.label << ',' << kind_string(result.test.kind) << ','
             << result.test.n_prompt << ',' << result.test.n_gen << ',' << env.load.target << ','
-            << env.load.weights_id << ',' << env.tp << ",\"" << device_list(env.devices)
+            << env.load.weights_id << ',' << env.tp << ',' << env.pp << ',' << env.pipeline_chunks << ",\"" << device_list(env.devices)
             << "\"," << env.max_context << ',' << env.prefill_chunk << ','
             << speculative_backend_name(env.speculative_backend) << ',' << env.mtp_draft_tokens << ','
             << proposal_head_name(env.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative_backend, env.mtp_draft_tokens) << ','
+            << (env.volta_long_attention ? "true" : "false") << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes

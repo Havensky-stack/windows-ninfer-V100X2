@@ -1286,12 +1286,12 @@ void validate_fused_split_pair(std::span<const Tensor> x, std::span<const Weight
                                const ExecutionContext& ec) {
     detail::require_split_context(
         ec, "gdn_input_proj column-parallel: requires an ExecutionContext with two or four distinct "
-            "devices", ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+            "devices", ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count) || w.size() != x.size()) {
         throw std::invalid_argument(
             "gdn_input_proj column-parallel: argument width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         if (x[0].ne[1] != x[rank].ne[1]) {
             throw std::invalid_argument(
                 "gdn_input_proj column-parallel: both ranks must carry the same token count");
@@ -1306,7 +1306,7 @@ void validate_fused_split_pair(std::span<const Tensor> x, std::span<const Weight
         }
     }
     for (const Weight& weight : w) {
-        if (weight.n != 16384 / ec.tp) {
+        if (weight.n != 16384 / ec.device_count) {
             throw std::invalid_argument("GDN projection shard does not match TP width");
         }
     }
@@ -1331,18 +1331,18 @@ void validate_split_storage_split_pair(std::span<const Tensor> x,
                                        std::span<const Weight> query_key_w,
                                        std::span<const Weight> value_z_w,
                                        const ExecutionContext& ec) {
-    if (ec.tp != 2) {
+    if (ec.device_count != 2) {
         throw std::invalid_argument("split-storage Q4/Q5 GDN supports TP2 only");
     }
     detail::require_split_context(
         ec, "gdn_input_proj column-parallel: requires an ExecutionContext with two or four distinct "
-            "devices", ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp) || query_key_w.size() != x.size() ||
+            "devices", ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count) || query_key_w.size() != x.size() ||
         value_z_w.size() != x.size()) {
         throw std::invalid_argument(
             "gdn_input_proj column-parallel: argument width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         if (x[0].ne[1] != x[rank].ne[1]) {
         throw std::invalid_argument(
             "gdn_input_proj column-parallel: both ranks must carry the same token count");
@@ -1399,7 +1399,7 @@ void gdn_input_proj_column_parallel(std::span<const Tensor> x,
         validate_fused_column_rank_semantics(x[slot], query_key_value_z_weight[slot], qkv[slot],
                                              z[slot], policy);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_value_z_weight[slot].payload, qkv[slot].data,
@@ -1421,7 +1421,7 @@ void gdn_input_proj_column_parallel(std::span<const Tensor> x,
                                     const ExecutionContext& ec) {
     const std::array<WorkspaceArena*, kMaximumExecutionDevices> workspace{};
     gdn_input_proj_column_parallel(x, query_key_value_z_weight, qkv, z, LinearPolicy::A16Only,
-                                   std::span(workspace).first(ec.tp), ec);
+                                   std::span(workspace).first(ec.device_count), ec);
 }
 
 void gdn_input_proj_column_parallel(std::span<const Tensor> x,
@@ -1437,7 +1437,7 @@ void gdn_input_proj_column_parallel(std::span<const Tensor> x,
         validate_split_storage_column_rank_semantics(x[slot], query_key_weight[slot],
                                                       value_z_weight[slot], qkv[slot], z[slot]);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_weight[slot].payload, qkv[slot].data,
@@ -1474,11 +1474,11 @@ void require_conv_split_pair(std::span<const Tensor> x, const ExecutionContext& 
                              const char* op) {
     const std::string message =
         std::string(op) + ": requires an ExecutionContext with two distinct devices";
-    detail::require_split_context(ec, message.c_str(), ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp)) {
+    detail::require_split_context(ec, message.c_str(), ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count)) {
         throw std::invalid_argument(std::string(op) + ": argument width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
     if (x[0].ne[1] != x[rank].ne[1] || x[0].ne[2] != x[rank].ne[2]) {
         throw std::invalid_argument(std::string(op) +
                                     ": both ranks must carry the same width and batch");
@@ -1498,7 +1498,7 @@ void require_conv_shard_workspace(std::span<WorkspaceArena* const> workspace, co
 
 template <class... Spans>
 void require_conv_width(const ExecutionContext& ec, const char* op, const Spans&... spans) {
-    if (!((spans.size() == static_cast<std::size_t>(ec.tp)) && ...)) {
+    if (!((spans.size() == static_cast<std::size_t>(ec.device_count)) && ...)) {
         throw std::invalid_argument(std::string(op) + ": argument width must equal TP width");
     }
 }
@@ -1506,10 +1506,10 @@ void require_conv_width(const ExecutionContext& ec, const char* op, const Spans&
 void require_fused_conv_weights(std::span<const Weight> weights,
                                std::span<const Tensor> conv_weight,
                                const ExecutionContext& ec, const char* op) {
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         if (weights[rank].qtype != weights[0].qtype ||
             weights[rank].layout != weights[0].layout ||
-            weights[rank].n != 16384 / ec.tp || conv_weight[rank].ne[0] != 10240 / ec.tp) {
+            weights[rank].n != 16384 / ec.device_count || conv_weight[rank].ne[0] != 10240 / ec.device_count) {
             throw std::invalid_argument(std::string(op) + ": inconsistent projection shard");
         }
     }
@@ -1666,7 +1666,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
             initial_state_slots[slot], snapshot_base_slots[slot], query[slot], key[slot],
             value[slot], z[slot]);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_value_z_weight[slot].payload, conv_states[slot].data,
@@ -1715,7 +1715,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
     std::span<const Tensor> z, std::span<WorkspaceArena* const> workspace,
     const ExecutionContext& ec) {
     constexpr const char* kOp = "gdn_input_proj_conv_snapshot column-parallel";
-    if (ec.tp != 2) { throw std::invalid_argument("split-storage Q4/Q5 GDN supports TP2 only"); }
+    if (ec.device_count != 2) { throw std::invalid_argument("split-storage Q4/Q5 GDN supports TP2 only"); }
     require_conv_split_pair(x, ec, kOp);
     require_conv_width(ec, kOp, query_key_weight, value_z_weight, conv_weight, conv_states,
                        valid_columns, initial_state_slots, snapshot_base_slots,
@@ -1732,7 +1732,7 @@ void gdn_input_proj_conv_snapshot_column_parallel(
             initial_state_slots[slot], snapshot_base_slots[slot], query[slot], key[slot],
             value[slot], z[slot]);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_weight[slot].payload, conv_states[slot].data,
@@ -1795,7 +1795,7 @@ void gdn_input_proj_conv_record_column_parallel(
             initial_state_slots[slot], conv_record[slot], query[slot], key[slot], value[slot],
             z[slot]);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_value_z_weight[slot].payload, conv_record[slot].data,
@@ -1840,7 +1840,7 @@ void gdn_input_proj_conv_record_column_parallel(
     std::span<const Tensor> value, std::span<const Tensor> z,
     std::span<WorkspaceArena* const> workspace, const ExecutionContext& ec) {
     constexpr const char* kOp = "gdn_input_proj_conv_record column-parallel";
-    if (ec.tp != 2) { throw std::invalid_argument("split-storage Q4/Q5 GDN supports TP2 only"); }
+    if (ec.device_count != 2) { throw std::invalid_argument("split-storage Q4/Q5 GDN supports TP2 only"); }
     require_conv_split_pair(x, ec, kOp);
     require_conv_width(ec, kOp, query_key_weight, value_z_weight, conv_weight, conv_states,
                        valid_columns, initial_state_slots, conv_record,
@@ -1857,7 +1857,7 @@ void gdn_input_proj_conv_record_column_parallel(
             initial_state_slots[slot], conv_record[slot], query[slot], key[slot], value[slot],
             z[slot]);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_weight[slot].payload, conv_record[slot].data,

@@ -87,7 +87,10 @@ struct SequencePlanningInputs {
     // channels) is the model's own extent divided by `tp`, because each device holds only its own
     // head shard. Page COUNTS are not divided: all devices carry the same pages.
     int tp = 1;
+    int pp = 1;
+    std::uint32_t pipeline_chunks = 1;
     RamKvOptions ram_kv;
+    bool volta_long_attention = false;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -117,7 +120,10 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     bool use_cuda_graph = true;
     int device          = 0;
     int tp              = 1;
+    int pp              = 1;
+    std::uint32_t pipeline_chunks = 1;
     RamKvOptions ram_kv;
+    bool volta_long_attention = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;

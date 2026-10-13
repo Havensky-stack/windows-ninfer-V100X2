@@ -53,7 +53,7 @@ ExecutionContext::ExecutionContext(const std::vector<int>& device_ids, int stora
     if (storage_device >= 0 && device_ids.size() != 1) {
         throw std::runtime_error("a storage-only weight device requires tp == 1");
     }
-    tp = static_cast<int>(device_ids.size());
+    device_count = static_cast<int>(device_ids.size());
     // Distinct ids are a correctness precondition, not a preference: every tensor-parallel op
     // pairs `dev[0]` with `dev[1]` and assumes the two hold DIFFERENT shards on DIFFERENT devices.
     // `--devices 0,0` would build two CUDA contexts on one GPU, halve nothing, and make the peer
@@ -80,7 +80,7 @@ ExecutionContext::ExecutionContext(const std::vector<int>& device_ids, int stora
                 "storage device must share the primary device's compute capability");
         }
     }
-    for (int rank = 1; rank < tp; ++rank) {
+    for (int rank = 1; rank < device_count; ++rank) {
         const cudaDeviceProp& p0 = dev[0]->props;
         const cudaDeviceProp& p1 = dev[rank]->props;
         if (p0.major != p1.major || p0.minor != p1.minor) {

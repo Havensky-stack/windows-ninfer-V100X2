@@ -1,25 +1,10 @@
 #pragma once
 
-// Split-projection NVFP4 SwiGLU on Volta tensor cores (sm_70 only): two independent QPN2 launches
-// -- one per weight half, using the unmodified plain-QPN2 kernel -- into fp32 scratch, then a
-// small combine kernel applies silu(gate) * up in fp32 before the single BF16 round.
-//
-// Why not the fused kernel (nvfp4_linear_swiglu_volta_qpn.cuh)? Measured against it directly on
-// the gate_up shape at T=4: the fused kernel reads 225.4 GB/s across the whole weight; two
-// separate QPN2 passes at QPN2's own tuned schedule read 371.6 GB/s each. The fused kernel pays
-// for computing both projections inside one CTA -- double the accumulators, double the decode
-// registers -- and that costs more than the shared activation load saves. Splitting keeps each
-// launch at QPN2's own measured-fastest register/occupancy profile; the only new cost is a
-// trivial elementwise combine kernel (output-sized traffic, negligible next to the weight stream)
-// and one extra kernel launch.
-//
-// Why fp32 scratch rather than composing linear() + silu_mul() (which was tried and reverted for
-// the fused kernel's problem too): the same reasoning holds regardless of which QPN kernel writes
-// the projection. linear()'s A16 output is BF16, and silu(gate) * up compounds two independently
-// BF16-rounded operands multiplicatively, failing the correctness test by ~0.8% against a ~0.35%
-// tolerance. Fp32 scratch is the fix either way -- it just also happens to fix the speed problem,
-// because it lets each projection run through QPN2's own kernel unmodified instead of a doubled
-// one.
+// NVFP4 SwiGLU on Volta: FP32 gate/up projections, FP32 SiLU/product, one BF16 output round.
+// TP2 T4/T5 uses independent gate/up SplitK8 warp groups in a shared CTA, retaining each
+// projection's register schedule and reduction order. Other shapes write the gate to FP32
+// scratch, then combine it in the up-projection epilogue. Rounding each projection to BF16
+// before the product is not equivalent and fails the independent numerical criterion.
 
 #include "core/device.h"
 #include "ops/common/math.cuh"
@@ -33,6 +18,16 @@
 namespace ninfer::ops::detail {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
+
+struct Nvfp4PairedSwiGluOutput {
+    __nv_bfloat16* out;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(std::int32_t row, std::int32_t token,
+                                          float gate, float up) const {
+        out[static_cast<std::int64_t>(token) * rows + row] = __float2bfloat16_rn(silu(gate) * up);
+    }
+};
 
 struct Nvfp4SwiGluFromGateOutput {
     const float* gate;

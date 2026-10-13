@@ -131,6 +131,17 @@ int test_cli_contract() {
 
     const auto tp2 = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--devices",
                                     "1,0", "--tp", "2", "--device", "1"});
+    const auto pp2 = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--pp", "2",
+                                    "--devices", "1,0", "--pipeline-chunks", "4"});
+    failures += expect(pp2.tp == 1 && pp2.pp == 2 && pp2.pipeline_chunks == 4 &&
+                           pp2.devices == std::vector<int>({1, 0}), "PP2 benchmark geometry");
+    const auto ram = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--ram-kv-window", "98304"});
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer",
+                                       "--volta-long-attention"}).volta_long_attention &&
+                           !parsed.volta_long_attention,
+                       "benchmark Volta long attention must be explicit and disabled by default");
+    failures += expect(ram.ram_kv.gpu_tokens == 98304 && parsed.ram_kv.gpu_tokens == 0,
+                       "RAM KV benchmark window is explicit and off by default");
     failures += expect(tp2.tp == 2 && tp2.device == 1 && tp2.devices == std::vector<int>({1, 0}),
                        "TP2 preserves rank order and primary device");
     const auto tp4 = parse_for_test({"ninfer_bench", "--weights", "model.ninfer", "--tp", "4",
@@ -310,6 +321,7 @@ qb::BenchEnvironment sample_environment() {
     env.speculative_backend               = ninfer::SpeculativeBackend::Mtp;
     env.mtp_draft_tokens                  = 5;
     env.proposal_head                     = ninfer::ProposalHead::Optimized;
+    env.volta_long_attention              = true;
     env.use_cuda_graph                    = true;
     env.decode_graph_primed               = true;
     env.decode_graph_prime_output_tokens  = 13;
@@ -332,7 +344,10 @@ int test_report_contract() {
         return fail(std::string("invalid benchmark JSON: ") + error.what());
     }
 
-    failures += expect(report.at("schema_version") == 13, "report schema v13");
+    failures += expect(report.at("schema_version") == 15, "report schema v15");
+    failures += expect(report.at("environment").at("pp") == 1, "report actual PP degree");
+    failures += expect(report.at("memory").at("devices").size() == 2,
+                       "report memory on every compute device");
     failures += expect(report.at("artifact_type") == "ninfer_bench_report", "report identity");
     failures += expect(report.at("environment").at("tp") == 2, "report actual TP width");
     failures += expect(report.at("environment").at("devices") == Json({1, 0}),
@@ -357,6 +372,8 @@ int test_report_contract() {
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
+    failures += expect(report.at("config").at("volta_long_attention") == true,
+                       "JSON records the attention implementation profile");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("mtp_draft_tokens") == 5,
                        "speculative configuration");
@@ -407,6 +424,27 @@ int test_report_contract() {
                        "fixed-length generation explicitly identifies disabled model stops");
     failures += expect(!tg.at("reps").at(1).contains("generation"),
                        "uncaptured repetition omits generation payload");
+    auto pipeline = env;
+    pipeline.tp = 1;
+    pipeline.pp = 2;
+    pipeline.pipeline_chunks = 8;
+    pipeline.load.devices[0].device = 1;
+    pipeline.load.devices[0].weights_bytes = 100;
+    pipeline.load.devices[1].device = 0;
+    pipeline.load.devices[1].weights_bytes = 200;
+    const auto pp_report = Json::parse(qb::format_json(pipeline, "ninfer_bench --pp 2", results));
+    failures += expect(pp_report.at("environment").at("tp") == 1 &&
+                           pp_report.at("environment").at("pp") == 2 &&
+                           pp_report.at("environment").at("pipeline_chunks") == 8,
+                       "report distinguishes PP2 from TP2");
+    const auto& device_memory = pp_report.at("memory").at("devices");
+    failures += expect(device_memory.size() == 2 && device_memory[0]["device"] == 1 &&
+                           device_memory[1]["device"] == 0 &&
+                           device_memory[0]["weights_bytes"] == 100 &&
+                           device_memory[1]["weights_bytes"] == 200,
+                       "PP report preserves asymmetric per-device weight ownership");
+    failures += expect(pp_report.at("memory").at("cuda_graph_rank_observed_bytes") ==
+                           Json({1200, 1300}), "PP report includes both graph devices");
     return failures;
 }
 
@@ -418,7 +456,7 @@ int test_human_and_csv_reports() {
     failures += expect(table.find("qwen3_6_27b") != std::string::npos, "table target");
     failures += expect(table.find("groupwise-int") != std::string::npos, "table weights id");
     failures += expect(table.find("model.ninfer") != std::string::npos, "table artifact");
-    failures += expect(table.find("tp=2 devices=1,0") != std::string::npos,
+    failures += expect(table.find("tp=2 pp=1 devices=1,0") != std::string::npos,
                        "table identifies both devices");
     failures +=
         expect(table.find("proposal_head=optimized") != std::string::npos, "table proposal head");
@@ -429,12 +467,12 @@ int test_human_and_csv_reports() {
     const std::string csv = qb::format_csv(env, results);
     failures += expect(csv.starts_with("label,kind,n_prompt,n_gen,target,weights_id"),
                        "CSV identity columns");
-    failures += expect(csv.find("weights_id,tp,devices,") != std::string::npos,
+    failures += expect(csv.find("weights_id,tp,pp,pipeline_chunks,devices,") != std::string::npos,
                        "CSV tensor-parallel columns");
-    failures += expect(csv.find(",2,\"1,0\",") != std::string::npos,
+    failures += expect(csv.find(",2,1,1,\"1,0\",") != std::string::npos,
                        "CSV device list remains one quoted field");
     for (const std::string_view field :
-         {"proposal_head", "kv_payload_bytes", "load_host_to_device_bytes",
+         {"proposal_head", "volta_long_attention", "kv_payload_bytes", "load_host_to_device_bytes",
           "request_transient_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
           "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
           "decode_engine_tok_s_mean", "total_seconds_mean"}) {

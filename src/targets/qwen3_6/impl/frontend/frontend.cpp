@@ -925,12 +925,13 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
 
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
+    std::vector<TokenId> retrieval_tokens;
     if (!has_media) {
         for (auto it = messages.rbegin(); it != messages.rend(); ++it) {
             if (it->role != ChatRole::User) { continue; }
             const std::string query = it->rendered_content();
             // Retrieval does not require a second unbounded encoding of a long archive message.
-            if (query.size() <= 16384) { result.retrieval_tokens = impl_->tokenizer->encode(query); }
+            if (query.size() <= 16384) { retrieval_tokens = impl_->tokenizer->encode(query); }
             break;
         }
     }
@@ -977,9 +978,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.token_ids                   = std::move(encoded.input_ids);
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         assign_text_positions(result);
-        if (result.retrieval_tokens.empty()) {
+        const auto found = retrieval_tokens.empty() ? result.token_ids.end() :
+            std::find_end(result.token_ids.begin(), result.token_ids.end(),
+                          retrieval_tokens.begin(), retrieval_tokens.end());
+        if (found != result.token_ids.end()) {
+            result.retrieval_query = {static_cast<std::size_t>(found - result.token_ids.begin()),
+                                       retrieval_tokens.size()};
+        } else {
             const auto count = std::min<std::size_t>(2048, result.token_ids.size());
-            result.retrieval_tokens.assign(result.token_ids.end() - count, result.token_ids.end());
+            result.retrieval_query = {result.token_ids.size() - count, count};
         }
     }
     (void)checked_token_count(result.token_ids.size());
@@ -1056,6 +1063,8 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
     assign_text_positions(result);
+    const auto query_tokens = std::min<std::size_t>(2048, result.token_ids.size());
+    result.retrieval_query = {result.token_ids.size() - query_tokens, query_tokens};
     result.identity.reusable = allow_prefix_identity;
     result.prepare.seconds   = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));

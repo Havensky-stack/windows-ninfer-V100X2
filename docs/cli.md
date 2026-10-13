@@ -1,12 +1,13 @@
 # NInfer CLI
 
-Experimental native RAM-KV: add `--ram-kv-window 98304` to a 27B SM70 TP1/TP2 Text/MTP command.
-This is approximate, training-free lexical retrieval, disabled by default. It keeps packed history
+Experimental native RAM-KV: add `--ram-kv-window 98304` to a 27B SM70 TP1/TP2/PP2 Text/MTP command.
+This is approximate, training-free Q/K mean-vector retrieval, disabled by default. It keeps packed history
 in RAM but omits unselected pages from attention (including long prefill). `--max-context` remains
 the logical limit; omitted `--kv-capacity` follows the RAM window instead. If explicitly provided,
 KV capacity must equal that window. `--ram-kv-budget-bytes` defaults to 32000000000 and bounds the
 maximum archive across all ranks, not process RSS. Window must be a multiple of 64, at least
-prefill-chunk+8192, and no larger than max-context. Only one active request; no Vision/DFlash/TP4.
+prefill-chunk+8192 (PP2: prefill-chunk*pipeline-chunks+8192), and no larger than max-context.
+Only one active request; no Vision/DFlash/TP4.
 
 `build/apps/ninfer` runs one request against one registered `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
@@ -179,8 +180,11 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
-| `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
+| `--pp 1\|2` | layer-pipeline degree; `2` requires SM70 Qwen3.8 NVFP4/QUASAR, TP1 and Text/None/MTP | `1` |
+| `--pipeline-chunks N` | PP prefill wave of `1..8` chunks; `1` is the serial control | `8` |
+| `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/PP1, one active request, INT8 KV, Text/None/MTP only; excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -249,6 +253,21 @@ for artifacts with execution-qualified Vision weights; QUASAR and GGUF-derived Q
 Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.
+
+`--tp 1 --pp 2 --devices 0,1` instead selects the experimental SM70 Qwen3.8-27B
+NVFP4/QUASAR layer pipeline. Device 1 owns layers 0..31; device 0 owns layers 32..63,
+the output head and MTP. `--pipeline-chunks 8` submits a bounded prefill wave so the
+next first-half chunk overlaps the previous second-half chunk; `1` is the non-overlapped
+control. Decode traverses the two stages serially. PP2 supports single-request Text,
+None/MTP speculation, prefix reuse and optional sparse RAM-KV, not Vision, DFlash or expert-storage mode.
+The choice is fixed at startup: it does not switch to TP2 after prefill or by prompt length.
+
+```bash
+./build-v100-tp4/apps/ninfer /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --tp 1 --pp 2 --devices 0,1 --pipeline-chunks 8 \
+  --max-context 180000 --prefill-chunk 1024 --kv-dtype int8 \
+  --spec mtp --draft-tokens 3 --lm-head-draft --prompt "Write a bounded queue in C++."
+```
 
 The 35B-A3B package also supports expert-storage mode on two GPUs without tensor parallelism. Keep
 `--tp 1`, select the compute GPU with `--device`, and pass the other GPU as `--storage-device`:

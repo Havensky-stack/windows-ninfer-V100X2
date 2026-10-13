@@ -47,6 +47,7 @@ struct W8VoltaMmaSchedule {
     static constexpr int kThreads    = kWarps * 32;
 };
 
+template <bool Prepacked = false>
 __global__ __launch_bounds__(W8VoltaMmaSchedule::kThreads, 8) void w8_volta_mma_gemm_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k, int t,
@@ -95,13 +96,22 @@ __global__ __launch_bounds__(W8VoltaMmaSchedule::kThreads, 8) void w8_volta_mma_
         r.p8          = make_uint2(0, 0);
         r.sc          = __ushort_as_half(0);
         if (row < n) {
-            const std::uint8_t* crow =
-                codes + static_cast<std::int64_t>(row) * padded_groups * kCodeB;
-            r.p8 = *reinterpret_cast<const uint2*>(
-                crow + static_cast<std::int64_t>(g) * kCodeB + (lane & 3) * 8);
-            r.sc = __ushort_as_half(reinterpret_cast<const std::uint16_t*>(
-                scales + static_cast<std::int64_t>(row) * padded_groups *
-                             W8RowSplitStorage::kScaleBytesPerGroup)[g]);
+            if constexpr (Prepacked) {
+                const int qpn_lane = ((row & 7) >> 2) * 16 + ((row & 31) >> 3) * 4 + (row & 3);
+                const auto tile = static_cast<std::int64_t>(row / 32);
+                r.p8 = reinterpret_cast<const uint2*>(codes)[
+                    (tile * (k / 8) + g * 4 + (lane & 3)) * 32 + qpn_lane];
+                r.sc = __ushort_as_half(reinterpret_cast<const std::uint16_t*>(scales)[
+                    (tile * (k / 32) + g) * 32 + qpn_lane]);
+            } else {
+                const std::uint8_t* crow =
+                    codes + static_cast<std::int64_t>(row) * padded_groups * kCodeB;
+                r.p8 = *reinterpret_cast<const uint2*>(
+                    crow + static_cast<std::int64_t>(g) * kCodeB + (lane & 3) * 8);
+                r.sc = __ushort_as_half(reinterpret_cast<const std::uint16_t*>(
+                    scales + static_cast<std::int64_t>(row) * padded_groups *
+                                 W8RowSplitStorage::kScaleBytesPerGroup)[g]);
+            }
         }
     };
 

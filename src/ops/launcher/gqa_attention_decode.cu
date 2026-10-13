@@ -6,6 +6,7 @@
 #include "ops/kernel/gqa_attention_decode_bf16.cuh"
 #include "ops/kernel/gqa_attention_decode_i8.cuh"
 #ifdef NINFER_VOLTA_BUILD
+#include "ops/launcher/gqa_attention_qpn_volta.h"
 #include "ops/kernel/gqa_attention_decode_i8_tc_volta.cuh"
 #include "ops/kernel/gqa_attention_prefill_volta.cuh"
 #endif
@@ -62,7 +63,12 @@ std::int32_t gqa_small_t_split_upper_bound(std::int32_t window) {
 }
 
 template <typename Geometry>
-std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype) {
+std::int32_t gqa_small_t_split_count(std::int32_t window, std::int32_t tokens, DType kv_dtype,
+                                    bool volta_long_attention) {
+    if (kv_dtype == DType::I8) {
+        const int long_splits = gqa_volta_long_i8_splits<Geometry>(window, tokens, volta_long_attention);
+        if (long_splits > 0) { return long_splits; }
+    }
     // A 64-key default split just above a 32-key boundary makes the partial
     // kernel execute a nearly empty second tile. These short ranges instead
     // launch one 32-key tile per split; the larger CTAs keep the small grid busy.
@@ -91,14 +97,15 @@ std::int32_t gqa_small_t_launch_capacity(GqaExecutionEnvelope envelope, std::int
     const auto include    = [&](std::uint32_t window) {
         if (window < envelope.min_visible_keys || window > envelope.max_visible_keys) { return; }
         const auto splits =
-            gqa_small_t_split_count<Geometry>(static_cast<std::int32_t>(window), tokens, dtype);
+            gqa_small_t_split_count<Geometry>(static_cast<std::int32_t>(window), tokens, dtype,
+                                               envelope.volta_long_attention);
         capacity = capacity > splits ? capacity : splits;
     };
     include(envelope.min_visible_keys);
     include(envelope.max_visible_keys);
     // The policy is monotonic inside these finite segments and may drop when crossing a boundary.
     // Evaluating every segment end plus both interval ends gives the exact interval maximum.
-    constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390};
+    constexpr std::uint32_t ends[] = {128, 160, 512, 4096, 5000, 8198, 16390, 65536};
     for (const std::uint32_t end : ends) { include(end); }
     return capacity;
 }
@@ -158,6 +165,7 @@ template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typena
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const GqaSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
+                          bool volta_long_attention,
                           std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
                           Tensor& partial_l, cudaStream_t stream) {
     Tensor& cache_k       = cache.k_pages;
@@ -166,30 +174,73 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v_scale = cache.v_scale_pages;
 
 #ifdef NINFER_VOLTA_BUILD
-    // Tensor-core route for the verify widths. The SIMT kernel below holds ~1.9 TFLOP/s at every
-    // width, so its cost is linear in the width; the tensor-core tile is flat in the width
-    // instead, which is exactly what a speculative verify pass needs. Narrow widths stay on SIMT:
-    // with no query tile to amortize, the tensor-core kernel pays its fixed cost for nothing (the
-    // bf16 measurements put it 2.5x behind at width 1). See the V100 performance summary.
+    if constexpr (Geometry::QHeads == 12 && TokenTile == 6) {
+        if (volta_long_attention && implementation_window > 16390) {
+            const __nv_bfloat16* new_k = nullptr;
+            const __nv_bfloat16* new_v = nullptr;
+            if constexpr (CacheInput::writes_cache) {
+                new_k = input.k;
+                new_v = input.v;
+            }
+            gqa_attention_verify_qpn_volta_launch(q, new_k, new_v, pos, scale, cache,
+                invocation, logical_capacity, splits, partial_acc, partial_m, partial_l, stream);
+            return;
+        }
+    }
+    if constexpr (Geometry::QHeads == 12 && TokenTile == 1) {
+        if (implementation_window > 16390) {
+            const __nv_bfloat16* new_k = nullptr;
+            const __nv_bfloat16* new_v = nullptr;
+            if constexpr (CacheInput::writes_cache) {
+                new_k = input.k;
+                new_v = input.v;
+            }
+            gqa_attention_single_qpn_volta_launch(q, new_k, new_v, pos, scale, cache,
+                invocation, logical_capacity, volta_long_attention, splits,
+                partial_acc, partial_m, partial_l, stream);
+            return;
+        }
+    }
     if constexpr (TokenTile >= kVoltaTcDecodeMinWidth) {
         const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-        gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, 4, MultiBatch, Masked,
-                                                         CacheInput><<<grid, 128, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(q.data), input,
-            static_cast<const std::int32_t*>(pos.data), static_cast<std::int8_t*>(cache_k.data),
-            static_cast<std::int8_t*>(cache_v.data), static_cast<__half*>(cache_k_scale.data),
-            static_cast<__half*>(cache_v_scale.data),
-            static_cast<const std::int32_t*>(cache.block_tables.data),
-            invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-            invocation.table_rows == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.table_rows->data),
-            cache.block_tables.ne[0], invocation.width, invocation.full_width,
-            invocation.column_begin, logical_capacity, scale,
-            static_cast<__nv_bfloat16*>(partial_acc.data), static_cast<float*>(partial_m.data),
-            static_cast<float*>(partial_l.data));
+        auto launch_volta = [&]<int Warps, bool Fp32Pv = false>() {
+            gqa_attention_small_t_tc_volta_partial_i8_kernel<Geometry, TokenTile, Warps,
+                                                             MultiBatch, Masked, CacheInput,
+                                                             Warps == 8, Fp32Pv>
+                <<<grid, Warps * 32, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data), input,
+                    static_cast<const std::int32_t*>(pos.data),
+                    static_cast<std::int8_t*>(cache_k.data), static_cast<std::int8_t*>(cache_v.data),
+                    static_cast<__half*>(cache_k_scale.data), static_cast<__half*>(cache_v_scale.data),
+                    static_cast<const std::int32_t*>(cache.block_tables.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data),
+                    cache.block_tables.ne[0], invocation.width, invocation.full_width,
+                    invocation.column_begin, logical_capacity, scale,
+                    static_cast<__nv_bfloat16*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+        };
+        if constexpr (Geometry::QHeads == 12 && TokenTile == 5) {
+            if (volta_long_attention && implementation_window > 16390) {
+                launch_volta.template operator()<8, true>();
+            } else if (implementation_window > 16390) {
+                launch_volta.template operator()<8>();
+            } else {
+                launch_volta.template operator()<4>();
+            }
+        } else if constexpr (Geometry::QHeads == 12 && TokenTile == 4) {
+            if (implementation_window > 16390) {
+                launch_volta.template operator()<8>();
+            } else {
+                launch_volta.template operator()<4>();
+            }
+        } else {
+            launch_volta.template operator()<4>();
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -360,7 +411,8 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
             if (cache.dtype == DType::I8) {                                                        \
                 launch_tc_partial_i8<Geometry, (TOKENS), MultiBatch, Masked>(                      \
                     q, input, pos, scale, cache, invocation, logical_capacity,                     \
-                    implementation_window, splits, partial_acc, partial_m, partial_l, stream);     \
+                    implementation_window, envelope.volta_long_attention, splits,                 \
+                    partial_acc, partial_m, partial_l, stream);                                     \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \
                     q, input, pos, scale, cache, invocation, logical_capacity, splits,             \
@@ -412,18 +464,31 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
     const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                   Offset>
-            <<<reduce_grid, kReduceBlock, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(partial_acc.data),
-                static_cast<const float*>(partial_m.data),
-                static_cast<const float*>(partial_l.data),
-                static_cast<const std::int32_t*>(pos.data),
-                invocation.valid_columns == nullptr
-                    ? nullptr
-                    : static_cast<const std::int32_t*>(invocation.valid_columns->data),
-                invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+        const auto launch_staged = [&]<int SplitTile>() {
+            gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
+                                                       Offset, SplitTile>
+                <<<reduce_grid, kReduceBlock, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(partial_acc.data),
+                    static_cast<const float*>(partial_m.data),
+                    static_cast<const float*>(partial_l.data),
+                    static_cast<const std::int32_t*>(pos.data),
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                    invocation.width, invocation.full_width, invocation.column_begin,
+                    invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data),
+                    envelope.volta_long_attention);
+        };
+#ifdef NINFER_VOLTA_BUILD
+        if constexpr (Int8 && Geometry::QHeads == 12) {
+            if (invocation.width == 5 && implementation_window > 32768) {
+                // Stage twice as many split vectors without changing their summation order.
+                launch_staged.template operator()<16>();
+                return;
+            }
+        }
+#endif
+        launch_staged.template operator()<256 / kDChunk>();
     };
     const bool masked         = invocation.valid_columns != nullptr;
     const auto launch_profile = [&]<bool Int8, bool MultiBatch, bool Masked>() {

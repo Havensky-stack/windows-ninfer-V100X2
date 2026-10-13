@@ -229,6 +229,8 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.artifact_path            = options_.artifact_path;
     engine_options.device                   = options_.device;
     engine_options.tp                       = options_.tp;
+    engine_options.pp                       = options_.pp;
+    engine_options.pipeline_chunks          = options_.pipeline_chunks;
     engine_options.devices                  = options_.devices;
     engine_options.storage_device           = options_.storage_device;
     engine_options.max_context              = options_.max_context;
@@ -242,6 +244,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.ram_kv                   = options_.ram_kv;
+    engine_options.volta_long_attention     = options_.volta_long_attention;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;

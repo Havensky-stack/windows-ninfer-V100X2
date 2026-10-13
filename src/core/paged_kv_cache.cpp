@@ -312,6 +312,8 @@ struct PagedKVAllocation::RamState {
     std::uint32_t resident = 0;
     std::uint64_t transfers = 0;
     bool dirty = true;
+    std::uint32_t required_begin = 0;
+    std::uint32_t required_end = 0;
 
     explicit RamState(const PagedKVPool& pool) : bytes(pool.ram_archive_bytes()),
         archived(pool.logical_page_capacity(), false),
@@ -501,6 +503,16 @@ void PagedKVAllocation::prefer_pages(std::span<const std::int32_t> ranked_pages)
     ram_->dirty = true;
 }
 
+void PagedKVAllocation::require_pages(std::uint32_t begin, std::uint32_t end) {
+    if (!ram_ || begin > end || end > pool_->logical_page_capacity() ||
+        end - begin > page_entitlement_) {
+        throw std::invalid_argument("RAM KV required page span is invalid");
+    }
+    if (begin != ram_->required_begin || end != ram_->required_end) { ram_->dirty = true; }
+    ram_->required_begin = begin;
+    ram_->required_end = end;
+}
+
 std::uint64_t PagedKVAllocation::ram_transfer_bytes() const noexcept {
     return ram_ ? ram_->transfers : 0;
 }
@@ -528,19 +540,21 @@ void PagedKVAllocation::materialize_ram_pages(std::uint32_t pages, cudaStream_t 
     // Every append page is mandatory, then a 4K recent band and a 512-token sink.
     // Existing selected pages stay physically in place. Original order is restored only in
     // the read table, never by moving resident payloads.
+    for (auto p = ram_->required_begin; p < std::min(pages, ram_->required_end); ++p) { add(p); }
     for (auto p = old_pages; p < pages; ++p) { add(p); }
     for (auto p = pages; p > (pages > 64 ? pages - 64 : 0);) { add(--p); }
     for (std::uint32_t p = 0; p < std::min(8U, pages); ++p) { add(p); }
     for (auto p : ram_->preferred) { if (p >= 0) { add(static_cast<std::uint32_t>(p)); } }
     for (auto p = pages; p != 0;) { add(--p); }
 
-    const auto copy_page = [&](std::uint32_t logical, std::int32_t physical, bool to_ram) {
+    const auto copy_run = [&](std::uint32_t logical, std::int32_t physical, std::uint32_t count, bool to_ram) {
         for (std::size_t p = 0; p < pool_->plane_count(); ++p) {
             const Tensor& plane = pool_->plane(p);
-            const auto bytes = static_cast<std::size_t>(plane.nb[3]);
+            const auto page_bytes = static_cast<std::size_t>(plane.nb[3]);
+            const auto bytes = page_bytes * count;
             auto* host = static_cast<unsigned char*>(ram_->archive) + ram_->plane_offsets[p] +
-                         static_cast<std::size_t>(logical) * bytes;
-            auto* gpu = static_cast<unsigned char*>(plane.data) + physical * bytes;
+                         static_cast<std::size_t>(logical) * page_bytes;
+            auto* gpu = static_cast<unsigned char*>(plane.data) + physical * page_bytes;
             CUDA_CHECK(cudaMemcpyAsync(to_ram ? static_cast<void*>(host) : gpu,
                                        to_ram ? static_cast<const void*>(gpu) : host, bytes,
                                        to_ram ? cudaMemcpyDeviceToHost : cudaMemcpyHostToDevice,
@@ -549,12 +563,16 @@ void PagedKVAllocation::materialize_ram_pages(std::uint32_t pages, cudaStream_t 
         }
     };
     std::vector<std::int32_t> evicted;
-    for (std::uint32_t p = 0; p < pages; ++p) {
-        if (page_ids_[p] < 0 || wanted[p]) { continue; }
-        copy_page(p, page_ids_[p], true);
-        ram_->archived[p] = true;
-        evicted.push_back(page_ids_[p]);
-        page_ids_[p] = -1;
+    for (std::uint32_t p = 0; p < pages;) {
+        if (page_ids_[p] < 0 || wanted[p]) { ++p; continue; }
+        std::uint32_t end = p + 1;
+        while (end < pages && !wanted[end] && page_ids_[end] == page_ids_[end - 1] + 1) { ++end; }
+        copy_run(p, page_ids_[p], end - p, true);
+        for (; p < end; ++p) {
+            ram_->archived[p] = true;
+            evicted.push_back(page_ids_[p]);
+            page_ids_[p] = -1;
+        }
     }
     // The host archive must be ready before a subsequent load or allocator reuse. Boundaries
     // run outside graph capture; no host payload pointer is embedded in a decode graph.
@@ -562,12 +580,20 @@ void PagedKVAllocation::materialize_ram_pages(std::uint32_t pages, cudaStream_t 
     pool_->return_pages(evicted);
     ram_->resident -= static_cast<std::uint32_t>(evicted.size());
     std::vector<std::int32_t> fresh;
+    std::vector<bool> load(pages, false);
     for (std::uint32_t p = 0; p < pages; ++p) {
         if (!wanted[p] || page_ids_[p] >= 0) { continue; }
         auto acquired = pool_->take_pages(1, -1);
         page_ids_[p] = acquired.front(); ++ram_->resident;
-        if (ram_->archived[p]) { copy_page(p, page_ids_[p], false); }
+        if (ram_->archived[p]) { load[p] = true; }
         else { fresh.push_back(page_ids_[p]); }
+    }
+    for (std::uint32_t p = 0; p < pages;) {
+        if (!load[p]) { ++p; continue; }
+        std::uint32_t end = p + 1;
+        while (end < pages && load[end] && page_ids_[end] == page_ids_[end - 1] + 1) { ++end; }
+        copy_run(p, page_ids_[p], end - p, false);
+        p = end;
     }
     // Flash staging can gather page-rounded future rows before applying its causal mask.
     // Keep their codes/scales finite (0), so a masked uninitialized FP16 NaN cannot contaminate

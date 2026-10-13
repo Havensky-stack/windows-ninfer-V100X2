@@ -128,6 +128,7 @@ struct NullTap {
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
+    std::uint32_t tail_column       = 0;
 };
 
 struct DFlashFeatureSink {
@@ -163,7 +164,7 @@ class VisionPrefillSession;
 // is its own bookkeeping: page allocation, lane state, sampling and the host round buffers all
 // live once, on rank 0, and rank 1's pools are driven through the identical call sequence so its
 // block tables match rank 0's by construction.
-struct TpExecution {
+struct PeerExecution {
     const ExecutionContext* execution = nullptr;
     const ops::PeerEvents* events     = nullptr;
     DeviceContext* device             = nullptr;
@@ -201,7 +202,7 @@ public:
                 qwen3_6::PagedKVCacheView mtp_kv           = qwen3_6::PagedKVCacheView(),
                 const qwen3_6::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_6::PagedKVCache* batch_mtp_kv  = nullptr,
-                std::span<const TpExecution> tp = {});
+                std::span<const PeerExecution> tp = {});
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -222,7 +223,13 @@ public:
     }
 
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+    void set_volta_long_attention(bool enabled) noexcept { volta_long_attention_ = enabled; }
     void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
+    void set_retrieval_query_capture(bool enabled) noexcept { capture_retrieval_query_ = enabled; }
+    void set_pipeline(std::optional<PeerExecution> stage, TokenId* upload = nullptr) {
+        pipeline_ = std::move(stage);
+        pipeline_upload_ = upload;
+    }
 
     void set_prefill_rewrite_checkpoint_frontier(std::int64_t position) noexcept {
         prefill_rewrite_checkpoint_frontier_ = position;
@@ -360,6 +367,9 @@ private:
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
+    void run_pipeline_stage(Tensor& x, Phase phase);
+    void pipeline_prefill_layers(Tensor& x, const Tensor& positions,
+                                  ops::GqaExecutionEnvelope envelope, std::int32_t begin);
 
     // --- tp == 2 forward -----------------------------------------------------------------------
     // Deliberately separate functions rather than branches inside the tp1 ones: the tp1 schedule
@@ -376,12 +386,12 @@ private:
     auto rank_map(Body&& body) const {
         using Value = std::decay_t<decltype(body(0))>;
         std::array<Value, kMaximumExecutionDevices> out{};
-        for (int rank = 0; rank < ec().tp; ++rank) { out[rank] = body(rank); }
+        for (int rank = 0; rank < ec().device_count; ++rank) { out[rank] = body(rank); }
         return out;
     }
     template <class T, std::size_t N>
     auto active(const std::array<T, N>& values) const {
-        return std::span(values).first(ec().tp);
+        return std::span(values).first(ec().device_count);
     }
     [[nodiscard]] std::array<const Tensor*, kMaximumExecutionDevices - 1>
     peer_positions(const std::array<Tensor, kMaximumExecutionDevices>& tensors) const {
@@ -488,6 +498,8 @@ private:
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
     template <class Tap>
+    void run_owned_layers(Tensor& x, Phase phase, Tap& tap);
+    template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
                                   const Tensor& kv_table_rows, const Tensor& linear_state_slots,
@@ -551,6 +563,11 @@ private:
     const Tensor* active_valid_columns_                   = nullptr;
     const Tensor* active_backend_kv_table_rows_           = nullptr;
     const ops::GqaExecutionEnvelope* active_gqa_envelope_ = nullptr;
+    bool volta_long_attention_ = false;
+    [[nodiscard]] ops::GqaExecutionEnvelope attention_envelope(ops::GqaExecutionEnvelope value) const {
+        value.volta_long_attention = volta_long_attention_;
+        return value;
+    }
     std::int32_t active_sequence_batch_                   = 0;
     std::int32_t active_sequence_width_                   = 0;
     std::int32_t rope_delta_                              = 0;
@@ -561,6 +578,9 @@ private:
     std::int64_t prefill_rewrite_checkpoint_frontier_     = -1;
     Tensor* rewrite_checkpoint_hidden_output_             = nullptr;
     std::uint32_t mtp_proposal_extent_                    = 0;
+    std::optional<PeerExecution> pipeline_;
+    TokenId* pipeline_upload_ = nullptr;
+    bool capture_retrieval_query_ = true;
 
     // YaRN rotary frequency override, indexed by rank: each device ropes its own head-local q/k
     // (12Q:2KV at tp == 2), so each device needs its own resident copy of the corrected table.
@@ -579,7 +599,7 @@ private:
     // `src/targets/qwen3_6/impl/runtime/yarn_rope.h` for the full account.
     std::array<ops::RopeFrequencyOverride, kMaximumExecutionDevices> rope_frequency_{};
 
-    std::span<const TpExecution> tp_;
+    std::span<const PeerExecution> tp_;
     std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_cache_positions_{};
     std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_rope_positions_{};
     std::array<const Tensor*, kMaximumExecutionDevices - 1> peer_kv_table_rows_{};

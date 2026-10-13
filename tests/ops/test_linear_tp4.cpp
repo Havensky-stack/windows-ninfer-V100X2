@@ -34,7 +34,7 @@ double decode(std::uint16_t value) {
     return std::bit_cast<float>(std::uint32_t(value) << 16);
 }
 void sync(const ExecutionContext& execution) {
-    for (int r = 0; r < execution.tp; ++r) {
+    for (int r = 0; r < execution.device_count; ++r) {
         CUDA_CHECK(cudaSetDevice(execution.dev[r]->device));
         execution.dev[r]->synchronize();
     }

@@ -39,9 +39,10 @@
 //      call. Holding the *entire* D=256 head-dim output resident across the whole key loop
 //      (as the Ampere kernel does, ~128 registers) would cost Volta 32 chunks x 8 floats =
 //      256 registers/thread for a *single* output row -- already at Volta's hard 255/thread
-//      cap with nothing left for Q/K fragments or loop state. Fix: split the head dimension
-//      across warps (DimSplit=4 below) instead of giving each warp the full D range, so each
-//      warp only holds D/4=64 columns resident (8 chunks x 8 floats = 64 registers). Warps
+//      cap with nothing left for Q/K fragments or loop state. Split the head dimension
+//      across four or eight warps instead of giving each warp the full D range. The TP2
+//      long-context four/five-query route uses eight warps, halving each warp's PV accumulators
+//      and reducing register pressure. Other shapes keep the four-warp schedule. Warps
 //      reuse one FP32 QK tile, perform the same online-softmax recurrence independently,
 //      and diverge only for the PV accumulate.
 //
@@ -77,9 +78,27 @@
 
 namespace ninfer::ops {
 
+__device__ __forceinline__ void volta_attention_pv_fp32(float (&d)[8], const half2 (&p)[4],
+                                                        const half2 (&v)[4]) {
+    const auto* a = reinterpret_cast<const unsigned*>(p);
+    const auto* b = reinterpret_cast<const unsigned*>(v);
+    asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]),
+                   "+f"(d[4]),"+f"(d[5]),"+f"(d[6]),"+f"(d[7])
+                 : "r"(a[0]),"r"(a[1]),"r"(b[0]),"r"(b[1]));
+    asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(d[0]),"+f"(d[1]),"+f"(d[2]),"+f"(d[3]),
+                   "+f"(d[4]),"+f"(d[5]),"+f"(d[6]),"+f"(d[7])
+                 : "r"(a[2]),"r"(a[3]),"r"(b[2]),"r"(b[3]));
+}
+
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
-__launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial_i8_kernel(
+          typename CacheInput, bool SharedSoftmax = false, bool Fp32Pv = false>
+__launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
     std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
     const std::int32_t* block_tables, const std::int32_t* valid_columns,
@@ -87,12 +106,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     static_assert(TokenTile >= 1 && TokenTile <= 6);
-    static_assert(WarpsPerCta == 4, "this kernel always splits the head dim 4 ways -- see file comment");
+    static_assert(WarpsPerCta == 4 || WarpsPerCta == 8);
+    static_assert(!Fp32Pv || (SharedSoftmax && WarpsPerCta == 8));
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     constexpr int DimSplit      = WarpsPerCta; // warps split the head dim, not the row range
     constexpr int Br            = 32;          // one Volta tile's worth of rows per pass
-    constexpr int Bc            = 16;          // keys per shared-memory tile
+    constexpr int Bc            = 16;
     constexpr int D             = kGqaHeadDim;
     constexpr int Threads       = DimSplit * 32;
     constexpr int DChunks       = D / 8;           // QK^T: full head-dim contraction, unsplit
@@ -101,6 +121,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     constexpr int DChunksLocal  = DSlice / 8;       // this warp's resident accumulator chunks
     constexpr int PageIds       = 64;
     constexpr int Groups        = D / kGqaKvQuantGroup; // quant groups per key row
+    constexpr bool InlineQK = Geometry::QHeads == 12 && TokenTile == 5 &&
+                              SharedSoftmax && !Fp32Pv;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -130,6 +152,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     // Lane-major within each score component: consumers and producers access contiguous
     // banks, including the 24 live rows of a TP2 MTP4 call.
     __shared__ float scores_s[PVChunks][8][32];
+    __shared__ half2 probabilities_s[SharedSoftmax ? PVChunks : 1][4][32];
+    __shared__ float alpha_s[SharedSoftmax ? PVChunks : 1][32];
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
@@ -208,7 +232,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
     // Producer and INT8 reducer must agree on the live partials, including the T=5/6
     // window specializations; the BF16 policy can leave unread or unwritten split rows.
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile);
+        gqa_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, Fp32Pv);
     if (split >= active_split_count) { return; }
 
     const int logical_tiles = div_up(window, Bc);
@@ -304,6 +328,13 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
         }
         __syncthreads();
 
+        const int r_lo = volta_d_get_i(0) & ~2;
+        const int r_hi = volta_d_get_i(0) | 2;
+        int q_head_lo = 0, tok_lo = 0, q_head_hi = 0, tok_hi = 0;
+        gqa_small_t_tc_row_to_qt<Geometry>(row_base + r_lo, tokens, kv_head, q_head_lo, tok_lo);
+        gqa_small_t_tc_row_to_qt<Geometry>(row_base + r_hi, tokens, kv_head, q_head_hi, tok_hi);
+        const int qabs_lo = r_lo < rows_here ? pos[tok_lo] : -1;
+        const int qabs_hi = r_hi < rows_here ? pos[tok_hi] : -1;
         int physical_page = physical_pages_s[0];
 
         // acc_f[c] holds this warp's DSlice-wide PV output for head-dim chunk c (columns
@@ -330,6 +361,7 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
         float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F;
         float l_lo = 0.0f, l_hi = 0.0f;
 
+
         for (int kb = 0; kb < key_blocks; ++kb) {
             const int k0 = first_tile + kb * Bc;
             if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
@@ -354,8 +386,8 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                         gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
                     const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
                         physical_page, kv_head, d / kGqaKvQuantGroup, page_offset);
-                    const float ks = __half2float(cache_k_scale[scale_off]);
-                    const float vs = __half2float(cache_v_scale[scale_off]);
+                    const __half ks = cache_k_scale[scale_off];
+                    const __half vs = cache_v_scale[scale_off];
                     store_vec(k_dst, gqa_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
                     store_vec(v_dst, gqa_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
                 } else {
@@ -365,47 +397,57 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
             }
             __syncthreads();
 
-            // QK is independent of the PV dimension slice. Give each eight-key subgroup
-            // to one warp, retaining the exact D=256 MMA accumulation order.
-            if (warp < PVChunks) {
-                float d_score[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            // The default five-query softmax consumes both groups on warp 0. Interleave
+            // their unchanged contractions there, avoiding the shared-score handoff.
+            float inline_score[InlineQK ? PVChunks : 1][8] = {};
+            if constexpr (InlineQK) {
+                if (warp == 0) {
 #pragma unroll
-                for (int c = 0; c < DChunks; ++c) {
-                    half2 qf[4];
-                    volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]), SmemStride / 2);
-                    half2 kf[4];
-                    volta_load_k(
-                        kf, reinterpret_cast<const half2*>(&k_s[warp * 8 * SmemStride + c * 8]),
-                        SmemStride / 2);
-                    volta_mma_qk(d_score, qf, kf);
+                    for (int c = 0; c < DChunks; ++c) {
+                        half2 qf[4];
+                        volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]),
+                                      SmemStride / 2);
+#pragma unroll
+                        for (int sub = 0; sub < PVChunks; ++sub) {
+                            half2 kf[4];
+                            volta_load_k(kf, reinterpret_cast<const half2*>(
+                                &k_s[sub * 8 * SmemStride + c * 8]), SmemStride / 2);
+                            volta_mma_qk(inline_score[sub], qf, kf);
+                        }
+                    }
                 }
+            } else {
+                if (warp < PVChunks) {
+                    float d_score[8] = {};
 #pragma unroll
-                for (int j = 0; j < 8; ++j) { scores_s[warp][j][lane] = d_score[j]; }
+                    for (int c = 0; c < DChunks; ++c) {
+                        half2 qf[4], kf[4];
+                        volta_load_qp(qf, reinterpret_cast<const half2*>(&q_s[c * 8]),
+                                      SmemStride / 2);
+                        volta_load_k(kf, reinterpret_cast<const half2*>(
+                            &k_s[warp * 8 * SmemStride + c * 8]), SmemStride / 2);
+                        volta_mma_qk(d_score, qf, kf);
+                    }
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) { scores_s[warp][j][lane] = d_score[j]; }
+                }
+                __syncthreads();
             }
-            __syncthreads();
 
-            // Softmax/PV still consume the eight-key subgroups in their original order.
-            // The score handoff adds no cast and does not alter max/sum/PV association.
-#pragma unroll
-            for (int sub = 0; sub < PVChunks; ++sub) {
+            // The default profile retains eight-key softmax/PV association. FP32 PV merges
+            // the two score groups into one sixteen-key online-softmax update.
+            auto prepare_probability = [&](int sub, half2 (&p)[4]) {
                 const int sub_k0 = k0 + sub * 8;
                 float d_score[8];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) { d_score[j] = scores_s[sub][j][lane]; }
+                for (int j = 0; j < 8; ++j) {
+                    d_score[j] = InlineQK ? inline_score[sub][j] : scores_s[sub][j][lane];
+                }
 
                 // --- Causal mask + scale. Row = volta_d_get_i(l) (0..31, this pass's local
                 // row index); each thread's 8 registers span exactly two distinct rows
                 // (l&2==0 vs l&2==2, see volta_mma.cuh), so two qabs lookups (not eight)
                 // cover this thread's own rows. ---
-                const int r_lo = volta_d_get_i(0) & ~2;
-                const int r_hi = volta_d_get_i(0) | 2;
-                int q_head_lo = 0, tok_lo = 0, q_head_hi = 0, tok_hi = 0;
-                gqa_small_t_tc_row_to_qt<Geometry>(row_base + r_lo, tokens, kv_head, q_head_lo,
-                                                   tok_lo);
-                gqa_small_t_tc_row_to_qt<Geometry>(row_base + r_hi, tokens, kv_head, q_head_hi,
-                                                   tok_hi);
-                const int qabs_lo = (r_lo < rows_here) ? pos[tok_lo] : -1;
-                const int qabs_hi = (r_hi < rows_here) ? pos[tok_hi] : -1;
 #pragma unroll
                 for (int l = 0; l < 8; ++l) {
                     const int row   = volta_d_get_i(l);
@@ -454,8 +496,94 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                 // see volta_mma.cuh's I_MAJOR addressing for the Q/P/PV-output tile.
                 const float alpha = ((lane & 2) == 0) ? alpha_lo : alpha_hi;
 
-                half2 p[4];
                 volta_softmax_to_half2(p, d_score);
+                return alpha;
+            };
+
+            if constexpr (Fp32Pv) {
+                if (warp == 0) {
+                    float values[2][8];
+#pragma unroll
+                    for (int sub = 0; sub < 2; ++sub) {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            const float score = scores_s[sub][j][lane];
+                            const int row = volta_d_get_i(j);
+                            const int key = k0 + sub * 8 + volta_d_get_j(j);
+                            const int qabs = (j & 2) == 0 ? qabs_lo : qabs_hi;
+                            values[sub][j] = row < rows_here && key >= split_start &&
+                                             key < split_end && key <= qabs
+                                ? score * scale : -CUDART_INF_F;
+                        }
+                    }
+                    float bm_lo = -CUDART_INF_F, bm_hi = -CUDART_INF_F;
+#pragma unroll
+                    for (int sub = 0; sub < 2; ++sub) {
+                        bm_lo = fmaxf(bm_lo, fmaxf(fmaxf(values[sub][0], values[sub][1]),
+                                                   fmaxf(values[sub][4], values[sub][5])));
+                        bm_hi = fmaxf(bm_hi, fmaxf(fmaxf(values[sub][2], values[sub][3]),
+                                                   fmaxf(values[sub][6], values[sub][7])));
+                    }
+                    bm_lo = fmaxf(bm_lo, __shfl_xor_sync(FullMask, bm_lo, 2, 32));
+                    bm_hi = fmaxf(bm_hi, __shfl_xor_sync(FullMask, bm_hi, 2, 32));
+                    const float next_m_lo = fmaxf(m_lo, bm_lo);
+                    const float next_m_hi = fmaxf(m_hi, bm_hi);
+                    const float a_lo = m_lo == -CUDART_INF_F ? 0.0f :
+                                      exp2_approx((m_lo - next_m_lo) * Log2E);
+                    const float a_hi = m_hi == -CUDART_INF_F ? 0.0f :
+                                      exp2_approx((m_hi - next_m_hi) * Log2E);
+                    float sum_lo = 0.0f, sum_hi = 0.0f;
+#pragma unroll
+                    for (int sub = 0; sub < 2; ++sub) {
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) {
+                            const float m = (j & 2) == 0 ? next_m_lo : next_m_hi;
+                            values[sub][j] = m > -CUDART_INF_F && values[sub][j] > -CUDART_INF_F
+                                ? exp2_approx((values[sub][j] - m) * Log2E) : 0.0f;
+                        }
+                        sum_lo += values[sub][0] + values[sub][1] + values[sub][4] + values[sub][5];
+                        sum_hi += values[sub][2] + values[sub][3] + values[sub][6] + values[sub][7];
+                        half2 p[4];
+                        volta_softmax_to_half2(p, values[sub]);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) probabilities_s[sub][j][lane] = p[j];
+                    }
+                    sum_lo += __shfl_xor_sync(FullMask, sum_lo, 2, 32);
+                    sum_hi += __shfl_xor_sync(FullMask, sum_hi, 2, 32);
+                    l_lo = l_lo * a_lo + sum_lo;
+                    l_hi = l_hi * a_hi + sum_hi;
+                    m_lo = next_m_lo;
+                    m_hi = next_m_hi;
+                    alpha_s[0][lane] = (lane & 2) == 0 ? a_lo : a_hi;
+                    alpha_s[1][lane] = 1.0f;
+                }
+                __syncthreads();
+            } else if constexpr (SharedSoftmax) {
+                // Each dimension warp uses the same probabilities. Publish both eight-key
+                // updates in order, then let all warps consume their unchanged PV slices.
+                if (warp == 0) {
+#pragma unroll
+                    for (int sub = 0; sub < PVChunks; ++sub) {
+                        half2 p[4];
+                        alpha_s[sub][lane] = prepare_probability(sub, p);
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) { probabilities_s[sub][j][lane] = p[j]; }
+                    }
+                }
+                __syncthreads();
+            }
+
+#pragma unroll
+            for (int sub = 0; sub < PVChunks; ++sub) {
+                half2 p[4];
+                float alpha;
+                if constexpr (SharedSoftmax) {
+                    alpha = alpha_s[sub][lane];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) { p[j] = probabilities_s[sub][j][lane]; }
+                } else {
+                    alpha = prepare_probability(sub, p);
+                }
 
 #pragma unroll
                 for (int c = 0; c < DChunksLocal; ++c) {
@@ -464,13 +592,25 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                                  reinterpret_cast<const half2*>(
                                      &v_s[sub * 8 * SmemStride + dim_warp * DSlice + c * 8]),
                                  SmemStride / 2);
-                    half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
-                    volta_mma_pv(pv, p, vf);
+                    if constexpr (Fp32Pv) {
+                        if (sub == 0) {
+                            const float alpha_lo = alpha_s[0][lane & ~2];
+                            const float alpha_hi = alpha_s[0][lane | 2];
 #pragma unroll
-                    for (int n = 0; n < 4; ++n) {
-                        const float2 contrib = __half22float2(pv[n]);
-                        acc_f[c][2 * n + 0]   = acc_f[c][2 * n + 0] * alpha + contrib.x;
-                        acc_f[c][2 * n + 1]   = acc_f[c][2 * n + 1] * alpha + contrib.y;
+                            for (int j = 0; j < 8; ++j) {
+                                acc_f[c][j] *= (j & 2) == 0 ? alpha_lo : alpha_hi;
+                            }
+                        }
+                        volta_attention_pv_fp32(acc_f[c], p, vf);
+                    } else {
+                        half2 pv[4] = {{0, 0}, {0, 0}, {0, 0}, {0, 0}};
+                        volta_mma_pv(pv, p, vf);
+#pragma unroll
+                        for (int n = 0; n < 4; ++n) {
+                            const float2 contrib = __half22float2(pv[n]);
+                            acc_f[c][2 * n + 0] = acc_f[c][2 * n + 0] * alpha + contrib.x;
+                            acc_f[c][2 * n + 1] = acc_f[c][2 * n + 1] * alpha + contrib.y;
+                        }
                     }
                 }
             }
@@ -492,20 +632,38 @@ __launch_bounds__(128, 2) __global__ void gqa_attention_small_t_tc_volta_partial
                 partial_l[gqa_partial_stat_index<Geometry>(q_head, token, split, tokens)] = own_l;
             }
         }
-        if (row < rows_here) {
-            int q_head = 0;
-            int token  = 0;
-            gqa_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head, token);
-            if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+        if constexpr (Fp32Pv) {
 #pragma unroll
-                for (int c = 0; c < DChunksLocal; ++c) {
-                    const int d = dim_warp * DSlice + c * 8;
-                    __nv_bfloat16 out8[8];
+            for (int c = 0; c < DChunksLocal; ++c) {
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) { out8[i] = __float2bfloat16(acc_f[c][i]); }
-                    const std::int64_t dst =
-                        gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
-                    store_vec(&partial_acc[dst], *reinterpret_cast<const int4*>(out8));
+                for (int j = 0; j < 8; ++j) {
+                    const int output_row = volta_d_get_i(j);
+                    if (output_row < rows_here) {
+                        int q_head = 0, token = 0;
+                        gqa_small_t_tc_row_to_qt<Geometry>(row_base + output_row, tokens, kv_head,
+                                                          q_head, token);
+                        const int d = dim_warp * DSlice + c * 8 + volta_d_get_j(j);
+                        partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] =
+                            __float2bfloat16(acc_f[c][j]);
+                    }
+                }
+            }
+        } else {
+            if (row < rows_here) {
+                int q_head = 0;
+                int token  = 0;
+                gqa_small_t_tc_row_to_qt<Geometry>(row_base + row, tokens, kv_head, q_head, token);
+                if (gqa_valid_q_head<Geometry>(kv_head, q_head)) {
+#pragma unroll
+                    for (int c = 0; c < DChunksLocal; ++c) {
+                        const int d = dim_warp * DSlice + c * 8;
+                        __nv_bfloat16 out8[8];
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { out8[i] = __float2bfloat16(acc_f[c][i]); }
+                        const std::int64_t dst =
+                            gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens);
+                        store_vec(&partial_acc[dst], *reinterpret_cast<const int4*>(out8));
+                    }
                 }
             }
         }

@@ -238,11 +238,11 @@ namespace {
 void validate_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
                          const ExecutionContext& ec, bool column_parallel) {
     detail::require_split_context(
-        ec, "linear split: requires two or four distinct devices", ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        ec, "linear split: requires two or four distinct devices", ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count) || w.size() != x.size()) {
         throw std::invalid_argument("linear split: argument width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         if (x[0].ne[1] != x[rank].ne[1]) {
             throw std::invalid_argument("linear split: ranks must carry the same token count");
         }
@@ -264,7 +264,7 @@ void validate_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
 // require_rank_residency.
 void validate_split_residency(std::span<const Tensor> x, std::span<const Weight> w,
                               std::span<const Tensor> out, const ExecutionContext& ec) {
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, out[slot].data,
@@ -316,7 +316,7 @@ void linear_column_parallel(std::span<const Tensor> x, std::span<const Weight> w
                             std::span<const Tensor> out, const ExecutionContext& ec) {
     const std::array<WorkspaceArena*, kMaximumExecutionDevices> workspace{};
     linear_column_parallel(x, w, out, LinearPolicy::A16Only,
-                           std::span(workspace).first(ec.tp), ec);
+                           std::span(workspace).first(ec.device_count), ec);
 }
 
 void linear_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
@@ -326,7 +326,7 @@ void linear_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
     validate_split_pair(x, w, ec, /*column_parallel=*/false);
     auto destination = validated_outputs(x, w, out, policy, workspace);
     validate_split_residency(x, w, out, ec);
-    if (!events.live() || events.ranks() != ec.tp || staging.size() != x.size()) {
+    if (!events.live() || events.ranks() != ec.device_count || staging.size() != x.size()) {
         throw std::invalid_argument("linear row-parallel: staging/events must match TP width");
     }
 
@@ -345,7 +345,7 @@ void linear_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
                          const ExecutionContext& ec, const PeerEvents& events) {
     const std::array<WorkspaceArena*, kMaximumExecutionDevices> workspace{};
     linear_row_parallel(x, w, out, staging, LinearPolicy::A16Only,
-                        std::span(workspace).first(ec.tp), ec, events);
+                        std::span(workspace).first(ec.device_count), ec, events);
 }
 
 } // namespace ninfer::ops

@@ -2,9 +2,9 @@
 
 [中文文档](README.zh-CN.md) · [Performance methodology](docs/performance.md)
 
-Experimental native RAM-KV is opt-in with `--ram-kv-window N` (27B SM70, TP1/TP2, one Text/MTP
-request). It stores packed history in RAM and uses training-free **lexical retrieval**, not KVMem's
-Q/K-vector retriever. It changes long-history attention, including prefill; default full history
+Experimental native RAM-KV is opt-in with `--ram-kv-window N` (27B SM70, TP1/TP2/PP2, one Text/MTP
+request). It stores packed history in RAM and uses KVMem-inspired **Q/K mean-vector retrieval**.
+It changes long-history attention, including prefill; default full history
 is unchanged. See [RAM-KV contracts](docs/maintainer/paged-kv-cache.md#15-optional-native-ram-kv-experiment)
 and [launch options](docs/cli.md). The external KVMem evaluation is not a native NInfer speed claim.
 
@@ -28,11 +28,12 @@ Inherited RTX 5090/Ampere/Ada results and general upstream capabilities are inte
 ## Recommended model: QUASAR NVFP4
 
 Use the [QUASAR NInfer artifact, release v3](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/v3).
-On this host, [measured QUASAR throughput](#quasar-nvfp4) reaches **139.80 tok/s** on a
-3,072-token coding input and **100.34 tok/s** after warming an 85,000-token coding input
-(MTP3, committed wall decode). DFlash7 reaches **249.00 tok/s** on the native 32-record JSONL
-task, or **153.12 tok/s** with 85,000 input tokens. These are workload-specific results;
-DFlash is not faster on every task.
+The [final local evaluation](#final-decode-and-quality-evaluation) measures **126.89 tok/s**
+on an 85,000-token coding input with default MTP4, or **143.46 tok/s** with optional
+experimental attention. Prefill is about **1,310 tok/s**. DFlash7 reaches **255.31 tok/s**
+on the original short 32-record JSONL task; the earlier 85,000-input JSONL result is
+**153.12 tok/s**. Rates count committed output and depend on the workload.
+The experimental attention profile stays off by default; DFlash is not faster on every task.
 
 Maintainer's personal experience: "It feels in the same tier as FP8."
 
@@ -90,6 +91,10 @@ GPU memory; TP4 Vision and DFlash plus Vision remain unsupported.
   history token, the same KV format and the same partial-output precision. The INT8 attention
   kernel also computes each QK score tile once and shares it across the four output-dimension
   warps, preserving their softmax and PV accumulation order.
+- **Optional long attention:** `--volta-long-attention` keeps complete INT8 KV history but
+  retunes long TP2 partitions, online softmax and FP32 PV accumulation. It supports single-request
+  Text/None/MTP on SM70, excludes DFlash/RAM-KV/Vision, and can change generated output.
+  It remains default-off; see the [local numerical and GPQA comparison](docs/performance.md#quasar-v3-final-long-context-decode-evaluation).
 - **DFlash sliding-window attention:** the Volta path uses FP32 split numerators and a warp-per-row
   route once enough rows are in flight; direct tiny windows retain the CTA route. The supported
   local window is 2,048 or 4,096 positions, and the complete-history target KV is unchanged.
@@ -105,6 +110,11 @@ GPU memory; TP4 Vision and DFlash plus Vision remain unsupported.
   second explicit pinned-host copy route; PCIe P2P is not NVLink. Qualified SM70 all-reduces
   of at most 80 KiB now sum direct peer reads into rank-local staging; both reads retire before
   either input is overwritten. Wide prefill and peer-off collectives keep the DMA route.
+- **Experimental PP2:** SM70 Qwen3.8 NVFP4/QUASAR can use `--tp 1 --pp 2 --devices 0,1`.
+  Complete layers are split 32/32; chronological prefill chunks run on two stages, while
+  decode visits both stages serially. Text/None/MTP and prefix reuse are supported for one
+  request; optional sparse RAM-KV is supported, but Vision and DFlash are not. TP2 remains the default recommended route.
+  See [the matched pipeline evaluation](docs/performance.md#experimental-pp2-layer-pipeline).
 - **Volta TP2 residuals:** Q5 row shards now select executable SM70 SIMT, fused MMA, or CUTLASS
   routes with the actual peak workspace reserved. BF16 row shards use the SM70 CUTLASS route.
   Both paths pass their independent FP64 operator checks and the two-card composition tests.
@@ -426,6 +436,57 @@ LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64" \
 
 For DFlash, use `--max-context 98304 --prefill-chunk 1024 --spec dflash --draft-tokens 7`
 and omit `--lm-head-draft` to match the full-head measurements above.
+
+#### Final decode and quality evaluation
+
+2026-10-13, the same two V100-SXM2-16GB cards, PCIe P2P **without NVLink**,
+CUDA 12.8 / SM70. Saved 85000-token code input, 180000 capacity, complete INT8
+group-64 KV, chunk 2560, greedy optimized-head MTP4 and CUDA Graphs. Two cold
+requests per route, no prefix reuse or extra request warmup, 512 timed committed
+outputs plus one prefill output. Values are mean ± sample SD:
+
+| Route | Prefill tok/s | Committed wall decode tok/s | Acceptance |
+|---|---:|---:|---:|
+| Default QUASAR / MTP4 | 1313.37 ± 3.89 | 126.89 ± 0.03 | 79.02% |
+| `--volta-long-attention` / MTP4 | 1307.41 ± 2.96 | 143.46 ± 0.01 | 76.74% |
+
+The experimental startup flag retains complete history, uses coarser long KV
+partitions and FP32 PV accumulation, and improves decode **13.05%** in this pair.
+It changes floating-point association and can change generated output. It stays
+**default-off** and supports single-request SM70 27B TP2 Text/None/MTP with INT8
+KV; DFlash, RAM-KV and Vision are excluded. Wide prefill is unchanged. Total
+request times are 68.756 / 68.585 s: the decode gain is not a comparable whole-request
+speedup. Both profiles repeat their outputs/counters and match their own controls.
+150 tok/s was not reached; the optimization goal is closed at this result.
+
+Local GPQA-Diamond uses **104 shared questions with 85K unrelated-code padding**,
+131072 capacity, 32768 output budget, greedy MTP4 and `xhigh` thinking:
+
+| Local route | Correct / 104 | Accuracy | Budget truncations |
+|---|---:|---:|---:|
+| QUASAR default | 88 | 84.62% | 11 |
+| QUASAR experimental attention | 90 | 86.54% | 8 |
+| Official NVFP4 | 90 | 86.54% | 5 |
+| Q4_K_M | 87 | 83.65% | 5 |
+
+Truncated/missing answers count as incorrect. Default → experimental has two
+losses and four gains (paired p=0.6875). This sample does not show an accuracy
+decrease, but does not prove noninferiority or losslessness. It is not standard
+short-context GPQA or a completed 198-question evaluation; no local BF16/FP8
+reference was measured. The experimental route still fails the stricter shared-history
+logit-equivalence gate, so the switch remains available for the user's tradeoff.
+
+The original **118-input-token, 32-record JSONL generation** benchmark now measures
+**255.31 ± 0.11 committed tok/s** with DFlash7, compared with **249.00 ± 0.08**
+before (+2.53%); 300 tok/s was not reached. Capacity 98304, chunk 1024, full KV,
+full proposal head, one full warmup and two measured requests. Acceptance is 99.05%;
+all records, arithmetic, field order, output IDs and draft counters match the old
+benchmark. This is the original arithmetic task, not the demo JSON→JSONL prompt.
+
+[Phase timings, numerical limits and reproduction](docs/performance.md#quasar-v3-final-long-context-decode-evaluation).
+Health logs record no reset or volatile uncorrected ECC during these final cases;
+the GPU benchmark cooldown has been removed at the user's request. Raw reports,
+models and local demo HTML remain untracked.
 
 #### NVFP4 v3 occupied-context sweep
 
@@ -889,7 +950,7 @@ consulted [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM). DFlash2 follo
 [Inco AI's implementation](https://inco.ai/blog/dflash2/) and its
 [Qwen3.8-27B draft checkpoint](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2).
 [KVMem](https://github.com/kvmem/kvmem-llama.cpp) informed the optional RAM-KV experiment.
-The native prototype uses lexical retrieval, not KVMem's Q/K-vector retrieval; selective-history
+The native implementation adapts Q/K mean-vector retrieval to chronological paged KV; selective-history
 attention is approximate and explicitly opt-in. The default profile retains full-context attention.
 
 [Li3age](https://github.com/Li3age) contributed TP2 Vision and the configurable visual-token

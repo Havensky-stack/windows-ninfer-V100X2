@@ -69,6 +69,10 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out,
                 cudaStream_t stream) {
     const std::int32_t total_t = x.ne[1];
 #ifdef NINFER_VOLTA_BUILD
+    if (workspace != nullptr && nvfp4_volta_qpn_precast_supported(weight.n, weight.k, total_t)) {
+        launch_nvfp4_volta_qpn_precast(x, weight, out, *workspace, stream);
+        return;
+    }
     // Materialize each weight once for the whole prefill call, including QPN-prepacked TP2
     // shards. Repeated 32-token QPN launches reread the entire down projection per tile.
     if (workspace != nullptr && total_t >= 128) {
@@ -118,6 +122,7 @@ std::size_t nvfp4_linear_workspace_capacity_bytes(std::int32_t output_rows, std:
     if (max_tokens >= 128) {
         return nvfp4_cutlass_sm70_workspace_bytes(output_rows, input_rows, max_tokens);
     }
+    return nvfp4_volta_qpn_precast_workspace_bytes(output_rows, input_rows, max_tokens);
 #endif
     return 0;
 }

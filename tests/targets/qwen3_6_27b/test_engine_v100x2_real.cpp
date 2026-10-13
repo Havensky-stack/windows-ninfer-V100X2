@@ -57,6 +57,7 @@ ninfer::EngineOptions engine_options(const char* artifact, bool speculation, boo
     ninfer::EngineOptions options;
     options.artifact_path = artifact;
     options.tp = v100x2_test::tp();
+    options.pp = v100x2_test::pp();
     options.devices = v100x2_test::devices();
     options.max_context = kContext;
     options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(kContext);
@@ -350,7 +351,7 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
     } else {
         require(disagreements == 0, "outputs failed strict non-speculative teacher-forced argmax");
     }
-    if (profile.backend == ninfer::SpeculativeBackend::Mtp) {
+    if (profile.backend == ninfer::SpeculativeBackend::Mtp && v100x2_test::pp() == 1) {
         exercise_mtp_batches(artifact, profile, inputs);
     }
     return 0;
@@ -365,7 +366,8 @@ int main() {
         return 77;
     }
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < v100x2_test::tp()) {
+    if (cudaGetDeviceCount(&devices) != cudaSuccess ||
+        devices < v100x2_test::tp() * v100x2_test::pp()) {
         std::cout << "skip: insufficient devices for the selected tensor-parallel width\n";
         return 77;
     }

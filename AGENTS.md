@@ -114,7 +114,7 @@ measurements of this target. The supported identities are
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
 `qwen3.6-35b-a3b/groupwise-int`.
 The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
-SM70 TP2 Text/None/MTP/DFlash. It registers the published QUASAR v3 container identity, preserves its
+SM70 TP2 Text/None/MTP/DFlash and experimental PP2 Text/None/MTP. It registers the published QUASAR v3 container identity, preserves its
 256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
 controls and optional W8/BF16 DFlash2 package. The 27B draft window remains at most seven.
 This artifact's QAT/conversion quality is not established by inference smoke tests.
@@ -139,14 +139,29 @@ including TP2; the official NVFP4 v3 package preserves W8 projections and BF16 a
 The 27B draft window is at most seven. On this V100X2, the verified DFlash profile is 98304-token
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
-The explicit RAM-KV experiment is optional SM70 27B TP1/TP2 single-request Text/None/MTP.
-It stores original packed KV in a bounded RAM archive and uses lexical-256 retrieval with
-chronological resident page tables. This is approximate attention (also during long prefill),
-not full-history semantic equivalence or KVMem Q/K-vector retrieval. The default route is unchanged.
+The optional `volta_long_attention` profile admits SM70 27B TP2/PP1 single-request
+Text/None/MTP with complete INT8 group-64 KV, without Vision or RAM-KV. It retains every
+causally visible key but changes split partitioning, softmax association and PV accumulation;
+it is default-off and not bit-equivalent to ordinary attention. The 104-question local GPQA
+comparison is behavioral evidence, not a full 198-question evaluation or proof of losslessness.
+
+The explicit RAM-KV experiment is optional SM70 27B TP1/TP2/PP2 single-request Text/None/MTP.
+It stores original packed KV in a bounded RAM archive and uses KVMem-inspired Q/K cosine
+mean-128 retrieval with chronological resident page tables. Keys are decoded from the original
+cache and inverse-rotated for the index; attention still consumes unchanged packed KV.
+This is approximate attention (also during long prefill), not full-history semantic equivalence.
+The default route is unchanged.
 RAM archive budget and whole-process RSS/cgroup limits are distinct; external llama.cpp results
 do not establish native NInfer performance. See docs/maintainer/paged-kv-cache.md section 15.
 
-One Engine owns one resident model, with one device, TP2, or the selected TP4 domain on the 27B
+The requested pipeline experiment additionally admits SM70 Qwen3.8-27B NVFP4/QUASAR
+startup-fixed TP1/PP2 single-request Text/None/MTP with prefix reuse. Device 1 owns
+layers 0..31, device 0 layers 32..63 and output/MTP. Bounded chronological prefill waves
+overlap stages; decode visits both stages serially. Optional sparse RAM-KV is admitted.
+Vision, DFlash, storage mode
+and concurrency above one are not admitted. No request-time TP/PP migration is provided.
+
+One Engine owns one resident model, with one device, TP2, experimental PP2, or the selected TP4 domain on the 27B
 package and a startup-fixed
 one to eight active requests. The V100X2 acceptance workload is one active request on two cards.
 The Engine forms one compact decode batch at every round boundary and uses bounded
@@ -346,9 +361,7 @@ Keep aggregate host CPU usage below the user's approximately 85% ceiling while l
 headroom for the session. Choose build concurrency or an external process quota accordingly; this
 user constraint supersedes the inherited unrestricted-build rule. Low CPU use during CUDA waits
 does not by itself indicate throttling, and busy waiting is not a performance objective.
-For local GPU stress/benchmark campaigns, use active periods of at most approximately ten minutes
-followed by three minutes idle. Rest at completed-request boundaries, leaving enough margin for the
-next request, and rest between backend runs. Exclude cooldowns from request measurements and
+The user has removed the GPU benchmark cooldown requirement. Keep detailed health logs and
 resume only missing saved cases after interruption. Do not change power limits or clocks.
 
 These are conventional project resources, not a checklist of resources every task must use:

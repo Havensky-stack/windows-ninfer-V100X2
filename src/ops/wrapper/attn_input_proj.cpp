@@ -352,11 +352,11 @@ void validate_fused_split_pair(std::span<const Tensor> x, std::span<const Weight
                                const ExecutionContext& ec) {
     detail::require_split_context(
         ec,
-        "attn_input_proj column-parallel: requires two or four distinct devices", ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        "attn_input_proj column-parallel: requires two or four distinct devices", ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count) || w.size() != x.size()) {
         throw std::invalid_argument("attn_input_proj: input/weight width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
     if (x[0].ne[1] != x[rank].ne[1]) {
         throw std::invalid_argument(
             "attn_input_proj column-parallel: both ranks must carry the same token count");
@@ -464,18 +464,18 @@ void attn_input_proj_column_parallel(std::span<const Tensor> x,
                                      std::span<WorkspaceArena* const> workspace,
                                      const ExecutionContext& ec) {
     validate_fused_split_pair(x, query_key_gate_value_weight, ec);
-    require_destination_width(q, gate, k, v, workspace, ec.tp);
+    require_destination_width(q, gate, k, v, workspace, ec.device_count);
     // Validate both ranks before issuing either, so a rejected pair enqueues nothing.
     for (std::size_t slot = 0; slot < x.size(); ++slot) {
         validate_fused_column_rank_semantics(x[slot], query_key_gate_value_weight[slot], q[slot],
-                                             gate[slot], k[slot], v[slot], policy, ec.tp);
+                                             gate[slot], k[slot], v[slot], policy, ec.device_count);
         const auto bytes = attn_input_proj_column_parallel_workspace_capacity_bytes(
-            query_key_gate_value_weight[slot].qtype, policy, x[slot].ne[1], x[slot].ne[1], ec.tp);
+            query_key_gate_value_weight[slot].qtype, policy, x[slot].ne[1], x[slot].ne[1], ec.device_count);
         if (bytes && workspace[slot] == nullptr) {
             throw std::invalid_argument("attn_input_proj: this profile requires workspace");
         }
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, query_key_gate_value_weight[slot].payload, q[slot].data,
@@ -487,7 +487,7 @@ void attn_input_proj_column_parallel(std::span<const Tensor> x,
         const Weight& w  = query_key_gate_value_weight[slot];
         Tensor q_dst = q[slot], gate_dst = gate[slot], k_dst = k[slot], v_dst = v[slot];
 #ifdef NINFER_VOLTA_BUILD
-        if (ec.tp == 4) {
+        if (ec.device_count == 4) {
             detail::attn_input_volta_tp4_launch(x[slot], w, q_dst, gate_dst, k_dst, v_dst,
                                                workspace[slot], ec.dev[slot]->stream);
             return;
@@ -516,7 +516,7 @@ void attn_input_proj_column_parallel(std::span<const Tensor> x,
                                      const ExecutionContext& ec) {
     const std::array<WorkspaceArena*, 4> workspace{};
     attn_input_proj_column_parallel(x, query_key_gate_value_weight, q, gate, k, v,
-                                    LinearPolicy::A16Only, std::span(workspace).first(ec.tp), ec);
+                                    LinearPolicy::A16Only, std::span(workspace).first(ec.device_count), ec);
 }
 
 void attn_input_proj_column_parallel(std::span<const Tensor> x,
@@ -530,7 +530,7 @@ void attn_input_proj_column_parallel(std::span<const Tensor> x,
         throw std::invalid_argument("Q4/Q5 attention: argument width must equal two");
     }
     validate_split_storage_split_pair(x, query_key_weight, gate_value_weight, ec);
-    require_destination_width(q, gate, k, v, workspace, ec.tp);
+    require_destination_width(q, gate, k, v, workspace, ec.device_count);
     for (std::size_t slot = 0; slot < 2; ++slot) {
         if (workspace[slot] == nullptr) {
             throw std::invalid_argument("Q4/Q5 attention shard requires a workspace arena");

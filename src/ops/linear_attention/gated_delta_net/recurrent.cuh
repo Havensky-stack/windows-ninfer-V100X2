@@ -516,6 +516,7 @@ using FoldGeometry30x32 = FoldGeometry<30, 16, 32, 8192>;
 // (24 % 8 == 0, 5120 % 128 == 0).
 using FoldGeometry48x24Tp2 = FoldGeometry<48, 8, 24, 5120>;
 using FoldGeometry48x12Tp4 = FoldGeometry<48, 4, 12, 2560>;
+using FoldGeometry24x48Pp2 = FoldGeometry<24, 16, 48, 10240>;
 
 // Every registered fold geometry, in one place, so `launch_replay_fold`'s dispatch chain is
 // generated rather than hand-written: a newly registered geometry must not be left behind in a
@@ -524,7 +525,8 @@ using FoldGeometry48x12Tp4 = FoldGeometry<48, 4, 12, 2560>;
     X(FoldGeometry48x48)                                                                           \
     X(FoldGeometry30x32)                                                                           \
     X(FoldGeometry48x24Tp2)                                                                         \
-    X(FoldGeometry48x12Tp4)
+    X(FoldGeometry48x12Tp4)                                                                         \
+    X(FoldGeometry24x48Pp2)
 
 template <class Geometry>
 struct FoldAccess {

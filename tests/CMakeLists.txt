@@ -183,6 +183,10 @@ ninfer_add_test(ninfer_qwen3_8_27b_v100x2_real_test
 target_link_libraries(ninfer_qwen3_8_27b_v100x2_real_test PRIVATE CUDA::cudart)
 set_tests_properties(ninfer_qwen3_8_27b_v100x2_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Explicit artifact/corpus arguments keep this 85K numerical gate out of routine CTest runs.
+add_executable(ninfer_long_attention_real_test targets/qwen3_6_27b/test_long_attention_real.cpp)
+target_link_libraries(ninfer_long_attention_real_test PRIVATE ninfer_engine)
+target_include_directories(ninfer_long_attention_real_test PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
 # TP2 INT8 KV + MTP3/DFlash7 cache continuation and response-checkpoint replay.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100x2_prefix_real.cpp
@@ -459,6 +463,15 @@ ninfer_add_linear_test(ninfer_linear_q4_a16_test ops/linear/test_q4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q5_a16_test ops/linear/test_q5_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
+ninfer_add_op_test(ninfer_linear_w8_prepacked_sm70_test
+  SOURCES ops/linear/test_w8_prepacked_sm70.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_w8_volta_decode_test
+  SOURCES ops/linear/test_w8_volta_decode.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_q4_volta_proposal_test
+  SOURCES ops/linear/test_q4_volta_proposal.cu
+  LIBRARIES ninfer_ops)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_volta_tp4_a16_test ops/linear/test_volta_tp4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)

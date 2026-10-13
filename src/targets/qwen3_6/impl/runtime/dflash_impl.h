@@ -395,7 +395,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                    sizeof(qwen3_6::DFlashDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
         auto tp_ranks = tp_execution(state.execution);
-        const TpExecution* tp = state.execution.peers.empty() ? nullptr : &tp_ranks[0];
+        const PeerExecution* tp = state.execution.peers.empty() ? nullptr : &tp_ranks[0];
         qwen3_6::DFlashDecodeState* peer_frame = nullptr;
         if (tp) {
             if (!tp->io->dflash_decode || state.execution.peers[0].dflash_host_ingress == nullptr) {

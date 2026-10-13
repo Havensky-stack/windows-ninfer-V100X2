@@ -33,10 +33,17 @@ Binder::Binder(const Reader& reader, int device_count, bool storage_only)
 bool Binder::has_tensor(std::string_view name) const noexcept { return reader_.find(name) != nullptr; }
 
 void Binder::set_shard_resolver(ShardResolver resolver) {
-    if (!materialization_.device_objects.empty()) {
+    if (!materialization_.device_objects.empty() || device_mask_resolver_) {
         throw ArtifactError("the shard resolver must be installed before any tensor is placed");
     }
     shard_resolver_ = std::move(resolver);
+}
+
+void Binder::set_device_mask_resolver(DeviceMaskResolver resolver) {
+    if (!materialization_.device_objects.empty() || shard_resolver_ || storage_only_) {
+        throw ArtifactError("device placement must be selected before materialization");
+    }
+    device_mask_resolver_ = std::move(resolver);
 }
 
 ObjectHandle Binder::find_unconsumed(std::string_view name) {
@@ -115,6 +122,17 @@ void Binder::materialize_on_device(ObjectHandle handle) {
                             std::string(tensor->name));
     }
     const std::uint64_t alignment = tensor_alignment(tensor->layout);
+    if (device_mask_resolver_) {
+        const std::uint32_t mask = device_mask_resolver_(tensor->name);
+        if (mask == 0 || (mask >> materialization_.device_count) != 0) {
+            throw ArtifactError("invalid device placement mask: " + std::string(tensor->name));
+        }
+        for (int device = 0; device < materialization_.device_count; ++device) {
+            if ((mask & (1U << device)) != 0) { place_on_device(handle, device); }
+        }
+        planned_[handle.index] = true;
+        return;
+    }
     const ShardPlacement placement =
         shard_resolver_ ? shard_resolver_(tensor->name) : ShardPlacement{};
 

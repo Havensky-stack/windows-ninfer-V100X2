@@ -121,7 +121,7 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--rope native|yarn] [--yarn-factor F] [--yarn-origin O]\n"
-           "       [--device N] [--tp 1|2|4] [--devices N,...] [--storage-device N]\n"
+           "       [--device N] [--tp 1|2|4] [--pp 1|2] [--pipeline-chunks 1..8] [--devices N,...] [--storage-device N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--ram-kv-window N] [--ram-kv-budget-bytes N]\n"
            "       [--lm-head-draft]\n"
@@ -136,7 +136,8 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--ram-kv-window enables experimental approximate lexical RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2).\n"
+           "--volta-long-attention selects experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ.\n"
+           "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
            "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"
            "independently of text context; smaller budgets reduce reserved Vision memory.\n"
@@ -146,11 +147,13 @@ std::string usage_text(const char* argv0) {
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n"
            "--tp selects the tensor-parallel degree (default 1); --tp 2 splits the model across "
-           "two GPUs and requires --devices; it supports --spec mtp, --spec dflash and "
-           "--vision.\n"
+           "two GPUs and supports --spec mtp, --spec dflash and --vision.\n"
+           "--pp 2 selects SM70 Qwen3.8 NVFP4/QUASAR layer pipeline execution instead "
+           "(requires --tp 1 --devices 0,1; Text/None/MTP, one active request). "
+           "--pipeline-chunks controls the prefill wave (default 8; 1 is serial).\n"
            "--tp 4 supports SM70 Qwen3.8-27B NVFP4 and native FP8 Text/MTP; use --devices 0,1,2,3. Vision and DFlash "
            "remain unsupported at this width.\n"
-           "--devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
+           "--devices lists --tp * --pp device ids, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
            "primary device.\n"
            "--storage-device N enables 35B expert-storage mode: tp stays 1 and N is the second "
@@ -206,6 +209,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--volta-long-attention") {
+            options.volta_long_attention = true;
         } else if (arg == "--ram-kv-window") {
             options.ram_kv.gpu_tokens = parse_u32(value(arg), "ram-kv-window");
         } else if (arg == "--ram-kv-budget-bytes") {
@@ -217,6 +222,14 @@ Options parse_options(int argc, char** argv) {
             device_explicit = true;
         } else if (arg == "--tp") {
             options.tp = parse_tp(value(arg));
+        } else if (arg == "--pp") {
+            options.pp = parse_device(value(arg));
+            if (options.pp != 1 && options.pp != 2) { throw std::invalid_argument("--pp must be 1 or 2"); }
+        } else if (arg == "--pipeline-chunks") {
+            options.pipeline_chunks = parse_u32(value(arg), "pipeline-chunks");
+            if (options.pipeline_chunks < 1 || options.pipeline_chunks > 8) {
+                throw std::invalid_argument("--pipeline-chunks must be between 1 and 8");
+            }
         } else if (arg == "--devices") {
             options.devices  = parse_devices(value(arg));
             devices_explicit = true;
@@ -294,14 +307,14 @@ Options parse_options(int argc, char** argv) {
     }
 
     if (devices_explicit) {
-        if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
-            throw std::invalid_argument("--devices must list exactly --tp device ids");
+        if (options.devices.size() != static_cast<std::size_t>(options.tp * options.pp)) {
+            throw std::invalid_argument("--devices must list exactly --tp * --pp device ids");
         }
         if (device_explicit && options.devices.front() != options.device) {
             throw std::invalid_argument("--device and --devices disagree on the primary device");
         }
         options.device = options.devices.front();
-    } else if (options.tp == 1) {
+    } else if (options.tp * options.pp == 1) {
         options.devices = {options.device};
     }
 
