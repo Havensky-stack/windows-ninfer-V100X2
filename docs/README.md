@@ -1,15 +1,16 @@
 # NInfer documentation
 
-Start with the [project README](../README.md) or [中文文档](../README.zh-CN.md) for the CUDA 12.8
-V100X2 build, Q4_K_M conversion, 180,000-token INT8-KV/MTP3 usage, and separately labeled
-P2P-enabled and P2P-disabled measurements. The Chinese guide also includes the NVFP4 API
-launch command; general protocol examples live in the serving guide below.
+Start with the [中文首页](../README.md) or [English overview](../README.en.md) for this Windows
+fork's contributions, upstream sources, portable application and verified operating limits.
+General engine references below include inherited capabilities that are not all qualified on
+Windows; the Windows guide identifies the actual local evidence.
 
 ## User guides
 
 | Document | Purpose |
 |---|---|
-| [Windows toolchain](windows-toolchain.md) | local GRID/WDDM, CUDA 12.8, MSVC and TP2 probe qualification; full Windows port pending |
+| [Windows application](windows-app.md) | portable launcher, bundled dependencies, model download, tests and release packaging |
+| [Windows toolchain](windows-toolchain.md) | local GRID/WDDM, isolated CUDA 12.8/MSVC, native build, real inference and capacity checks |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, dual-GPU (`--tp 2`) execution, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, dual-GPU serving, and YaRN extended context |
 | [PyQt 控制台](gui.md) | 图形化启动/停止 API、TP/设备、上下文/KV、MTP/DFlash、缓存、并发和采样参数 |

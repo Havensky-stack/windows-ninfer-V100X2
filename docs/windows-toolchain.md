@@ -1,5 +1,8 @@
 # Windows 双 V100 工具链
 
+普通用户优先使用[中文首页的便携应用](../README.md#小白使用下载解压双击)，无需安装编译环境。
+启动器与发行打包说明见 [Windows 应用维护](windows-app.md)。本文面向自行编译和复查验证的用户。
+
 本 fork 的 Windows 工作以 `tuxKOH/ninfer-V100X2` 的双卡执行路径为基础，参考
 [ww485000 的 Windows 单卡分支](https://github.com/ww485000/ninfer-windows-v100/tree/v100-sm70)
 的平台适配。Windows CLI/API 已完成整个引擎的编译、链接和 `--help` 启动检查。

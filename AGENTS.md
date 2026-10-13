@@ -117,6 +117,10 @@ unchanged; fine-tune quality and Windows performance require their own evidence.
 For this trial the Windows launcher defaults to ordinary decode: MTP graph/eager parity passed,
 but the strict teacher-forced gate found one disagreement in 64 positions. Keep that failure
 visible and do not claim MTP qualification or weaken its criterion to accommodate the artifact.
+The Windows portable launcher under `tools/windows/launcher` owns only dependency checks,
+explicit model download, child-service lifecycle and a local HTTP client. Inference remains
+owned by the public Engine/server route. The Chinese `README.md` leads with this fork's
+contributions and upstream attribution; inherited Linux measurements are not Windows claims.
 
 NInfer is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
 checkpoint artifacts. This checkout's active target is maximum single-request performance on

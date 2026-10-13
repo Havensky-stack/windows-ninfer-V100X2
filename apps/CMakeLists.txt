@@ -17,3 +17,12 @@ target_include_directories(ninfer-serve PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_load_progress)
+if(MSVC)
+  # UTF-8 argv/filesystem paths also work when the portable app or model lives
+  # in a Chinese-named directory. No elevation or global code-page change.
+  foreach(app ninfer ninfer-serve)
+    target_link_options(${app} PRIVATE
+      "/MANIFEST:EMBED"
+      "/MANIFESTINPUT:${PROJECT_SOURCE_DIR}/tools/windows/launcher/app.manifest")
+  endforeach()
+endif()
