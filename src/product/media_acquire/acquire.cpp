@@ -2,9 +2,14 @@
 
 #include <curl/curl.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -143,6 +148,20 @@ UrlParts parse_url(std::string_view value) {
 }
 
 std::string resolve_public(const UrlParts& url, bool allow_private) {
+#ifdef _WIN32
+    struct WinsockSession {
+        WinsockSession() {
+            WSADATA data{};
+            const int status = WSAStartup(MAKEWORD(2, 2), &data);
+            if (status != 0) {
+                throw Error(ErrorKind::RemoteUnavailable,
+                            "Winsock initialization failed: " + std::to_string(status));
+            }
+        }
+        ~WinsockSession() { WSACleanup(); }
+    };
+    static const WinsockSession winsock;
+#endif
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -287,7 +306,7 @@ std::vector<std::uint8_t> read_path(const Source& source, const Policy& policy) 
     if (!policy.media_root.empty()) {
         const std::filesystem::path root = std::filesystem::weakly_canonical(policy.media_root, ec);
         const auto relative              = std::filesystem::relative(path, root, ec);
-        if (ec || relative.empty() || relative.native().starts_with("..")) {
+        if (ec || relative.empty() || relative.generic_u8string().starts_with(u8"..")) {
             throw std::invalid_argument("media path is outside configured media root");
         }
     }

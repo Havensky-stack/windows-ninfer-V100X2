@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <future>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -204,6 +205,44 @@ void test_common_validation() {
     }
 }
 
+// Independent reads share one file handle during parallel shard materialization.
+// Exercise Unicode paths, distinct offsets, short reads, EOF and buffer boundaries.
+void test_concurrent_direct_reads() {
+    auto fixture = write_fixture({
+        {"identity", {{"model_id", "fixture-model"}, {"weights_id", "fixture-weights"}}},
+        {"objects", Json::array({
+            {{"name", "first"}, {"kind", "resource"}, {"encoding", "raw-bytes-v1"},
+             {"offset", 0}, {"bytes", 4096}},
+            {{"name", "tail"}, {"kind", "resource"}, {"encoding", "raw-bytes-v1"},
+             {"offset", 4096}, {"bytes", 257}}
+        })}
+    }, "concurrent_io");
+    auto unicode_path = fixture.path.parent_path() / std::filesystem::path(u8"ninfer_中文_concurrent_io.ninfer");
+    std::filesystem::rename(fixture.path, unicode_path);
+    fixture.path = std::move(unicode_path);
+    Reader reader(fixture.path);
+    auto read = [&](int block) {
+        alignas(Reader::direct_io_alignment) std::array<std::byte, 4096> output;
+        const std::size_t expected = block == 0 ? 4096 : 257;
+        for (int repeat = 0; repeat < 32; ++repeat) {
+            output.fill(std::byte{0xcd});
+            const auto count = reader.read_direct(reader.payload_offset() + block * 4096, output);
+            if (count != expected) { throw std::runtime_error("incorrect direct read size"); }
+            for (std::size_t i = 0; i < output.size(); ++i) {
+                const auto value = i < expected ? std::byte(block + 1) : std::byte{0xcd};
+                if (output[i] != value) { throw std::runtime_error("direct read data or guard mismatch"); }
+            }
+        }
+        if (reader.read_direct(reader.payload_offset() + 8192, output) != 0) {
+            throw std::runtime_error("direct read beyond EOF did not return zero");
+        }
+    };
+    auto first = std::async(std::launch::async, read, 0);
+    auto second = std::async(std::launch::async, read, 1);
+    first.get();
+    second.get();
+}
+
 } // namespace
 
 int main() {
@@ -211,6 +250,7 @@ int main() {
         test_registered_sizes();
         test_normative_fixture();
         test_common_validation();
+        test_concurrent_direct_reads();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

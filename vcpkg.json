@@ -1,0 +1,9 @@
+{
+  "name": "ninfer-v100x2",
+  "version-string": "0.1.0",
+  "builtin-baseline": "4bca8fd8654e5ba76f92661db7bfe954768ad8ef",
+  "dependencies": [
+    { "name": "curl", "default-features": false, "features": ["ssl"] },
+    { "name": "ffmpeg", "default-features": false, "features": ["avcodec", "avformat", "swscale", "zlib"] }
+  ]
+}

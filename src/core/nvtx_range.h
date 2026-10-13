@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib> // NVTX uses _wgetenv on Windows.
 #include <nvtx3/nvToolsExt.h>
 
 #include <string>

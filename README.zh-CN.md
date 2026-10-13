@@ -2,6 +2,9 @@
 
 [English](README.md) · [详细评测方法](docs/performance.md) · [HTTP API](docs/serving.md)
 
+本 Windows fork 的工具链、构建步骤和本机验证范围见 [Windows 双 V100 指南](docs/windows-toolchain.md)。
+下方继承的 Linux 性能数据不代表 Windows/GRID 实测结果。
+
 原生 RAM-KV 实验入口：`--ram-kv-window N`，支持 27B SM70、TP1/TP2、单请求 Text/MTP。
 首版采用免训练 **token 匹配检索**，并非 KVMem 的 Q/K 向量检索移植。RAM 无损存储 packed KV，
 但未选中的历史页不参与注意力，长 prefill 也会淘汰，可能漏召回；默认完整历史路径不变。

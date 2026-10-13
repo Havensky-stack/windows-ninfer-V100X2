@@ -24,6 +24,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -738,6 +739,53 @@ int test_official_resource_guards() {
     return failures;
 }
 
+int test_coder390_template() {
+    const auto source = read_file(NINFER_SOURCE_DIR
+        "/tests/fixtures/frontend/coder390_chat_template.jinja");
+    const auto compiled = fi::CompiledChatTemplate::resolve(source);
+    auto standalone = resources(source);
+    auto config = nlohmann::json::parse(standalone.tokenizer_config_json);
+    config.erase("chat_template");
+    standalone.tokenizer_config_json = config.dump();
+    const auto frontend = FrontendFactory::create_component(standalone);
+    int failures = check(frontend.prompt_capabilities().reasoning_effort.xhigh,
+                         "standalone Coder390 template lost reasoning effort");
+    const auto reference = nlohmann::json::parse(read_file(NINFER_SOURCE_DIR
+        "/tests/fixtures/frontend/coder390_chat_expected.json"));
+    for (const auto& test : reference.at("cases")) {
+        std::vector<fi::ChatMessage> messages;
+        for (const auto& value : test.at("messages")) {
+            const auto role = value.at("role").get<std::string>();
+            const auto kind = role == "user" ? ninfer::ChatRole::User
+                : role == "system" ? ninfer::ChatRole::System
+                : role == "developer" ? ninfer::ChatRole::Developer
+                : role == "tool" ? ninfer::ChatRole::Tool : ninfer::ChatRole::Assistant;
+            auto message = chat_message(kind, value.at("content").get<std::string>());
+            message.reasoning_content = value.value("reasoning_content", "");
+            messages.push_back(std::move(message));
+        }
+        const auto& options = test.at("options");
+        fi::ChatRenderOptions render;
+        render.enable_thinking = options.value("enable_thinking", true);
+        render.add_generation_prompt = options.value("add_generation_prompt", true);
+        if (options.contains("preserve_thinking")) {
+            render.preserve_thinking = options.at("preserve_thinking").get<bool>();
+        }
+        if (options.contains("reasoning_effort")) {
+            render.reasoning_effort = options.at("reasoning_effort") == "low"
+                ? ninfer::ReasoningEffort::Low
+                : options.at("reasoning_effort") == "xhigh" ? ninfer::ReasoningEffort::XHigh
+                                                           : ninfer::ReasoningEffort::Medium;
+        }
+        const auto actual = compiled.render(messages, render);
+        if (actual.text != test.at("expected").get<std::string>()) {
+            std::cerr << "Coder390 Jinja parity: " << test.at("name") << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::ChatMessage text_message;
     text_message.role = ninfer::ChatRole::User;
@@ -1414,7 +1462,12 @@ int test_media_preparation_cancellation() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) try {
+    if (argc == 2 && std::string_view(argv[1]) == "--coder390-template") {
+        const int failures = test_official_resource_guards() + test_coder390_template();
+        if (failures == 0) { std::cout << "Coder390 Jinja parity and resource guards PASS\n"; }
+        return failures == 0 ? 0 : 1;
+    }
     const FrontendResources owned = resources();
     const Frontend frontend       = FrontendFactory::create_component(owned);
     int failures                  = 0;
@@ -1425,6 +1478,7 @@ int main() {
     failures += test_reasoning_effort_chat_template();
     failures += test_rewrite_checkpoint_trace();
     failures += test_official_resource_guards();
+    failures += test_coder390_template();
     failures += test_text_and_image_prepare(frontend);
     failures += test_media_admission_uses_aggregate_resources(frontend);
     failures += test_multimodal_prompt_over_removed_32k_cap(frontend);
@@ -1446,4 +1500,7 @@ int main() {
     failures += test_disabled_vision();
     failures += test_visual_budget_independent_of_text_context();
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& error) {
+    std::cerr << "frontend test: " << error.what() << '\n';
+    return 1;
 }

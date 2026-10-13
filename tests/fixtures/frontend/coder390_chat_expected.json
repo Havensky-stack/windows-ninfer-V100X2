@@ -1,0 +1,148 @@
+{
+  "oracle": "Jinja2 3.1.6 rendering the unmodified published Coder390 template; exact UTF-8 output",
+  "cases": [
+    {
+      "name": "no_thinking",
+      "messages": [
+        {
+          "role": "user",
+          "content": "hello"
+        }
+      ],
+      "options": {
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "default_effort",
+      "messages": [
+        {
+          "role": "user",
+          "content": "hello"
+        }
+      ],
+      "options": {},
+      "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "low_effort",
+      "messages": [
+        {
+          "role": "developer",
+          "content": "be brief"
+        },
+        {
+          "role": "user",
+          "content": "hello"
+        }
+      ],
+      "options": {
+        "reasoning_effort": "low"
+      },
+      "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nbe brief<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "positional_instructions",
+      "messages": [
+        {
+          "role": "user",
+          "content": "hello"
+        },
+        {
+          "role": "developer",
+          "content": "use JSON"
+        },
+        {
+          "role": "user",
+          "content": "answer"
+        }
+      ],
+      "options": {
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nhello<|im_end|>\n<|im_start|>system\nuse JSON<|im_end|>\n<|im_start|>user\nanswer<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "tool_only_history",
+      "messages": [
+        {
+          "role": "tool",
+          "content": "first result"
+        },
+        {
+          "role": "tool",
+          "content": "second result"
+        }
+      ],
+      "options": {
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\n<tool_response>\nfirst result\n</tool_response>\n<tool_response>\nsecond result\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    },
+    {
+      "name": "tool_then_assistant",
+      "messages": [
+        {
+          "role": "tool",
+          "content": "result"
+        },
+        {
+          "role": "assistant",
+          "content": "answer",
+          "reasoning_content": "reason"
+        }
+      ],
+      "options": {
+        "enable_thinking": false,
+        "add_generation_prompt": false
+      },
+      "expected": "<|im_start|>user\n<tool_response>\nresult\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\nreason\n</think>\n\nanswer<|im_end|>\n"
+    },
+    {
+      "name": "preserve_default",
+      "messages": [
+        {
+          "role": "user",
+          "content": "q1"
+        },
+        {
+          "role": "assistant",
+          "content": "a1",
+          "reasoning_content": "old thought"
+        },
+        {
+          "role": "user",
+          "content": "q2"
+        }
+      ],
+      "options": {
+        "reasoning_effort": "medium"
+      },
+      "expected": "<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think>\nold thought\n</think>\n\na1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "name": "drop_old_reasoning",
+      "messages": [
+        {
+          "role": "user",
+          "content": "q1"
+        },
+        {
+          "role": "assistant",
+          "content": "a1",
+          "reasoning_content": "old thought"
+        },
+        {
+          "role": "user",
+          "content": "q2"
+        }
+      ],
+      "options": {
+        "preserve_thinking": false,
+        "enable_thinking": false
+      },
+      "expected": "<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\na1<|im_end|>\n<|im_start|>user\nq2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    }
+  ]
+}

@@ -1,6 +1,11 @@
 NInfer
 ======
 
+Windows artifact mapping and overlapped I/O adapted from the Apache-2.0
+ww485000/ninfer-windows-v100 v100-sm70 branch:
+https://github.com/ww485000/ninfer-windows-v100/tree/v100-sm70
+Windows V100X2 integration by the Havensky-stack/windows-ninfer-V100X2 contributors.
+
 This product includes software developed as the NInfer project.
 
 Original work

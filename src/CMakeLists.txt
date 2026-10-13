@@ -32,7 +32,7 @@ add_library(ninfer_core STATIC
   runtime/engine/request_memory.cpp)
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads)
 
 # Generic .ninfer framing, binding, and direct final materialization.
 add_library(ninfer_artifact STATIC
@@ -57,7 +57,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
     CUDA_SEPARABLE_COMPILATION OFF
     CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
   target_compile_options(ninfer_nvfp4_tma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
-  target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+  target_link_libraries(ninfer_nvfp4_tma PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
 endif()
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
@@ -346,18 +346,22 @@ add_library(ninfer_text STATIC
   text/unicode.cpp
   ${PROJECT_SOURCE_DIR}/third_party/utf8proc/utf8proc.c)
 ninfer_internal_includes(ninfer_text)
+target_compile_definitions(ninfer_text PUBLIC UTF8PROC_STATIC)
 
 add_library(ninfer_media_decode STATIC
   media/decode/decode.cpp)
 ninfer_internal_includes(ninfer_media_decode)
-target_link_libraries(ninfer_media_decode PRIVATE PkgConfig::FFMPEG)
+target_link_libraries(ninfer_media_decode PRIVATE ${NINFER_FFMPEG_TARGET})
 
 if(NINFER_BUILD_MEDIA_ACQUIRE)
   # Product-only path/data/HTTP acquisition. No target package links this library.
   add_library(ninfer_media_acquire STATIC
     product/media_acquire/acquire.cpp)
   ninfer_internal_includes(ninfer_media_acquire)
-  target_link_libraries(ninfer_media_acquire PRIVATE PkgConfig::LIBCURL)
+  target_link_libraries(ninfer_media_acquire PRIVATE ${NINFER_CURL_TARGET})
+  if(WIN32)
+    target_link_libraries(ninfer_media_acquire PRIVATE ws2_32)
+  endif()
 endif()
 
 if(NINFER_BUILD_PROMPT_INPUT)
@@ -416,5 +420,5 @@ if(NINFER_BUILD_SERVE)
     ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
   target_link_libraries(ninfer_serve
     PUBLIC ninfer_engine Threads::Threads
-    PRIVATE ninfer_media_acquire CUDA::cudart)
+    PRIVATE ninfer_media_acquire ${NINFER_CUDART_TARGET})
 endif()

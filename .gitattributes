@@ -1,0 +1,2 @@
+# Template fixtures are hashed as exact resource bytes, including on Windows.
+tests/fixtures/frontend/*.jinja text eol=lf

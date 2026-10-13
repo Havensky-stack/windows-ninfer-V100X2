@@ -2,6 +2,9 @@
 
 [中文文档](README.zh-CN.md) · [Performance methodology](docs/performance.md)
 
+Windows fork: [native CLI/API build, toolchain and validation](docs/windows-toolchain.md).
+Linux measurements below are not Windows/GRID results; see the guide for the local qualification scope.
+
 Experimental native RAM-KV is opt-in with `--ram-kv-window N` (27B SM70, TP1/TP2, one Text/MTP
 request). It stores packed history in RAM and uses training-free **lexical retrieval**, not KVMem's
 Q/K-vector retriever. It changes long-history attention, including prefill; default full history

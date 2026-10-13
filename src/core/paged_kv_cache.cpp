@@ -8,7 +8,11 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 
 namespace ninfer {
 namespace {
@@ -302,7 +306,7 @@ void PagedKVPool::release_row(std::int32_t row) noexcept {
 }
 
 struct PagedKVAllocation::RamState {
-    void* archive = MAP_FAILED;
+    void* archive = nullptr;
     std::size_t bytes = 0;
     std::vector<std::size_t> plane_offsets;
     std::vector<bool> archived;
@@ -321,11 +325,22 @@ struct PagedKVAllocation::RamState {
             plane_offsets.push_back(offset);
             offset += pool.plane(p).nb[3] * pool.logical_page_capacity();
         }
+#ifdef _WIN32
+        archive = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (archive == nullptr) { throw std::bad_alloc(); }
+#else
         archive = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (archive == MAP_FAILED) { throw std::bad_alloc(); }
+#endif
     }
-    ~RamState() { if (archive != MAP_FAILED) { munmap(archive, bytes); } }
+    ~RamState() {
+#ifdef _WIN32
+        if (archive != nullptr) { VirtualFree(archive, 0, MEM_RELEASE); }
+#else
+        if (archive != nullptr) { munmap(archive, bytes); }
+#endif
+    }
 };
 
 PagedKVAllocation::PagedKVAllocation() noexcept = default;

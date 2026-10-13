@@ -72,7 +72,7 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
+target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
 
 # Stop-aware task measurement over saved exact-token workload cases.
 add_executable(ninfer_v100_task_bench ${PROJECT_SOURCE_DIR}/tools/v100/bench_tasks.cpp)

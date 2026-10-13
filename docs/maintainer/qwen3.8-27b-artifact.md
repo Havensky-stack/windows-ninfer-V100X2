@@ -107,6 +107,21 @@ frontend. Text and MTP are verified through the public Engine route; Vision obje
 for the existing Vision route. The optional v3 DFlash2 objects are also projected and validated;
 they become GPU-resident only when DFlash is selected at Engine startup.
 
+The Windows Coder390 trial additionally admits metadata name
+`qwen3.8-27b-coder390-w4a4-mtp-dflash2` from Merkyor's
+`Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer` v3 package.
+It uses the same `qwen3.8-27b/nvfp4` storage profile and complete adapter/binder validation,
+without rewriting source weights or substituting frontend resources. This is an explicit
+fine-tune admission, not acceptance of arbitrary model names or the publisher's older V2
+packages. Its dedicated `chat_template.jinja` is preserved directly; the tokenizer-config
+copy is optional and must match when present. The registered template retains reasoning-effort
+controls and accepts tool-result histories with no retained user turn. Eight exact rendering
+fixtures use the original template under Jinja2 as their oracle. Its ten standalone
+W8 DFlash context K/V objects must match the corresponding QKV row slices exactly in every
+code and FP16 scale before the adapter reuses those QKV rows; unequal duplicates are rejected.
+Windows validation and the selected download are documented in
+[the Windows guide](../windows-toolchain.md).
+
 ### 1.2 Optional v3 DFlash2 package
 
 The official v3 container supplies 66 DFlash2 objects totaling 2,226,792,960 bytes. Main feature,

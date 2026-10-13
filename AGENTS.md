@@ -104,6 +104,20 @@ intermediate artifacts are excluded unless requested or themselves the deliverab
 
 ## Current product contract
 
+This fork additionally targets native Windows 11 on two V100-SXM2 16 GB cards in GRID/WDDM
+mode. Keep the user's graphics/game configuration and existing system CUDA installation intact.
+Use the isolated CUDA 12.8/MSVC 14.44 environment under `tools/windows`; Windows platform
+adaptations preserve the existing Engine, TP2 schedules, artifact formats and numerical Ops.
+The Windows qualification scope and commands live in `docs/windows-toolchain.md`. Linux or
+single-card TCC results are not Windows TP2 performance evidence.
+The requested Coder390 trial admits the published single-file v3 package named
+`qwen3.8-27b-coder390-w4a4-mtp-dflash2` through the existing `qwen3.8-27b/nvfp4`
+storage and execution contract. Its packed weights, divisors and frontend resources remain
+unchanged; fine-tune quality and Windows performance require their own evidence.
+For this trial the Windows launcher defaults to ordinary decode: MTP graph/eager parity passed,
+but the strict teacher-forced gate found one disagreement in 64 positions. Keep that failure
+visible and do not claim MTP qualification or weaken its criterion to accommodate the artifact.
+
 NInfer is a from-scratch C++/CUDA inference engine for a small set of explicitly registered
 checkpoint artifacts. This checkout's active target is maximum single-request performance on
 two Tesla V100-SXM2 16 GB cards using CUDA 12.8 and `sm_70`. It combines the RTX 3060 TP2 path

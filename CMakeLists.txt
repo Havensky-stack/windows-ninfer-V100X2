@@ -14,6 +14,10 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
+if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+  include(tools/windows/msvc-dependencies.cmake)
+endif()
+
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
     message(FATAL_ERROR "Volta sm_70 requires CUDA 12.8; CUDA 13 removed Volta compilation")
@@ -55,6 +59,8 @@ if(MSVC)
   # dim3 constructors behind its own __cplusplus >= 201103L test, which fails to compile every
   # translation unit that builds a dim3 in a constant expression.
   add_compile_options(
+    $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
     $<$<COMPILE_LANGUAGE:C,CXX>:/Zc:__cplusplus>
@@ -95,6 +101,7 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 if(WIN32)
+  set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
   set(NINFER_CUDART_TARGET CUDA::cudart_static)
 else()
   set(NINFER_CUDART_TARGET CUDA::cudart)

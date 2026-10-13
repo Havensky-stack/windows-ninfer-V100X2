@@ -164,6 +164,11 @@ The artifact contains exactly these `raw-bytes-v1` resources:
 
 The artifact retains these resource payloads byte-for-byte.
 
+The standalone registered chat template is authoritative. A duplicate `chat_template` field
+in `tokenizer_config.json` is optional; when supplied it must match the standalone resource.
+Unknown template source bytes remain rejected. The Coder390 template registration and its
+tool-history semantics are described in the Qwen3.8 artifact reference.
+
 ## 5. Text and optimized MTP draft inventory
 
 ### 5.1 Text-global objects

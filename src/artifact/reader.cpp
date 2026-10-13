@@ -18,10 +18,14 @@
 #include <unordered_map>
 #include <utility>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace ninfer::artifact {
 namespace {
@@ -190,9 +194,55 @@ struct TransparentStringHash {
     }
 };
 
+// Windows mapping and overlapped reads adapted from ww485000/ninfer-windows-v100.
 class MappedFile {
 public:
     explicit MappedFile(const std::filesystem::path& path) {
+#ifdef _WIN32
+        file_ = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, nullptr);
+        if (file_ == INVALID_HANDLE_VALUE) {
+            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                                    "CreateFileW " + path.string());
+        }
+        LARGE_INTEGER file_size{};
+        if (!::GetFileSizeEx(file_, &file_size)) {
+            const auto error = ::GetLastError();
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            throw std::system_error(static_cast<int>(error), std::system_category(),
+                                    "GetFileSizeEx " + path.string());
+        }
+        if (file_size.QuadPart < 0 ||
+            static_cast<std::uint64_t>(file_size.QuadPart) >
+                std::numeric_limits<std::size_t>::max()) {
+            ::CloseHandle(file_);
+            file_ = INVALID_HANDLE_VALUE;
+            throw ArtifactError("artifact size does not fit the process address space");
+        }
+        size_ = static_cast<std::size_t>(file_size.QuadPart);
+        if (size_ != 0) {
+            mapping_ = ::CreateFileMappingW(file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (mapping_ == nullptr) {
+                const auto error = ::GetLastError();
+                ::CloseHandle(file_);
+                file_ = INVALID_HANDLE_VALUE;
+                throw std::system_error(static_cast<int>(error), std::system_category(),
+                                        "CreateFileMappingW " + path.string());
+            }
+            data_ = static_cast<const std::byte*>(
+                ::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0));
+            if (data_ == nullptr) {
+                const auto error = ::GetLastError();
+                ::CloseHandle(mapping_);
+                ::CloseHandle(file_);
+                mapping_ = nullptr;
+                file_    = INVALID_HANDLE_VALUE;
+                throw std::system_error(static_cast<int>(error), std::system_category(),
+                                        "MapViewOfFile " + path.string());
+            }
+        }
+#else
         const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
         if (fd < 0) {
             throw std::system_error(errno, std::generic_category(), "open " + path.string());
@@ -224,11 +274,18 @@ public:
         fd_   = fd;
         data_ = static_cast<const std::byte*>(mapping);
         size_ = size;
+#endif
     }
 
     ~MappedFile() {
+#ifdef _WIN32
+        if (data_ != nullptr) { ::UnmapViewOfFile(data_); }
+        if (mapping_ != nullptr) { ::CloseHandle(mapping_); }
+        if (file_ != INVALID_HANDLE_VALUE) { ::CloseHandle(file_); }
+#else
         if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
         if (fd_ >= 0) { ::close(fd_); }
+#endif
     }
 
     MappedFile(const MappedFile&)            = delete;
@@ -244,6 +301,33 @@ public:
             reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
             throw ArtifactError("direct artifact read is not 4096-byte aligned");
         }
+#ifdef _WIN32
+        if (destination.size() > std::numeric_limits<DWORD>::max()) {
+            throw ArtifactError("direct artifact read exceeds platform I/O limits");
+        }
+        OVERLAPPED operation{};
+        operation.Offset     = static_cast<DWORD>(absolute_offset);
+        operation.OffsetHigh = static_cast<DWORD>(absolute_offset >> 32U);
+        operation.hEvent     = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (operation.hEvent == nullptr) {
+            throw std::system_error(static_cast<int>(::GetLastError()), std::system_category(),
+                                    "create direct artifact read event");
+        }
+        DWORD bytes           = 0;
+        BOOL complete = ::ReadFile(file_, destination.data(), static_cast<DWORD>(destination.size()),
+                                   &bytes, &operation);
+        DWORD error   = complete ? ERROR_SUCCESS : ::GetLastError();
+        if (!complete && error == ERROR_IO_PENDING) {
+            complete = ::GetOverlappedResult(file_, &operation, &bytes, TRUE);
+            error    = complete ? ERROR_SUCCESS : ::GetLastError();
+        }
+        ::CloseHandle(operation.hEvent);
+        if (!complete && error != ERROR_HANDLE_EOF) {
+            throw std::system_error(static_cast<int>(error), std::system_category(),
+                                    "direct artifact read");
+        }
+        return bytes;
+#else
         if (absolute_offset > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max()) ||
             destination.size() > static_cast<std::size_t>(std::numeric_limits<ssize_t>::max())) {
             throw ArtifactError("direct artifact read exceeds platform I/O limits");
@@ -258,10 +342,16 @@ public:
             throw std::system_error(errno, std::generic_category(), "direct artifact read");
         }
         return static_cast<std::size_t>(bytes);
+#endif
     }
 
 private:
+#ifdef _WIN32
+    HANDLE file_    = INVALID_HANDLE_VALUE;
+    HANDLE mapping_ = nullptr;
+#else
     int fd_                = -1;
+#endif
     const std::byte* data_ = nullptr;
     std::size_t size_      = 0;
 };
@@ -295,9 +385,15 @@ public:
             std::byte{0x07}, std::byte{0x98}, std::byte{0x30}, std::byte{0xf2}};
         quasar_ = std::equal(quasar_id.begin(), quasar_id.end(), file_.data() + 16);
         if (!directory_.is_object() || !directory_.contains("metadata") ||
-            !directory_.at("metadata").is_object() ||
-            directory_.at("metadata").value("name", "") != "qwen3.8-27b") {
+            !directory_.at("metadata").is_object()) {
             throw ArtifactError("NInfer v3 compatibility is limited to qwen3.8-27b");
+        }
+        const auto name = directory_.at("metadata").value("name", "");
+        coder390_ = name == "qwen3.8-27b-coder390-w4a4-mtp-dflash2";
+        // Explicitly admitted Coder390 fine-tune, using the same NVFP4 storage contract.
+        // Its complete tensor inventory and dimensions still pass the adapter and binder.
+        if (name != "qwen3.8-27b" && !coder390_) {
+            throw ArtifactError("unregistered Qwen3.8 v3 artifact: " + name);
         }
         if (!directory_.contains("files") || !directory_.at("files").is_array() ||
             directory_.at("files").size() != 1 ||
@@ -494,7 +590,7 @@ public:
             return a.at("offset").get<std::uint64_t>() < b.at("offset").get<std::uint64_t>();
         });
 
-        const auto template_bytes = embedded_chat_template();
+        const auto template_bytes = chat_template_bytes();
         auto template_it = std::find_if(objects.begin(), objects.end(), [](const Json& object) {
             return object.at("name") == "frontend/chat_template.jinja";
         });
@@ -540,10 +636,8 @@ private:
                 {prefix + "attention/query", prefix + "attention/key", prefix + "attention/value"});
             // Context K/V are aliases of the same QKV rows, not independent parameters.
             for (const char* role : {"key", "value"}) {
-                if (binding_parts(prefix + "attention/context_" + role) !=
-                    binding_parts(prefix + "attention/" + role)) {
-                    throw ArtifactError(prefix + "attention/context_" + role + ": alias differs");
-                }
+                validate_context_alias(prefix + "attention/" + role,
+                                       prefix + "attention/context_" + role);
             }
             add(old_prefix + "mlp/gate_up", {prefix + "mlp/gate", prefix + "mlp/up"});
             for (const char* role : {"input_norm", "post_attention_norm", "attention/query_norm",
@@ -556,6 +650,46 @@ private:
         for (const char* role : {"hidden_projection", "predecessor_codebook", "successor_codebook"}) {
             add("dflash/candidate_selector/" + std::string(role),
                 {"dflash2/candidate_selector/" + std::string(role)});
+        }
+    }
+
+    void validate_context_alias(const std::string& source_name, const std::string& context_name) const {
+        const auto source_parts = binding_parts(source_name);
+        const auto context_parts = binding_parts(context_name);
+        if (source_parts == context_parts) { return; }
+        if (!coder390_ || source_parts.size() != 1 || context_parts.size() != 1) {
+            throw ArtifactError(context_name + ": alias differs");
+        }
+        // Coder390 stores duplicate W8 context rows. Admit them only when every
+        // packed code and scale equals its QKV slice; no requantization or copy.
+        const auto& source = object(source_parts[0].at("object").get<std::string>());
+        const auto& context = object(context_parts[0].at("object").get<std::string>());
+        const auto range = source_parts[0].at("range").get<std::array<std::uint64_t, 2>>();
+        if (source.at("shape") != Json::array({6144, 5120}) ||
+            context.at("shape") != Json::array({1024, 5120}) ||
+            source.at("format") != "q8_g32_fp16" || context.at("format") != source.at("format") ||
+            source.at("layout") != "row_split_k128_v1" || context.at("layout") != source.at("layout") ||
+            range[0] % 5120 != 0 || range[1] < range[0] || range[1] - range[0] != 1024 * 5120 ||
+            context_parts[0].at("range") != Json::array({0, 1024 * 5120})) {
+            throw ArtifactError(context_name + ": invalid duplicate context geometry");
+        }
+        const std::array<std::uint64_t, 2> shape{6144, 5120};
+        const std::array<SliceRange, 1> rows{{{range[0] / 5120, 1024}}};
+        const auto slice = tensor_row_slice(StorageLayout::RowSplitK128V1,
+                                            NumericFormat::W8G32_F16S, shape, rows);
+        const auto parent_bytes = object_payload(source);
+        const auto context_bytes = object_payload(context);
+        if (context_bytes.size() != slice.encoded_bytes) {
+            throw ArtifactError(context_name + ": duplicate context size differs");
+        }
+        for (const auto& copy : slice.copies) {
+            if (copy.source_offset > parent_bytes.size() ||
+                copy.bytes > parent_bytes.size() - copy.source_offset ||
+                !std::equal(parent_bytes.begin() + copy.source_offset,
+                            parent_bytes.begin() + copy.source_offset + copy.bytes,
+                            context_bytes.begin() + copy.dest_offset)) {
+                throw ArtifactError(context_name + ": duplicate context codes/scales differ");
+            }
         }
     }
 
@@ -686,8 +820,17 @@ private:
         return {file_.data() + begin, static_cast<std::size_t>(bytes)};
     }
 
-    std::vector<std::byte> embedded_chat_template() const {
+    std::vector<std::byte> chat_template_bytes() const {
         const auto& components = directory_.at("components");
+        if (coder390_) {
+            // This registered package keeps the template in its dedicated resource,
+            // rather than embedding a second copy in tokenizer_config.json.
+            const auto id = require_string(
+                components.at("text").at("resources").at("chat_template.jinja"),
+                "chat_template.jinja resource");
+            const auto bytes = object_payload(object(id));
+            return {bytes.begin(), bytes.end()};
+        }
         const auto id = require_string(
             components.at("text").at("resources").at("tokenizer_config.json"),
             "tokenizer_config.json resource");
@@ -715,6 +858,7 @@ private:
     const MappedFile& file_;
     std::uint64_t payload_start_;
     bool quasar_ = false;
+    bool coder390_ = false;
     std::map<std::string, const Json*, std::less<>> objects_;
     std::map<std::string, const Json*, std::less<>> selected_;
     std::map<std::string, std::string, std::less<>> physical_names_;

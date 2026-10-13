@@ -193,8 +193,10 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
     }
-    if (!tokenizer_config.contains("chat_template") ||
-        !tokenizer_config.at("chat_template").is_string()) {
+    // A registered standalone template is authoritative; some published packages
+    // omit its redundant tokenizer-config copy. When present, the copy must agree.
+    if (!tokenizer_config.contains("chat_template")) { return; }
+    if (!tokenizer_config.at("chat_template").is_string()) {
         throw std::invalid_argument(
             "tokenizer_config.json.chat_template must contain the loaded chat template");
     }

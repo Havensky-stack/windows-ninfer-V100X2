@@ -69,13 +69,18 @@ bool ends_with(const std::string& text, std::string_view suffix) {
            text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-long last_real_user_query(const std::vector<ChatMessage>& messages) {
+long last_real_user_query(const std::vector<ChatMessage>& messages, bool allow_tool_history) {
     for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
         const ChatMessage& message = messages[static_cast<std::size_t>(i)];
         if (message.role != ChatRole::User) { continue; }
         const std::string content = trim_ascii_whitespace(message.rendered_content());
         if (!(starts_with(content, "<tool_response>") && ends_with(content, "</tool_response>"))) {
             return i;
+        }
+    }
+    if (allow_tool_history) {
+        for (long i = static_cast<long>(messages.size()) - 1; i >= 0; --i) {
+            if (messages[static_cast<std::size_t>(i)].role == ChatRole::Tool) { return i; }
         }
     }
     throw std::invalid_argument("no user query found in chat messages");
@@ -297,6 +302,13 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
     if (digest == kReasoningEffortTemplateDigest) {
         return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffort);
     }
+    // Published Coder390 template: reasoning effort plus tool-only histories.
+    constexpr Sha256Digest coder390_digest{
+        0xa4, 0x97, 0xdb, 0x9e, 0x66, 0x39, 0x41, 0xe6, 0xf7, 0xa0, 0x53, 0x07, 0xc2, 0xba, 0xfa, 0x83,
+        0x74, 0xc1, 0x2e, 0x14, 0x2a, 0xd1, 0xfb, 0xea, 0x62, 0x29, 0x88, 0x8d, 0x41, 0xf1, 0xab, 0x16};
+    if (digest == coder390_digest) {
+        return CompiledChatTemplate(ChatTemplateSemantics::ReasoningEffortToolHistory);
+    }
     throw std::invalid_argument("unsupported frontend/chat_template.jinja (sha256 " +
                                 sha256_hex(digest) + ")");
 }
@@ -304,7 +316,7 @@ CompiledChatTemplate CompiledChatTemplate::resolve(std::string_view source) {
 PromptCapabilities CompiledChatTemplate::capabilities() const noexcept {
     PromptCapabilities result;
     result.enable_thinking = true;
-    if (semantics_ == ChatTemplateSemantics::ReasoningEffort) {
+    if (semantics_ != ChatTemplateSemantics::ThinkingToggle) {
         result.reasoning_effort.low            = true;
         result.reasoning_effort.medium         = true;
         result.reasoning_effort.xhigh          = true;
@@ -317,7 +329,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
                                           ChatRenderOptions options) const {
     if (messages.empty()) { throw std::invalid_argument("chat messages must not be empty"); }
 
-    const bool effort_template = semantics_ == ChatTemplateSemantics::ReasoningEffort;
+    const bool effort_template = semantics_ != ChatTemplateSemantics::ThinkingToggle;
+    const bool tool_history = semantics_ == ChatTemplateSemantics::ReasoningEffortToolHistory;
     const std::string_view reasoning_instructions =
         resolve_reasoning_instructions(semantics_, options);
 
@@ -350,7 +363,7 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
         rendered += "<|im_end|>\n";
     }
 
-    const long last_query_index  = last_real_user_query(messages);
+    const long last_query_index  = last_real_user_query(messages, tool_history);
     const bool preserve_thinking = options.preserve_thinking.value_or(effort_template);
     std::optional<RewriteCheckpointByteSpec> rewrite_checkpoint;
 
@@ -375,7 +388,8 @@ RenderedChat CompiledChatTemplate::render(const std::vector<ChatMessage>& messag
             continue;
         }
         if (message.role == ChatRole::Tool) {
-            const bool opens_group = i > 0 && messages[i - 1].role != ChatRole::Tool;
+            const bool opens_group = (tool_history && i == 0) ||
+                                      (i > 0 && messages[i - 1].role != ChatRole::Tool);
             const bool closes_group =
                 i + 1 == messages.size() || messages[i + 1].role != ChatRole::Tool;
             if (opens_group) { rendered += "<|im_start|>user"; }

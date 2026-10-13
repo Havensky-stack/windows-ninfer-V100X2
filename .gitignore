@@ -8,6 +8,7 @@ cmake-build-*/
 *.a
 compile_commands.json
 CMakeUserPresets.json
+vcpkg_installed/
 .cache/
 
 # CUDA / profiling artifacts

@@ -9,6 +9,7 @@ launch command; general protocol examples live in the serving guide below.
 
 | Document | Purpose |
 |---|---|
+| [Windows toolchain](windows-toolchain.md) | local GRID/WDDM, CUDA 12.8, MSVC and TP2 probe qualification; full Windows port pending |
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, dual-GPU (`--tp 2`) execution, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, dual-GPU serving, and YaRN extended context |
 | [PyQt 控制台](gui.md) | 图形化启动/停止 API、TP/设备、上下文/KV、MTP/DFlash、缓存、并发和采样参数 |

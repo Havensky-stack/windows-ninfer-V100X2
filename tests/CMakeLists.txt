@@ -158,7 +158,7 @@ set_tests_properties(ninfer_concurrent_executor_test PROPERTIES SKIP_RETURN_CODE
 ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
-target_link_libraries(ninfer_qwen3_6_27b_prefix_real_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_27b_prefix_real_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME ninfer_qwen3_6_27b_vision_tp2_real_test COMMAND ninfer_qwen3_6_27b_prefix_real_test)
 set_tests_properties(ninfer_qwen3_6_27b_vision_tp2_real_test PROPERTIES
@@ -166,28 +166,28 @@ set_tests_properties(ninfer_qwen3_6_27b_vision_tp2_real_test PROPERTIES
 ninfer_add_test(ninfer_qwen3_8_27b_tp2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_tp2_real.cpp
   LIBRARIES ninfer_engine)
-target_link_libraries(ninfer_qwen3_8_27b_tp2_real_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_8_27b_tp2_real_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_8_27b_tp2_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # MTP3 speculative decoding under TP2. Opt-in on the same env/device gate as its siblings; the
 # timeout is larger because every leg runs four engines (tp1/tp2 x MTP/off).
 ninfer_add_test(ninfer_qwen3_8_27b_mtp_tp2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_mtp_tp2_real.cpp
   LIBRARIES ninfer_engine ninfer_product_prompt_input)
-target_link_libraries(ninfer_qwen3_8_27b_mtp_tp2_real_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_8_27b_mtp_tp2_real_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_8_27b_mtp_tp2_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
 # Q4_K_M/NVFP4 MTP3/DFlash7 graph/eager and teacher-forcing state gate. Every engine uses TP2,
 # so it can run on two 16 GiB V100s without loading the whole artifact on one card.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100x2_real.cpp
   LIBRARIES ninfer_engine)
-target_link_libraries(ninfer_qwen3_8_27b_v100x2_real_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_8_27b_v100x2_real_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_8_27b_v100x2_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # TP2 INT8 KV + MTP3/DFlash7 cache continuation and response-checkpoint replay.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100x2_prefix_real.cpp
   LIBRARIES ninfer_engine)
-target_link_libraries(ninfer_qwen3_8_27b_v100x2_prefix_real_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_8_27b_v100x2_prefix_real_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_8_27b_v100x2_prefix_real_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # `--rope yarn` past the native 262144-position window, on real weights, at both tp widths.
@@ -195,12 +195,12 @@ set_tests_properties(ninfer_qwen3_8_27b_v100x2_prefix_real_test
 ninfer_add_test(ninfer_qwen3_8_27b_yarn_real_test
   SOURCES targets/qwen3_6_27b/test_engine_yarn_real.cpp
   LIBRARIES ninfer_engine)
-target_link_libraries(ninfer_qwen3_8_27b_yarn_real_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_8_27b_yarn_real_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_8_27b_yarn_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
 ninfer_add_test(ninfer_qwen3_8_27b_graph_tp2_test
   SOURCES targets/qwen3_6_27b/test_graph_tp2.cpp
   LIBRARIES ninfer_engine)
-target_link_libraries(ninfer_qwen3_8_27b_graph_tp2_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_8_27b_graph_tp2_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_8_27b_graph_tp2_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # Greedy tp1-vs-tp2 numerical parity harness. Source lives under tools/tp2/ because it is a
 # re-runnable host tool, not only a test; wired here as an opt-in ctest as well, on the same
@@ -209,7 +209,7 @@ ninfer_add_test(ninfer_qwen3_8_27b_tp2_parity_test
   SOURCES ${PROJECT_SOURCE_DIR}/tools/tp2/parity.cpp
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_product_prompt_input)
-target_link_libraries(ninfer_qwen3_8_27b_tp2_parity_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_8_27b_tp2_parity_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_8_27b_tp2_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
@@ -218,7 +218,7 @@ ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
 target_include_directories(ninfer_qwen3_6_27b_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export)
-target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_27b_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_8_27b_dflash2_v3_load_plan_test
   SOURCES targets/qwen3_6_27b/test_dflash2_v3_load_plan.cpp
@@ -243,7 +243,7 @@ target_include_directories(ninfer_qwen3_6_27b_sharded_materialization_test PRIVA
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/impl
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-target_link_libraries(ninfer_qwen3_6_27b_sharded_materialization_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_27b_sharded_materialization_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_sharded_materialization_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only: no artifact, no device. Pure TP2 ShardPlan table test.
 ninfer_add_test(ninfer_qwen3_6_27b_shard_map_test
@@ -268,7 +268,7 @@ ninfer_add_test(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
 target_include_directories(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
-target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE CUDA::cudart)
+target_link_libraries(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
