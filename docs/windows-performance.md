@@ -51,6 +51,30 @@ $model = '.\models\Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer'
 修改前的无分析器 CLI 对照使用相同设置、输出上限 128：decode 7.578 秒、16.76 tok/s。
 因此低速在直接 CLI 推理中同样存在，GUI 和 HTTP 不是主要来源。
 
+## DFlash7 本机补测
+
+2026-10-14，同一 Coder390 v3、GRID 553.62/WDDM 和 mapped-host 构建，
+`--spec dflash --draft-tokens 7`，full proposal head。容量改为 **98304**，分块仍为
+256，INT8 group-64 KV、TP2、Graph、19-token 数数提示、采样参数和 2048 输出上限
+与前文相同。该容量与前文 MTP 的 131072 不同，不是完全同配置的后端对照。
+
+单次完整请求输出 1391 tokens，已提交 decode **153.70 tok/s**，客户端耗时
+**9.25 秒**；接受 **1217/1218** drafts（99.92%），174 轮。整数序列完整为 1..300。
+相对普通解码，29 处换行变为空格，答案不逐字节相同。这个高度可预测的短输入请求
+不能代表一般问答或长上下文速度。结果保存在本地 `build-tools/count300-dflash7/`。
+
+DFlash 加载的权重合计 24.31 GiB，启动后主卡约余 270 MiB，显存余量很紧；本次
+只验证该容量的短请求，不声明满容量稳定性。可复用前文 CLI 命令，将两个容量参数
+都改为 `98304`，并追加 `--spec dflash --draft-tokens 7`；不要使用 MTP 的
+`--lm-head-draft` 参数。
+
+真实模型检查使用 `NINFER_V100X2_SPEC=dflash`、
+`NINFER_V100X2_PROPOSAL_HEAD=full`，4K 容量。Graph/eager、greedy/sampling 路线
+对照通过，但严格 teacher-forced 检查仍失败：probe 1、位置 31，target 2532 对
+speculative 561，logit deficit 0.125，即 1/64；普通对照 0/64。这与 MTP 是同一处
+差异，不能将 DFlash 标为已通过严格行为契约。两个验证提示的接受分别为 26/30 和
+20/75，进一步说明数数的近 100% 接受率不适用于所有任务。应用默认设置不变。
+
 ## 跨卡延迟证据
 
 修改前普通解码的 64 层各有两次主干 all-reduce，共 128 次。隐藏向量有 5120 个 BF16
@@ -129,6 +153,20 @@ target 2532 对 speculative 561、logit deficit 0.125（1/64）。严格测试�
 这里仍走 PCIe 和主机内存，并未启用 P2P，也不代表所有大小的传输都适合它。
 
 ## TCC 和 llama.cpp
+
+本机补查：CUDA Driver API `cuDeviceCanAccessPeer` 双向均返回 0；NVML 的双向
+P2P read/write 状态均为 `IOH_TOPOLOGY_NOT_SUPPORTED`，PCI P2P 状态为
+`NOT_SUPPORTED`，NVLink 链路均 inactive。当前和待生效驱动模式均为 WDDM。
+在场设备的 Windows PnP 路径分别为 `PCIROOT(0)#PCI(0300)#PCI(0000)` 和
+`PCIROOT(80)#PCI(0200)#PCI(0000)`；主板 JGINYUE X99-8D3/2.5G Server，
+两颗 Xeon E5-2696 v3。两卡确实分属不同 PCIe 根。
+
+[CUDA 12.8 P2P 文档](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-c-programming-guide/index.html#peer-to-peer-memory-access)
+以设备 peer-capability 查询和实际 PCIe/NVLink 拓扑为准。当前 NInfer 无法绕过这个
+不支持结果启用真正 P2P；mapped-host 通信仍经过主机内存。TCC 后需重新查询并验证
+双向访问，不能承诺切模式就能解决。如果仍报拓扑不支持，下一步是核实同一 CPU/PCIe
+根下的槽位连接方案；NVLink 则需检查 SXM2 底板/转接方案是否有实际互联。当前证据
+尚未分离驱动模式与跨根拓扑各自的影响，不说明两张 V100 本身永久不支持 P2P。
 
 [CUDA 12.8 Windows 安装指南](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-installation-guide-microsoft-windows/index.html)
 及 [NVIDIA SMI 文档](https://docs.nvidia.com/deploy/nvidia-smi/index.html)说明：TCC 面向
