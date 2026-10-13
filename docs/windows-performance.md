@@ -254,9 +254,13 @@ NVML 双向 read/write 仍为 **`IOH_TOPOLOGY_NOT_SUPPORTED`**，PCI 为
 计算、可降低内核启动延迟，但不能承担 Windows 显示/游戏图形渲染。用户已选择推理用
 TCC、游戏恢复 WDDM，并接受重启。当前 553.62 的命令选项应以本机 help 为准，不能套用
 新版文档才有的自动重启控制选项。本次只切换驱动模式，没有更换驱动、CUDA、功耗或时钟。
-本机恢复入口为 `build-tools/driver-mode/restore-wddm.cmd`，会通过 UAC 对已记录的
-两张 V100 UUID 执行 `-dm 0`，随后需重启。也可在管理员终端对已核实的两卡分别
-执行 `nvidia-smi -i <GPU-UUID> -dm 0`；脚本不自动重启电脑。
+正式切换入口已提交到源码：[启用 TCC](../tools/windows/enable-tcc.cmd)、
+[恢复 WDDM](../tools/windows/restore-wddm.cmd)，共用
+[`set-v100-mode.ps1`](../tools/windows/set-v100-mode.ps1)。脚本自动识别两张 V100，
+通过 UAC 按实际查询到的 UUID 执行 `-dm 1/0`，随后需重启；没有写死本机 UUID。
+只读查询使用 `-Mode Status`。切换日志保存在 `%LOCALAPPDATA%\NInferV100X2\driver-mode`。
+也可在管理员终端对已核实的两卡分别执行 `nvidia-smi -i <GPU-UUID> -dm 0`；
+脚本不自动重启电脑。WDDM → TCC 已实测；本轮未实际执行回切 WDDM。
 
 ### TCC 同负载对照
 
