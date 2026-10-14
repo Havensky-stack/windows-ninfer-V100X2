@@ -1,4 +1,4 @@
-param([string]$Version = '0.1.1', [switch]$SkipArchive)
+param([string]$Version = '0.1.2', [switch]$SkipArchive)
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Use a numeric major.minor.patch version.' }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
@@ -25,6 +25,11 @@ $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if ($LASTEXITCODE -ne 0) { throw 'Launcher compilation failed.' }
 Copy-Item -LiteralPath (Join-Path $repo 'LICENSE'), (Join-Path $repo 'NOTICE') -Destination $package -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'launcher\使用说明.txt') -Destination $package -Force
+$modeTools = Join-Path $package 'tools'
+New-Item -ItemType Directory -Force $modeTools | Out-Null
+foreach ($name in @('enable-tcc.cmd', 'restore-wddm.cmd', 'set-v100-mode.ps1')) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination $modeTools -Force
+}
 Copy-Item -LiteralPath (Join-Path $repo 'build-tools\cuda-12.8.1\LICENSE') -Destination (Join-Path $licenses 'NVIDIA-CUDA.txt') -Force
 foreach ($dependency in @('ffmpeg', 'curl', 'zlib')) {
     $share = Join-Path $repo "build-windows\vcpkg_installed\x64-windows-ninfer\share\$dependency"

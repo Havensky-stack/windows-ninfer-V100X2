@@ -1,6 +1,6 @@
 # NInfer for Windows · Dual V100
 
-[中文首页](README.md) · [Download Windows preview](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases)
+[中文首页](README.md) · [Download Windows v0.1.2 preview](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.2-windows-preview)
 
 This fork brings the `tuxKOH/ninfer-V100X2` inference engine to native Windows on two
 Tesla V100-SXM2 16GB GPUs. Tested on Windows 11, GRID 553.62, WDDM and TCC, PCIe 3.0 x16 per GPU,
@@ -11,12 +11,12 @@ MSVC 14.44 build, exact Coder390 v3 artifact/template admission, focused regress
 and a portable Chinese launcher with hardware checks, resumable model download, SHA-256
 verification, service lifecycle controls and a simple single-turn chat interface.
 
-Current source and the local 0.1.1 build use mapped-host transfers for small WDDM TP2
+Current source and the v0.1.2 release use mapped-host transfers for small WDDM TP2
 reductions. On the same count-to-300 request, committed ordinary decode rose from 16.49
 to 28.08 tok/s; experimental MTP3 rose from 57.07 to 94.68 tok/s. Answers were byte-identical
 before and after. The input occupied only 19 tokens, and MTP accepted all drafts; this is not
 a long-context or general-chat claim. See [Windows performance](docs/windows-performance.md).
-The published 0.1.0 ZIP does not include this optimization.
+The v0.1.2 ZIP includes this optimization and configurable speculative modes; the old 0.1.0 does not.
 
 With the same driver and per-mode workload, TCC measured **36.19 / 122.69 / 189.50 committed
 decode tok/s** for ordinary decode / MTP3 / DFlash7, versus **28.08 / 94.68 / 153.70** on
@@ -33,12 +33,18 @@ are bundled: no Python, CUDA Toolkit or Visual Studio installation is needed. In
 NVIDIA driver first. The optional model download is 23.8GB and is not included in the ZIP.
 This preview requires NVIDIA devices 0 and 1 to be V100s with at least 16GB each.
 
-The launcher defaults to ordinary decode, INT8 KV, 128K capacity and 256-token prefill chunks.
+The v0.1.2 launcher defaults to ordinary decode, thinking enabled, INT8 KV, 128K capacity,
+2048 output tokens and 256-token prefill chunks. It exposes MTP/DFlash, draft count, MTP proposal
+head, thinking, context/output limits, KV format, prefill chunk, port, concurrency, CUDA Graph
+and prefix reuse. DFlash selection suggests 96K with seven drafts and enforces one active request.
+Settings persist locally; the log shows the actual launch command. Thinking and final answers
+are displayed separately, with an explicit notice if the output limit is reached.
 128K passed an API smoke request with about 1.8GiB free per card. 200,000 capacity passed
 a short request; 220,000 failed the current memory budget. These are capacity checks, not
 full-context quality or throughput measurements. MTP and DFlash both failed 1/64 strict
-teacher-forced argmax checks; the launcher defaults to ordinary decode. DFlash/Vision are not
-qualified for this preview.
+teacher-forced argmax checks; these modes remain experimental. Vision is not qualified for this preview.
+Model downloads begin only after clicking the download button and choosing a directory, with
+resume and SHA-256 verification; opening the application does not automatically download weights.
 
 ## Switching V100 modes
 
@@ -64,6 +70,8 @@ both directions still report `IOH_TOPOLOGY_NOT_SUPPORTED` here, and NVLink is in
 rule, including CUDA components and raw diagnostic results. Maintained scripts are committed
 under `tools/windows/`; published measurement summaries are in `docs/windows-performance.md`.
 The old local mode-switch scripts have moved to the tracked tools directory.
+The v0.1.2 ZIP bundles the same scripts in `tools/`, with TCC/WDDM buttons in the launcher.
+Stop the model first, approve UAC, then reboot manually; no automatic driver-mode change occurs.
 
 ## Sources and attribution
 

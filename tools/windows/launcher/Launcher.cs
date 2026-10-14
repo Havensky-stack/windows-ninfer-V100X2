@@ -16,6 +16,52 @@ using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 namespace NInferWindows {
+    internal sealed class LaunchOptions {
+        public string Backend = "none";
+        public int Drafts = 3;
+        public int Context = 131072;
+        public int OutputTokens = 2048;
+        public int PrefillChunk = 256;
+        public int Port = 0;
+        public int Concurrency = 1;
+        public string Kv = "int8";
+        public bool Thinking = true;
+        public bool Graph = true;
+        public bool PrefixReuse = true;
+        public bool OptimizedMtpHead = true;
+
+        internal void Validate() {
+            if (Backend != "none" && Backend != "mtp" && Backend != "dflash") throw new Exception("请选择普通、MTP 或 DFlash 解码。");
+            if (Context < 1024 || Context > 262144) throw new Exception("上下文容量须为 1024–262144；实际可用值取决于显存。");
+            if (OutputTokens < 16 || OutputTokens > Context) throw new Exception("输出上限须为 16 到上下文容量之间，包含思考与回答。");
+            if (PrefillChunk < 128 || PrefillChunk > 1024 || PrefillChunk % 128 != 0) throw new Exception("预填充分块须为 128–1024 之间的 128 倍数。");
+            if (Port < 0 || Port > 65535) throw new Exception("端口须为 0（自动）或 1–65535。");
+            if (Concurrency < 1 || Concurrency > 8) throw new Exception("并发数须为 1–8。");
+            if (Backend == "dflash" && Concurrency != 1) throw new Exception("DFlash 多并发尚有已知错误，请使用单请求。");
+            if (Backend != "none" && (Drafts < 1 || Drafts > (Backend == "mtp" ? 3 : 7))) throw new Exception("MTP 草稿数为 1–3；DFlash 为 1–7。");
+            if (Kv != "int8" && Kv != "bf16") throw new Exception("KV 格式须为 int8 或 bf16。");
+        }
+
+        internal string[] Arguments(string model, int port) {
+            Validate();
+            var args = new List<string> { Path.GetFullPath(model), "--host", "127.0.0.1", "--port", port.ToString(), "--model-id", "coder390",
+                "--tp", "2", "--devices", "0,1", "--max-concurrency", Concurrency.ToString(), "--max-context", Context.ToString(),
+                "--kv-capacity", ((long)Context * Concurrency).ToString(), "--kv-dtype", Kv, "--prefill-chunk", PrefillChunk.ToString(),
+                "--default-max-tokens", OutputTokens.ToString() };
+            if (!Thinking) args.Add("--no-thinking");
+            if (!Graph) args.Add("--no-cuda-graph");
+            if (!PrefixReuse) args.Add("--no-prefix-reuse");
+            if (Backend != "none") { args.AddRange(new[] { "--spec", Backend, "--draft-tokens", Drafts.ToString() }); }
+            if (Backend == "mtp" && OptimizedMtpHead) args.Add("--lm-head-draft");
+            return args.ToArray();
+        }
+    }
+
+    internal sealed class LauncherSettings {
+        public string Model = "";
+        public LaunchOptions Options = new LaunchOptions();
+    }
+
     internal sealed class Runtime : IDisposable {
         internal const string ModelName = "Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer";
         internal const long ModelBytes = 23773675264L;
@@ -25,6 +71,7 @@ namespace NInferWindows {
         internal readonly string Root;
         internal readonly Action<string> Log;
         private Process server;
+        private LaunchOptions activeOptions;
         private readonly HttpClient http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
         internal string Endpoint { get; private set; }
         internal bool Running { get { return server != null && !server.HasExited; } }
@@ -143,17 +190,25 @@ namespace NInferWindows {
             progress("模型下载与完整性校验通过。");
         }
 
-        internal async Task StartAsync(string model, int context, CancellationToken token) {
+        internal async Task StartAsync(string model, LaunchOptions options, CancellationToken token) {
             if (Running) throw new Exception("服务已经启动。");
+            options.Validate();
             await CheckAsync();
             token.ThrowIfCancellationRequested();
             if (!File.Exists(model) || !string.Equals(Path.GetExtension(model), ".ninfer", StringComparison.OrdinalIgnoreCase)) throw new Exception("请选择有效的 .ninfer 模型文件。");
-            var listener = new TcpListener(IPAddress.Loopback, 0);
-            listener.Start(); int port = ((IPEndPoint)listener.LocalEndpoint).Port; listener.Stop();
+            int port = options.Port;
+            if (port == 0) {
+                var listener = new TcpListener(IPAddress.Loopback, 0);
+                listener.Start(); port = ((IPEndPoint)listener.LocalEndpoint).Port; listener.Stop();
+            } else {
+                var listener = new TcpListener(IPAddress.Loopback, port);
+                try { listener.Start(); } catch (SocketException) { throw new Exception("端口已被占用，请换一个端口或设为 0 自动选择。"); }
+                finally { listener.Stop(); }
+            }
             Endpoint = "http://127.0.0.1:" + port;
-            var args = new[] { Path.GetFullPath(model), "--host", "127.0.0.1", "--port", port.ToString(), "--model-id", "coder390",
-                "--tp", "2", "--devices", "0,1", "--max-concurrency", "1", "--max-context", context.ToString(),
-                "--kv-capacity", context.ToString(), "--kv-dtype", "int8", "--prefill-chunk", "256", "--default-max-tokens", "1024", "--no-thinking" };
+            var args = options.Arguments(model, port);
+            activeOptions = options;
+            Log("启动命令：ninfer-serve.exe " + string.Join(" ", args.Select(Quote)));
             server = new Process { StartInfo = new ProcessStartInfo(Path.Combine(Root, "bin", "ninfer-serve.exe"), string.Join(" ", args.Select(Quote))) {
                 WorkingDirectory = Path.Combine(Root, "bin"), UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
@@ -182,15 +237,25 @@ namespace NInferWindows {
         internal async Task<string> ChatAsync(string text, CancellationToken token) {
             if (!Running) throw new Exception("请先启动模型。");
             var json = new JavaScriptSerializer();
-            string body = json.Serialize(new { model = "coder390", messages = new[] { new { role = "user", content = text } }, max_tokens = 512, temperature = 0.7 });
+            string body = json.Serialize(new { model = "coder390", messages = new[] { new { role = "user", content = text } }, max_tokens = activeOptions.OutputTokens });
             using (var content = new StringContent(body, Encoding.UTF8, "application/json"))
             using (var response = await http.PostAsync(Endpoint + "/v1/chat/completions", content, token)) {
                 string answer = await response.Content.ReadAsStringAsync();
                 if (!response.IsSuccessStatusCode) throw new Exception("请求失败：" + answer);
-                var parsed = json.Deserialize<Dictionary<string, object>>(answer);
-                var choice = (Dictionary<string, object>)((System.Collections.IList)parsed["choices"])[0];
-                return (string)((Dictionary<string, object>)choice["message"])["content"];
+                return FormatChat(answer);
             }
+        }
+        internal static string FormatChat(string response) {
+            var parsed = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(response);
+            var choice = (Dictionary<string, object>)((System.Collections.IList)parsed["choices"])[0];
+            var message = (Dictionary<string, object>)choice["message"];
+            object reasoning, content, finish;
+            message.TryGetValue("reasoning_content", out reasoning); message.TryGetValue("content", out content);
+            choice.TryGetValue("finish_reason", out finish);
+            string text = string.IsNullOrEmpty(reasoning as string) ? "" : "【思考】\r\n" + reasoning + "\r\n\r\n【回答】\r\n";
+            text += content as string ?? "";
+            if (string.Equals(finish as string, "length", StringComparison.Ordinal)) text += "\r\n\r\n[已达到输出上限，思考与回答可能未完成；可停止服务后提高输出上限。]";
+            return text;
         }
         internal void Stop() {
             if (server == null) return;
@@ -203,7 +268,21 @@ namespace NInferWindows {
 
     internal sealed class Launcher : Form {
         readonly TextBox model = new TextBox { Dock = DockStyle.Fill };
-        readonly ComboBox context = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 210 };
+        readonly NumericUpDown context = Number(1024, 262144, 131072, 108, 1024);
+        readonly NumericUpDown outputTokens = Number(16, 262144, 2048, 90, 256);
+        readonly NumericUpDown prefill = Number(128, 1024, 256, 72, 128);
+        readonly NumericUpDown port = Number(0, 65535, 0, 78, 1);
+        readonly NumericUpDown concurrency = Number(1, 8, 1, 50, 1);
+        readonly NumericUpDown drafts = Number(1, 3, 3, 50, 1);
+        readonly ComboBox backend = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 155 };
+        readonly ComboBox kv = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 82 };
+        readonly CheckBox thinking = new CheckBox { Text = "开启思考", Checked = true, AutoSize = true };
+        readonly CheckBox graph = new CheckBox { Text = "CUDA Graph", Checked = true, AutoSize = true };
+        readonly CheckBox prefix = new CheckBox { Text = "前缀复用", Checked = true, AutoSize = true };
+        readonly CheckBox mtpHead = new CheckBox { Text = "MTP 优化草稿头", Checked = true, AutoSize = true };
+        readonly TableLayoutPanel optionsPanel = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 3, ColumnCount = 1 };
+        readonly Button tcc = new Button { Text = "切换 TCC", AutoSize = true };
+        readonly Button wddm = new Button { Text = "恢复 WDDM", AutoSize = true };
         readonly TextBox prompt = new TextBox { Multiline = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical };
         readonly TextBox answer = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical };
         readonly TextBox logs = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical };
@@ -216,20 +295,21 @@ namespace NInferWindows {
         readonly Button browse = new Button { Text = "选择本地模型…", AutoSize = true };
         readonly Runtime runtime;
         CancellationTokenSource operation = new CancellationTokenSource();
-        readonly string settings = Path.Combine(Runtime.StateDir, "model-path.txt");
+        readonly string settings = Path.Combine(Runtime.StateDir, "settings.json");
         readonly object logLock = new object();
         bool busy;
 
         internal Launcher(bool preview = false) {
             Directory.CreateDirectory(Runtime.StateDir);
             runtime = new Runtime(AppDomain.CurrentDomain.BaseDirectory, AddLog);
-            Text = "NInfer · Windows 双 V100 · 0.1.1 预览版";
-            Font = new Font("Microsoft YaHei UI", 10); Size = new Size(1000, 800); MinimumSize = new Size(850, 680);
+            Text = "NInfer · Windows 双 V100 · 0.1.2 预览版";
+            Font = new Font("Microsoft YaHei UI", 10); Size = new Size(1100, 960); MinimumSize = new Size(1060, 900);
             StartPosition = FormStartPosition.CenterScreen;
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 9 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 10 };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 174));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
@@ -237,14 +317,22 @@ namespace NInferWindows {
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 55));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 45));
             Controls.Add(layout);
-            layout.Controls.Add(new Label { Text = "本地运行 Qwen · 不改驱动 · 无需开发环境", Font = new Font(Font.FontFamily, 17, FontStyle.Bold), AutoSize = true });
-            layout.Controls.Add(new Label { Text = "面向 2 × V100 16GB，模型约占 23.8GB 磁盘。默认普通解码，MTP 尚未通过严格校验。\r\n128K 为建议容量；20万仅验证过短请求。游戏或其他模型会占用显存。", AutoSize = true });
+            layout.Controls.Add(new Label { Text = "本地运行 Qwen · 双 V100 · 无需开发环境", Font = new Font(Font.FontFamily, 17, FontStyle.Bold), AutoSize = true });
+            layout.Controls.Add(new Label { Text = "默认普通解码与思考开启；MTP / DFlash 为实验功能，严格校验仍有 1/64 差异。\r\nDFlash 建议 96K / 单请求；容量不代表占用。WDDM 小消息优化自动启用，TCC 不保证 P2P。", AutoSize = true });
             var modelRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2 };
             modelRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); modelRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             modelRow.Controls.Add(model); modelRow.Controls.Add(browse); layout.Controls.Add(modelRow);
+            backend.Items.AddRange(new object[] { "普通解码（默认）", "MTP（实验）", "DFlash（实验）" }); backend.SelectedIndex = 0;
+            kv.Items.AddRange(new object[] { "INT8", "BF16" }); kv.SelectedIndex = 0;
+            optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+            optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+            optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+            optionsPanel.Controls.Add(OptionRow("解码", backend, "草稿数", drafts, thinking, mtpHead));
+            optionsPanel.Controls.Add(OptionRow("上下文容量", context, "输出上限", outputTokens, "预填充分块", prefill, "端口（0=自动）", port));
+            optionsPanel.Controls.Add(OptionRow("KV 格式", kv, "并发", concurrency, graph, prefix));
+            layout.Controls.Add(Section("模型启动选项（停止服务后修改；输出上限包含思考与回答）", optionsPanel));
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill };
-            context.Items.AddRange(new object[] { "16K · 显存占用较低", "64K", "128K · 推荐", "200000 · 余量较小" }); context.SelectedIndex = 2;
-            actions.Controls.Add(context); actions.Controls.Add(start); actions.Controls.Add(stop); actions.Controls.Add(download); layout.Controls.Add(actions);
+            actions.Controls.Add(start); actions.Controls.Add(stop); actions.Controls.Add(download); actions.Controls.Add(tcc); actions.Controls.Add(wddm); layout.Controls.Add(actions);
             layout.Controls.Add(status);
             var api = new FlowLayoutPanel { Dock = DockStyle.Fill };
             var copy = new Button { Text = "复制 API 地址", AutoSize = true };
@@ -252,14 +340,21 @@ namespace NInferWindows {
             api.Controls.Add(address); api.Controls.Add(copy); api.Controls.Add(send); layout.Controls.Add(api);
             prompt.Text = "用中文简单介绍一下你能帮助我做什么。";
             layout.Controls.Add(Section("输入问题", prompt)); layout.Controls.Add(Section("回答（每次独立问答）", answer)); layout.Controls.Add(Section("运行日志", logs));
-            if (File.Exists(settings)) model.Text = File.ReadAllText(settings, Encoding.UTF8);
+            backend.SelectedIndexChanged += (s, e) => {
+                drafts.Maximum = backend.SelectedIndex == 2 ? 7 : 3;
+                drafts.Value = drafts.Maximum;
+                if (backend.SelectedIndex == 2) { context.Value = Math.Min(context.Value, 98304); concurrency.Value = 1; }
+                UpdateButtons();
+            };
+            if (!preview) LoadSettings();
             browse.Click += (s, e) => {
                 using (var dialog = new OpenFileDialog { Filter = "NInfer 模型|*.ninfer", Title = "选择本项目登记的 .ninfer 模型" })
-                    if (dialog.ShowDialog(this) == DialogResult.OK) { model.Text = dialog.FileName; SaveModel(); }
+                    if (dialog.ShowDialog(this) == DialogResult.OK) { model.Text = dialog.FileName; SaveSettings(); }
             };
             start.Click += async (s, e) => await Work(async token => {
-                status.Text = "正在加载模型，请稍候…"; SaveModel();
-                await runtime.StartAsync(model.Text, new[] { 16384, 65536, 131072, 200000 }[context.SelectedIndex], token);
+                var options = ReadOptions(); options.Validate();
+                status.Text = "正在加载模型，请稍候…"; SaveSettings();
+                await runtime.StartAsync(model.Text, options, token);
                 address.Text = runtime.Endpoint + "/v1"; status.Text = "运行中 · 可直接提问，或连接支持 OpenAI API 的客户端（模型名 coder390）";
             });
             stop.Click += (s, e) => { operation.Cancel(); runtime.Stop(); address.Text = "服务已停止"; status.Text = "已停止；下载进度保存在 .part 文件中"; UpdateButtons(); };
@@ -274,12 +369,15 @@ namespace NInferWindows {
                     string target = Path.Combine(dialog.SelectedPath, Runtime.ModelName);
                     await Work(async token => {
                         await Runtime.DownloadAsync(target, message => { status.Text = message; }, token);
-                        model.Text = target; SaveModel(); status.Text = "模型已准备好，点击“启动模型”";
+                        model.Text = target; SaveSettings(); status.Text = "模型已准备好，点击“启动模型”";
                     });
                 }
             };
+            tcc.Click += (s, e) => SwitchMode("enable-tcc.cmd");
+            wddm.Click += (s, e) => SwitchMode("restore-wddm.cmd");
             if (!preview) Shown += async (s, e) => await Work(async token => { AddLog(await runtime.CheckAsync()); status.Text = "环境就绪 · 选择模型后启动，或下载推荐模型"; });
-            FormClosing += (s, e) => { operation.Cancel(); runtime.Stop(); };
+            else status.Text = "选择本地模型，或点击“下载推荐模型”；启动前可调整以上选项。";
+            FormClosing += (s, e) => { if (!preview) SaveSettings(); operation.Cancel(); runtime.Stop(); };
             FormClosed += (s, e) => runtime.Dispose();
             UpdateButtons();
         }
@@ -287,11 +385,50 @@ namespace NInferWindows {
             var box = new GroupBox { Text = title, Dock = DockStyle.Fill, Padding = new Padding(8) };
             box.Controls.Add(content); return box;
         }
-        void SaveModel() { File.WriteAllText(settings, model.Text, Encoding.UTF8); }
+        static NumericUpDown Number(int min, int max, int value, int width, int step) {
+            return new NumericUpDown { Minimum = min, Maximum = max, Value = value, Width = width, Increment = step, ThousandsSeparator = true };
+        }
+        static FlowLayoutPanel OptionRow(params object[] items) {
+            var row = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+            foreach (object item in items) row.Controls.Add(item is string ? new Label { Text = (string)item, AutoSize = true, Padding = new Padding(0, 5, 0, 0) } : (Control)item);
+            return row;
+        }
+        LaunchOptions ReadOptions() {
+            return new LaunchOptions { Backend = new[] { "none", "mtp", "dflash" }[backend.SelectedIndex], Drafts = (int)drafts.Value,
+                Context = (int)context.Value, OutputTokens = (int)outputTokens.Value, PrefillChunk = (int)prefill.Value, Port = (int)port.Value,
+                Concurrency = (int)concurrency.Value, Kv = kv.SelectedIndex == 0 ? "int8" : "bf16", Thinking = thinking.Checked,
+                Graph = graph.Checked, PrefixReuse = prefix.Checked, OptimizedMtpHead = mtpHead.Checked };
+        }
+        void SaveSettings() {
+            try { File.WriteAllText(settings, new JavaScriptSerializer().Serialize(new LauncherSettings { Model = model.Text, Options = ReadOptions() }), Encoding.UTF8); }
+            catch (Exception error) { AddLog("设置保存失败：" + error.Message); }
+        }
+        void LoadSettings() {
+            if (!File.Exists(settings)) return;
+            try {
+                var saved = new JavaScriptSerializer().Deserialize<LauncherSettings>(File.ReadAllText(settings, Encoding.UTF8));
+                var o = saved.Options; o.Validate(); model.Text = saved.Model;
+                backend.SelectedIndex = Array.IndexOf(new[] { "none", "mtp", "dflash" }, o.Backend);
+                drafts.Value = o.Drafts; context.Value = o.Context; outputTokens.Value = o.OutputTokens; prefill.Value = o.PrefillChunk;
+                port.Value = o.Port; concurrency.Value = o.Concurrency; kv.SelectedIndex = o.Kv == "int8" ? 0 : 1;
+                thinking.Checked = o.Thinking; graph.Checked = o.Graph; prefix.Checked = o.PrefixReuse; mtpHead.Checked = o.OptimizedMtpHead;
+            } catch (Exception error) { AddLog("无法恢复保存的设置，请重新选择：" + error.Message); }
+        }
+        void SwitchMode(string name) {
+            try {
+                string path = Path.Combine(runtime.Root, "tools", name);
+                if (!File.Exists(path)) throw new Exception("缺少模式切换脚本，请完整解压发布包。");
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true, WorkingDirectory = Path.GetDirectoryName(path) });
+                status.Text = "请在脚本窗口完成操作；确认待生效模式后保存工作并重启。";
+            } catch (Exception error) { MessageBox.Show(this, error.Message, "显卡模式"); }
+        }
         void UpdateButtons() {
             if (IsDisposed) return;
             start.Enabled = !busy && !runtime.Running; browse.Enabled = !busy && !runtime.Running;
-            download.Enabled = !busy && !runtime.Running; context.Enabled = !busy && !runtime.Running;
+            download.Enabled = !busy && !runtime.Running; optionsPanel.Enabled = !busy && !runtime.Running;
+            drafts.Enabled = backend.SelectedIndex != 0; mtpHead.Enabled = backend.SelectedIndex == 1;
+            concurrency.Enabled = backend.SelectedIndex != 2;
+            tcc.Enabled = wddm.Enabled = !busy && !runtime.Running;
             model.ReadOnly = busy || runtime.Running; send.Enabled = !busy && runtime.Running;
         }
         async Task Work(Func<CancellationToken, Task> action) {
@@ -324,9 +461,10 @@ namespace NInferWindows {
                     }
                     return 0;
                 }
-                if (args.Length == 3 && args[0] == "--smoke") {
+                if (args.Length == 4 && args[0] == "--smoke") {
                     using (var runtime = new Runtime(AppDomain.CurrentDomain.BaseDirectory, line => File.AppendAllText(args[2], line + "\n"))) {
-                        runtime.StartAsync(args[1], 4096, CancellationToken.None).GetAwaiter().GetResult();
+                        var options = new LaunchOptions { Backend = args[3], Context = 4096, OutputTokens = 512, Drafts = args[3] == "dflash" ? 7 : 3 };
+                        runtime.StartAsync(args[1], options, CancellationToken.None).GetAwaiter().GetResult();
                         var answer = runtime.ChatAsync("Reply in Chinese with one short sentence: what is 2 plus 2?", CancellationToken.None).GetAwaiter().GetResult();
                         if (string.IsNullOrWhiteSpace(answer)) throw new Exception("No answer returned");
                         File.AppendAllText(args[2], "ANSWER: " + answer + "\nSMOKE PASS\n");
@@ -335,7 +473,7 @@ namespace NInferWindows {
                 }
                 Application.Run(new Launcher()); return 0;
             } catch (Exception error) {
-                if (args.Length == 3 && args[0] == "--smoke") File.AppendAllText(args[2], error.ToString());
+                if (args.Length == 4 && args[0] == "--smoke") File.AppendAllText(args[2], error.ToString());
                 else MessageBox.Show(error.Message, "NInfer 启动失败");
                 return 1;
             }

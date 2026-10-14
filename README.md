@@ -1,6 +1,6 @@
 # NInfer Windows 双 V100
 
-[English](README.en.md) · [下载 Windows 应用](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases) · [使用与构建详情](docs/windows-toolchain.md)
+[English](README.en.md) · [下载 Windows 应用 v0.1.2](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.2-windows-preview) · [使用与构建详情](docs/windows-toolchain.md)
 
 在 **Windows 原生环境**中，用两张 V100 运行 Qwen3.8-27B。支持保留 GRID/WDDM 游戏配置，也可按需切换 TCC 提高推理速度；无需替换系统 CUDA。
 
@@ -14,7 +14,7 @@
 - **保留现有驱动与环境**：项目内独立 CUDA 12.8.1 + MSVC 14.44 工具链，不替换系统 CUDA 12.4；修复中文 MSVC 头文件依赖检测。
 - **接入指定 Coder390 v3 模型**：验证原始权重布局、DFlash 上下文副本和独立聊天模板；不重新量化模型。八组模板输出与原始 Jinja 模板逐字节对照。
 - **本机验证与公开限制**：双卡无 P2P/NVLink 的 Graph 探针、九项平台回归、真实 CLI/API 问答、上下文容量检查；明确保留 MTP 尚未通过的严格校验结果。
-- **中文便携应用**：显卡检查、模型选择/断点下载/SHA-256 校验、一键启动/停止、单轮聊天和 API 地址复制；运行依赖随包提供。
+- **中文便携应用**：显卡检查、模型选择/断点下载/SHA-256 校验、普通/MTP/DFlash 与启动参数配置、思考内容显示、一键启动/停止、TCC/WDDM 切换入口；运行依赖随包提供。
 
 ## 上游与工作来源
 
@@ -32,17 +32,36 @@
 ## 小白使用：下载、解压、双击
 
 1. 安装适合自己显卡的 NVIDIA 驱动。**本机验证的是 GRID 553.62，WDDM 与 TCC 均完成测速**，不是要求所有机器盲目更换到该版本。
-2. 从 [Releases](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases) 下载 `NInfer-Windows-V100X2-0.1.0.zip`，完整解压，双击 **`NInfer.exe`**。不要在压缩包内直接运行。
+2. 从 [v0.1.2 Release](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.2-windows-preview) 下载 `NInfer-Windows-V100X2-0.1.2.zip`，完整解压，双击 **`NInfer.exe`**。不要在压缩包内直接运行。
 3. 选择已有的兼容 `.ninfer` 模型；没有模型时点击 **“下载推荐模型”**。模型约 **23.8GB**，需预留至少 25GB 磁盘空间，支持取消后续传及完整性校验。
-4. 选择上下文容量，点击 **“启动模型”**，等待服务就绪。建议从 **128K** 开始；显存紧张时选 16K。
+4. 选择解码模式及启动选项，点击 **“启动模型”**，等待服务就绪。默认普通解码、思考开启、128K 容量；选择 DFlash 会将草稿数设为 7、并发设为 1，并把超过 96K 的容量降到 96K 建议值。显存不足时降低容量。
 5. 在界面提问，点击 **“发送单轮提问”**。每次问答独立；多轮聊天可使用自己的 OpenAI API 客户端。
 6. 点击 **“停止 / 取消”**或正常关闭窗口，会停止本应用启动的服务并释放显存。
 
-**无需安装 Python、CUDA Toolkit 或 Visual Studio。** CUDA runtime 与 VC++ 运行库随发布包提供，界面使用 Windows 自带的 .NET Framework 4.8。应用不安装驱动、不修改 TCC/WDDM、全局环境变量或其他服务。
+**无需安装 Python、CUDA Toolkit 或 Visual Studio。** CUDA runtime 与 VC++ 运行库随发布包提供，界面使用 Windows 自带的 .NET Framework 4.8。应用不安装驱动、不自动切模式，也不修改全局环境变量或其他服务。只有点击“切换 TCC / 恢复 WDDM”并允许 UAC 后，附带脚本才会请求切换；随后需自行重启。
 
 ![中文启动器](docs/images/windows-launcher.png)
 
 运行范围：Windows 11 x64，NVIDIA 设备 `0,1` 为两张至少 16GB 的 V100。RX550 可继续负责显示输出。建议 64GB 以上系统内存；本机验证为 128GB，较小内存尚未验证。发布包未做代码签名，请核对同一 Release 的 `SHA256SUMS.txt`。
+
+### 发布应用的启动选项
+
+| 选项 | 默认值与说明 |
+|---|---|
+| 解码模式 | 普通；可手动启用实验 MTP 或 DFlash。 |
+| 草稿数 | MTP 最多 3，DFlash 最多 7；MTP 可开关优化草稿头。 |
+| 思考模式 | 默认开启；内置聊天分别显示思考与回答，达到输出上限时提示截断。 |
+| 上下文容量 | 默认 131072，输入历史、思考和回答共用；DFlash 建议 98304。 |
+| 输出上限 | 默认 2048，包含思考与回答；同时用于 API 默认值和内置聊天。客户端可另行指定。 |
+| 预填充分块 | 默认 256，可选 128 的倍数至 1024；更大分块需要更多显存。 |
+| KV 格式 | 默认 INT8，可选 BF16；BF16 显存需求更高。 |
+| 并发 | 默认 1；普通/MTP 可选 1–8，共享 KV 按容量 × 并发分配，可能被显存预算拒绝；DFlash 固定 1。 |
+| CUDA Graph / 前缀复用 | 默认开启，可分别关闭。WDDM 小消息传输优化按硬件自动启用，无需手动开关。 |
+| API 端口 | 默认 0 自动选择，也可填 8081 等固定端口；只监听本机。 |
+| TCC / WDDM | 点击对应按钮调用附带脚本；运行模型时按钮禁用，先停止模型再切换。 |
+
+模型路径和启动选项自动保存在本地，运行日志显示实际启动命令。修改启动选项需先停止服务。
+应用启动时**不会自动下载模型**；点击“下载推荐模型”并选择目录后，才会从 ModelScope 自动下载、断点续传及校验，完成后仍由你点击“启动模型”。
 
 ### 连接聊天客户端
 
@@ -70,7 +89,7 @@
 
 ## 本机实测与限制
 
-当前源码和本地 0.1.1 构建包含上述通信优化；已发布的 0.1.0 ZIP 不包含该改动。
+**v0.1.2 发布包已包含 WDDM 通信优化、实验 MTP/DFlash 开关和完整启动选项。** 旧 0.1.0 ZIP 不包含这些更新；下面的速度来自同一推理实现的 CLI/API 对照，不是开启思考后的速度保证。
 
 ### 推理速度与并发
 
@@ -116,6 +135,8 @@ Windows 11、2× V100-SXM2 16GB、GRID 553.62/WDDM、PCIe 3.0 ×16，**无 P2P�
 | [restore-wddm.cmd](tools/windows/restore-wddm.cmd) | 双击，为两张 V100 请求 WDDM 游戏模式。 |
 | [set-v100-mode.ps1](tools/windows/set-v100-mode.ps1) | 共用实现，自动识别恰好两张 Tesla V100，按查询到的 UUID 操作。 |
 
+v0.1.2 ZIP 的 `tools/` 目录也包含这三个脚本，启动器上的切换按钮调用同一实现。
+
 先退出使用 V100 的游戏和推理程序，再双击相应 `.cmd`，允许 Windows UAC 管理员授权。**确认两卡 Pending 均为目标模式后，保存工作并重启**；重启后 Current 应与 Pending 一致。TCC 下 V100 不能承担游戏图形渲染，RX550 可继续输出画面。脚本不强制切换、不自动重启，也不安装驱动或改动其他型号显卡；驱动拒绝或只完成一张时会报错并显示状态，恢复 WDDM 可使用同一恢复入口。
 
 只读查询（无需管理员权限，也不会切换模式）：
@@ -138,7 +159,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\windows\set-v100
 
 默认监听 `http://127.0.0.1:8080/v1`，用 `-Port` 更换端口。模型 ID 可通过 `/v1/models` 查询。需要自己编译时阅读 [工具链与构建](docs/windows-toolchain.md)；构建便携应用和发布包见 [应用维护说明](docs/windows-app.md)。
 
-日志及上次选择的模型路径保存在 `%LOCALAPPDATA%\NInferV100X2`。卸载时关闭启动器、删除解压目录即可；模型和设置可自行保留。
+日志、模型路径与启动选项保存在 `%LOCALAPPDATA%\NInferV100X2`，设置文件为 `settings.json`。卸载时关闭启动器、删除解压目录即可；模型和设置可自行保留。
 
 ### 为什么仓库没有 build-tools？
 
