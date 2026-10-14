@@ -2,9 +2,13 @@
 
 [English](README.en.md) · [下载 Windows 应用 v0.1.3](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.3-windows-preview) · [使用与构建详情](docs/windows-toolchain.md)
 
-在 **Windows 原生环境**中，用两张 V100 运行 Qwen3.8-27B。支持保留 GRID/WDDM 游戏配置，也可按需切换 TCC 提高推理速度；无需替换系统 CUDA。
+**让双 Tesla V100 在 Windows 上运行本地 Qwen：中文便携应用、双卡推理优化与兼容 API。**
 
-本项目是在上游推理引擎基础上的 **Windows 双卡适配与易用性发行版**，不是重新实现的模型或独立训练成果。当前发布为预览版，已验证 Windows 11 + 双 V100-SXM2 16GB + GRID 553.62。
+NInfer Windows 双 V100 面向希望在 Windows 电脑上运行本地大模型的双卡用户，围绕已登记的 Qwen 27B 模型提供原生 C++/CUDA 推理、中文启动器和命令行工具。可以直接进行本地问答，也可通过 OpenAI / Anthropic 兼容 API 接入聊天客户端、代码助手和 Agent 工具；具体协议范围见[服务文档](docs/serving.md)。
+
+项目重点是 **Windows 双卡适配、V100 通信与推理优化，以及便于普通用户使用的发行包**。便携应用提供模型选择与显式下载、启动参数配置和 TCC/WDDM 切换入口；无需安装开发工具链或替换系统 CUDA。支持 GRID/WDDM 游戏配置，也可按需切换 TCC 用于推理。
+
+本仓库现独立维护，代码基于 [tuxKOH/ninfer-V100X2](https://github.com/tuxKOH/ninfer-V100X2) 及相关上游工作，继续保留提交历史、许可证和来源说明。当前为预览版，已验证 Windows 11 + 双 V100-SXM2 16GB + GRID 553.62；MTP/DFlash 仍为实验功能，实测条件与已知限制在下文公开。
 
 ## 本项目做了什么
 

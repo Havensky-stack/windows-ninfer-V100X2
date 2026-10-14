@@ -2,9 +2,20 @@
 
 [中文首页](README.md) · [Download Windows v0.1.3 preview](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.3-windows-preview)
 
-This fork brings the `tuxKOH/ninfer-V100X2` inference engine to native Windows on two
-Tesla V100-SXM2 16GB GPUs. Tested on Windows 11, GRID 553.62, WDDM and TCC, PCIe 3.0 x16 per GPU,
-without P2P or NVLink. The existing graphics driver and system CUDA installation are preserved.
+**Local Qwen inference on Windows with dual Tesla V100 GPUs, a portable Chinese launcher,
+and compatible APIs.**
+
+This independently maintained project builds on [tuxKOH/ninfer-V100X2](https://github.com/tuxKOH/ninfer-V100X2)
+and its upstream work, retaining commit history, licenses and attribution. It focuses on native
+Windows support, dual-V100 communication and inference optimizations, and accessible packaging
+for the registered Qwen 27B models. Use the launcher for local questions or connect chat clients,
+coding assistants and agent tools through the OpenAI / Anthropic compatible APIs; see the
+[serving contract](docs/serving.md) for supported protocol behavior.
+
+The preview is tested on Windows 11, two V100-SXM2 16GB GPUs, GRID 553.62, WDDM and TCC,
+PCIe 3.0 x16 per GPU, without P2P or NVLink. Portable packages include runtime dependencies
+and explicit model-download and GPU-mode controls, without replacing the system CUDA installation.
+MTP and DFlash remain experimental; measured conditions and known limitations are documented below.
 
 Our contributions are Windows platform I/O/memory/network support, an isolated CUDA 12.8 /
 MSVC 14.44 build, exact Coder390 v3 artifact/template admission, focused regression tests,
