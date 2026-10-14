@@ -168,8 +168,9 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
     print_metric("tensors/resources",
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
     print_metric("tensor parallel", std::to_string(load.tp) + (load.tp > 1 ? " (split)" : ""));
+    print_metric("pipeline stages", std::to_string(load.pp));
     print_metric("rope", format_rope(load));
-    for (int rank = 0; rank < load.tp; ++rank) {
+    for (int rank = 0; rank < load.tp * load.pp; ++rank) {
         const ninfer::DeviceMemoryReport& row = load.devices[static_cast<std::size_t>(rank)];
         const std::string label               = "gpu" + std::to_string(row.device);
         print_metric(label + " weights", format_bytes(row.weights_bytes));
@@ -299,6 +300,8 @@ int main(int argc, char** argv) {
         engine_options.artifact_path  = cli.artifact_path;
         engine_options.device         = cli.device;
         engine_options.tp             = cli.tp;
+        engine_options.pp             = cli.pp;
+        engine_options.pipeline_chunks = cli.pipeline_chunks;
         engine_options.devices        = cli.devices;
         engine_options.storage_device = cli.storage_device;
         engine_options.max_context    = cli.max_context;
@@ -309,6 +312,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.ram_kv         = cli.ram_kv;
+        engine_options.volta_long_attention = cli.volta_long_attention;
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.vision_max_tokens = cli.vision_max_tokens;

@@ -32,16 +32,16 @@ struct DeviceContext {
     void synchronize() const;
 };
 
-// One process, up to four CUDA devices. Only dev[0..tp-1] are constructed.
+// One process, up to four CUDA compute devices. The context does not select TP or PP semantics.
 inline constexpr std::size_t kMaximumExecutionDevices = 4;
 struct ExecutionContext {
     std::array<std::optional<DeviceContext>, kMaximumExecutionDevices> dev;
     // Optional device used only as a physical weight store. It is deliberately separate from
-    // `dev[1]`: tp remains the compute width, so family scheduling and KV geometry stay tp1.
+    // `dev[1]`: the compute device count remains one.
     std::optional<DeviceContext> storage;
-    int tp = 1;
+    int device_count = 1;
 
-    // device_ids.size() must be 1, 2 or 4 and becomes tp. Every id is validated to exist by
+    // device_ids.size() must be 1, 2 or 4 and becomes device_count. Every id is validated to exist by
     // DeviceContext's own constructor; multiple devices must additionally share the
     // same compute capability (sm major.minor), since nothing downstream can reconcile mismatched
     // architectures.

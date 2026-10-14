@@ -180,7 +180,9 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
                                  spec.value_heads == 24 && spec.conv_channels == 5120;
     const bool geometry_48_tp4 = spec.layers == 48 && spec.qk_heads == 4 &&
                                  spec.value_heads == 12 && spec.conv_channels == 2560;
-    return geometry_48 || geometry_30 || geometry_48_tp2 || geometry_48_tp4;
+    const bool geometry_24_pp2 = spec.layers == 24 && spec.qk_heads == 16 &&
+                                 spec.value_heads == 48 && spec.conv_channels == 10240;
+    return geometry_48 || geometry_30 || geometry_48_tp2 || geometry_48_tp4 || geometry_24_pp2;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

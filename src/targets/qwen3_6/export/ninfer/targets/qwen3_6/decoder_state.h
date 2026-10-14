@@ -36,6 +36,12 @@ struct PagedKVCacheLayout {
     std::int32_t head_dim     = 0;
     DType dtype               = DType::BF16;
     std::int32_t quant_group  = 0;
+    TensorRegion retrieval_keys;
+    TensorRegion retrieval_query;
+    TensorRegion retrieval_fallback;
+    TensorRegion retrieval_counts;
+    TensorRegion retrieval_span;
+    TensorRegion retrieval_scores;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pool.payload_bytes(); }
 };
@@ -79,6 +85,14 @@ public:
     [[nodiscard]] PagedKVCacheView execution_view(const PagedKVAllocation& allocation) const;
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
+
+    // Persistent single-request retrieval state; empty on the full-history route.
+    Tensor retrieval_keys;
+    Tensor retrieval_query;
+    Tensor retrieval_fallback;
+    Tensor retrieval_counts;
+    Tensor retrieval_span;
+    Tensor retrieval_scores;
 
 private:
     friend class PagedKVCacheView;

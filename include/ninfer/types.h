@@ -102,9 +102,14 @@ struct EngineOptions {
     // its optional DFlash2 backend, and Vision; TP4 supports SM70 Qwen3.8 NVFP4/native FP8
     // Text/MTP without Vision. The 35B-A3B package requires TP1.
     int tp = 1;
-    // Explicit device ids, one per tp rank. Empty means "derive from `device`" (i.e. {device});
+    // Pipeline degree. PP2 owns complete consecutive layer ranges on two SM70 devices;
+    // it requires TP1, one active request, Text, and None/MTP speculation.
+    int pp = 1;
+    // Number of chunks submitted in one PP prefill wave. One is the serial control profile.
+    std::uint32_t pipeline_chunks = 8;
+    // Explicit compute device ids. Empty means "derive from `device`" (i.e. {device});
     // this lets callers that construct EngineOptions directly (tests, embedders) omit it. When
-    // non-empty its size must equal tp.
+    // non-empty its size must equal tp * pp.
     std::vector<int> devices;
     // Optional second GPU used only as a VMM-backed expert-weight store. This keeps tp == 1:
     // attention, KV, and all scheduling remain on `device`; only supported MoE artifacts may use
@@ -124,6 +129,9 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // Complete-history SM70 TP2 long attention with coarser KV partitions and FP32 PV.
+    // Numerically qualified, not output-bit-equivalent to the default profile.
+    bool volta_long_attention          = false;
     RamKvOptions ram_kv;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -502,7 +510,7 @@ struct MemorySummary {
     std::size_t gdn_state_bytes = 0;
 };
 
-// One row of the per-device memory table the load summary prints. At tp == 1 only `devices[0]` is
+// One row of the per-device memory table. At tp * pp == 1 only `devices[0]` is
 // meaningful. Every byte count is measured or planned for that device specifically -- nothing here
 // is a model total divided by the tensor-parallel width.
 struct DeviceMemoryReport {
@@ -536,6 +544,7 @@ struct RuntimeStats {
 
 struct LoadSummary {
     int tp = 1;
+    int pp = 1;
     std::array<DeviceMemoryReport, 4> devices{};
     // Rotary regime resolved at construction. `effective_max_context` is the ceiling `max_context`
     // was validated against (the variant's native capacity under `RopeMode::Native`,

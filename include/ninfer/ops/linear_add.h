@@ -93,7 +93,7 @@ void ggml_k_gdn_output(std::span<const Tensor> x, std::span<const Weight> w,
                        const PeerEvents& events);
 
 // --- Tensor-parallel split form (tp == 2 or 4) ------------------------------------------------
-// All spans have exactly ec.tp entries. Only registered per-format shard shapes are admitted;
+// All spans have exactly ec.device_count entries. Only registered per-format shard shapes are admitted;
 // accepting a four-rank context does not register an otherwise unsupported weight geometry.
 // Staging follows allreduce_sum: one output contribution per rank at TP2, four at TP4.
 //

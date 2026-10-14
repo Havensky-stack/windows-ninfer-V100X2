@@ -193,3 +193,43 @@ $env:NINFER_V100X2_ARTIFACT = (Resolve-Path 'models/Qwen3.8-27B-Coder390-Efficie
 $env:NINFER_V100X2_PROPOSAL_HEAD = 'optimized'
 .\build-windows\tests\ninfer_qwen3_8_27b_v100x2_real_test.exe
 ```
+
+## 上游 Volta 更新的 Windows 集成验证
+
+本次集成上游 `861633e8` / `756d1363`，保留 WDDM mapped-host 通信、Coder390 前端、
+4K MTP Graph 的 32 MiB 预算、模式切换工具及中文启动器。新 API 中的 `device_count`
+表示执行域设备数；本地通信优化已同步适配。系统 CUDA 12.4 和 GRID 553.62 未改变。
+
+验证使用独立目录 `build-windows-upstream`，CUDA 12.8.93、MSVC 14.44、Release、SM70、
+四路构建；共享原有 vcpkg/CUTLASS 依赖。CLI/API 构建和 `--help` 通过；12 项平台/API
+测试通过，包括 public API、device、artifact reader/materialization、media decode、
+allreduce、RAM-KV、CLI/serve options、request log 和 OpenAI/Anthropic schema。
+Coder390 模板对照及启动器参数、持久化、下载测试通过。
+
+新 W8 词表头检查覆盖 code/scale 的精确排列、独立 FP64 投影参考、Graph/eager 与内存
+边界；NVFP4 输入投影、down projection 和 SwiGLU 对照独立 FP64 参考通过。
+85K 实际占用、180K 容量、1/4/5/6 查询的 INT8 注意力完整 FP64 对照、Graph 重放与
+页表边界检查也通过。这是算子验证，不是整模型长上下文性能或质量证明。
+这些测试可在通常的 `build-windows` 目录复现：
+
+```powershell
+. ./tools/windows/enter-toolchain.ps1
+cmake --build build-windows --parallel 4 --target ninfer_linear_w8_prepacked_sm70_test ninfer_nvfp4_input_sm70_test ninfer_attention_headlocal_test
+ctest --test-dir build-windows --output-on-failure -j 1 -R '^ninfer_(linear_w8_prepacked_sm70|nvfp4_input_sm70)_test$'
+./build-windows/tests/ninfer_attention_headlocal_test.exe --long-context-only
+```
+
+PP2、实验长注意力和 Q/K 均值 RAM-KV 保留上游的默认关闭状态，未加入 Windows GUI。
+本轮测试在 TCC 下执行；不把它当作新版 WDDM 或 PP2 的整模型性能认证。
+
+本次 TCC Coder390、4K 容量、DFlash7/full 的真实模型复核：Graph/eager 与
+贪心/采样切换检查通过；严格 teacher-forced 门仍失败，同一 probe 1、位置 31，
+目标 token 2532、投机 token 561，logit 差 0.125（1/64）。普通对照 0/64。
+未放宽断言，也未认定 DFlash 完成严格资格验证。MTP 本轮未重跑整模型门，旧失败仍有效。
+
+```powershell
+$env:NINFER_V100X2_ARTIFACT = (Resolve-Path 'models/Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer').Path
+$env:NINFER_V100X2_SPEC = 'dflash'
+$env:NINFER_V100X2_PROPOSAL_HEAD = 'full'
+./build-windows/tests/ninfer_qwen3_8_27b_v100x2_real_test.exe
+```

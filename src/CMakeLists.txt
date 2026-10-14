@@ -79,8 +79,10 @@ add_library(ninfer_ops STATIC
   ops/launcher/bidirectional_gqa_attention.cu
   ops/launcher/swa.cu
   ops/launcher/gqa_attention_decode.cu
+  ops/launcher/gqa_attention_qpn_volta.cu
   ops/launcher/gqa_attention_prefill.cu
   ops/launcher/kv_cache_append_prefix.cu
+  ops/launcher/kv_retrieval.cu
   ops/launcher/l2norm.cu
   ops/launcher/layer_norm.cu
   ops/launcher/mtp_pack.cu
@@ -300,6 +302,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear/q5/q5_volta_mma_gemm.cu
     ops/linear/w8/w8_volta_mma_gemm.cu
     ops/linear/w8/w8_volta_qpn_gemm.cu
+    ops/linear/w8/w8_prepack_sm70.cu
     ops/linear_add/q5/q5_linear_add_cutlass_sm70.cu
     ops/linear_swiglu/q4/q4_linear_swiglu_cutlass_sm70.cu
     ops/linear_swiglu/fp8/fp8_linear_swiglu_volta_qpn.cu

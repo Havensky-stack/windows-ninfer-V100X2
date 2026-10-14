@@ -3,7 +3,7 @@
 Optional native RAM-KV uses the same public Engine and HTTP protocols, not a llama.cpp backend.
 Add `--ram-kv-window 98304 --ram-kv-budget-bytes 32000000000` to a 27B SM70 TP2 Text/MTP
 launch with `--max-context 180000` or `262144`. It supports one active request and CUDA Graphs.
-Omit `--kv-capacity`, or set it equal to the resident window. This is **approximate lexical
+Omit `--kv-capacity`, or set it equal to the resident window. This is **approximate Q/K mean-vector
 retrieval**, including long prefill, and can miss history. RAM archive bytes are lossless, but that
 does not establish quality equivalence. No Vision/DFlash/TP4 in this mode. The archive budget is
 not an entire-server RAM cap; apply cgroup MemoryMax and disable swap separately when required.
@@ -65,6 +65,13 @@ profile. The 35B-A3B package has no TP2 path, but it can use two GPUs as a singl
 path plus an expert-only storage device. Keep `--tp 1`, select the compute GPU with `--device`,
 and pass the other GPU with `--storage-device`; this requires peer access and leaves attention,
 KV, GDN, and scheduling on the primary GPU.
+
+`--tp 1 --pp 2 --devices 0,1 --max-concurrency 1` selects the experimental SM70
+Qwen3.8 NVFP4/QUASAR layer pipeline through the same Engine and HTTP protocols.
+`--pipeline-chunks 1..8` controls the prefill wave (default 8; 1 is serial).
+It supports Text, None/MTP, prefix reuse and optional sparse RAM-KV; Vision, DFlash, expert storage
+and concurrency above one are rejected. Both prefill and decode use PP2 throughout
+the resident Engine's lifetime; there is no request-time TP/PP switch.
 
 Compatible-prefix reuse is enabled by default at both TP widths, including `--tp 2 --spec mtp`.
 The visual-prefix bridge test fails on this two-card SM70 host; the difference has not been
@@ -557,7 +564,9 @@ curl http://127.0.0.1:8080/v1/models \
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
-| `--devices A,B` | one CUDA device index per `--tp` rank; required for `--tp 2` | `--device` |
+| `--pp 1\|2` | experimental SM70 NVFP4/QUASAR layer pipeline; PP2 requires TP1, concurrency 1, Text/None/MTP | `1` |
+| `--pipeline-chunks N` | PP prefill wave of `1..8` chunks; `1` is serial | `8` |
+| `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
 | `--storage-device N` | 35B-A3B expert-only VMM backing GPU; keeps `--tp 1` | unset |
 | `--max-request-mib N` | body-size limit before JSON parsing | `384` |
 | `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
@@ -567,6 +576,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
+| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, concurrency 1, INT8 KV, Text/None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |

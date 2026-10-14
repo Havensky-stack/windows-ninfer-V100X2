@@ -32,8 +32,9 @@ std::string cuda_version_string(int version) {
 
 void fill_cuda_environment(ninfer::bench::BenchEnvironment& env) {
     env.tp = env.load.tp;
+    env.pp = env.load.pp;
     env.devices.clear();
-    for (int rank = 0; rank < env.tp; ++rank) {
+    for (int rank = 0; rank < env.tp * env.pp; ++rank) {
         env.devices.push_back(env.load.devices[rank].device);
     }
     env.device_id = env.devices.front();
@@ -162,26 +163,33 @@ int main(int argc, char** argv) {
         engine_options.artifact_path = options.artifact_path;
         engine_options.device        = options.device;
         engine_options.tp            = options.tp;
+        engine_options.pp            = options.pp;
+        engine_options.pipeline_chunks = options.pipeline_chunks;
         engine_options.devices       = options.devices;
         engine_options.max_context   = max_context;
-        engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+        engine_options.ram_kv        = options.ram_kv;
+        engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(
+            options.ram_kv.gpu_tokens != 0 ? options.ram_kv.gpu_tokens : max_context);
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.kv_cache      = options.kv_cache;
         engine_options.speculative.backend       = options.speculative_backend;
         engine_options.speculative.draft_tokens  = options.mtp_draft_tokens;
         engine_options.speculative.proposal_head = options.proposal_head;
         engine_options.use_cuda_graph            = options.use_cuda_graph;
+        engine_options.volta_long_attention      = options.volta_long_attention;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
         env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
         env.prefill_chunk            = options.prefill_chunk;
+        env.pipeline_chunks         = options.pp == 2 ? options.pipeline_chunks : 1U;
         env.kv_cache                 = options.kv_cache;
         env.speculative_backend      = options.speculative_backend;
         env.mtp_draft_tokens         = options.mtp_draft_tokens;
         env.proposal_head            = options.proposal_head;
         env.use_cuda_graph           = options.use_cuda_graph;
+        env.volta_long_attention     = options.volta_long_attention;
         env.repetitions              = options.repetitions;
         env.warmup                   = options.warmup;
         env.corpus_path              = options.corpus_path;
@@ -229,6 +237,7 @@ int main(int argc, char** argv) {
                 require_cuda(cudaProfilerStop(), "cudaProfilerStop");
             }
             const ninfer::MemorySummary memory    = engine.memory_summary();
+            env.memory.ram_kv_transfer_bytes       = memory.ram_kv_transfer_bytes;
             result.workspace_peak_bytes           = memory.workspace_logical_peak_bytes;
             result.workspace_allocator_peak_bytes = memory.workspace.peak_used_bytes;
             results.push_back(std::move(result));

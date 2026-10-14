@@ -103,7 +103,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         throw std::invalid_argument("sequence plan tp must be 1, 2 or 4");
     }
     const std::int32_t linear_state_slots =
-        LinearStateSlots::state_slot_count(plan.max_concurrency);
+        LinearStateSlots::state_slot_count(plan.max_concurrency) + (plan.ram_kv.gpu_tokens != 0 ? 1 : 0);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -121,7 +121,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     PersistentLayout out;
     out.decoder = qwen3_6::plan_decoder_state(
         builder, qwen3_6::DecoderStateSpec{
-                     .full_attention_layers     = TextConfig::full_attention_layers(),
+                     .full_attention_layers     = static_cast<std::uint32_t>(TextConfig::full_attention_layers() / plan.pp),
                      .mtp_layers                = TextConfig::mtp_layers,
                      .capacity                  = plan.capacity,
                      .kv_heads                  = TextConfig::kv_heads / tp,
@@ -135,7 +135,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .ram_kv                    = plan.ram_kv.gpu_tokens != 0,
                      .linear_attention =
                          {
-                             .layers         = TextConfig::gdn_layers(),
+                             .layers         = static_cast<std::uint32_t>(TextConfig::gdn_layers() / plan.pp),
                              .conv_channels  = TextConfig::convolution_dim / tp,
                              .conv_width     = TextConfig::gdn_conv_state_width,
                              .value_heads    = TextConfig::gdn_value_heads / tp,
@@ -146,14 +146,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                          },
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        // ONE device's replay records, exactly like the decoder state above: the GDN verify round
-        // records this device's own head/channel shard, and the registered
-        // FoldGeometry<48, 8, 24, 5120> is the shape the peer's fold consumes. The RECORD
-        // CAPACITY and WIDTH are not divided -- both devices record the same rows and the same
-        // draft window.
+        // Replay records follow the device's layer/head geometry. Record capacity and
+        // verify width are not divided: every device commits the same token prefix.
         out.replay_records = plan_gdn_replay_records(
             builder, GdnReplayRecordSpec{
-                         .layers          = TextConfig::gdn_layers(),
+                         .layers          = TextConfig::gdn_layers() / plan.pp,
                          .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                          .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
                          .conv_channels   = TextConfig::convolution_dim / tp,
@@ -257,7 +254,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto verify = drafts + 1;
     const ops::GqaExecutionEnvelope text_envelope{1, plan.ram_kv.gpu_tokens != 0
         ? std::min(plan.capacity, plan.kv_capacity + (plan.features.mtp() ? 64U : 0U))
-        : plan.capacity};
+        : plan.capacity, plan.volta_long_attention};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -455,6 +452,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
          ++batch) {
         WorkspaceLayoutBuilder ordinary;
         matrix(ordinary, DType::BF16, TextConfig::hidden, batch);
+        if (plan.pp == 2) {
+            // Peer-local decode control copies live alongside the residual for the whole stage.
+            for (int control = 0; control < 5; ++control) { matrix(ordinary, DType::I32, batch, 1); }
+        }
         tp_call_roots(ordinary, batch, batch);
         target_body(ordinary, batch, batch, qwen3_6::TextPhase::Verify, GdnWorkspacePath::Snapshot,
                     batch, 1, 1, text_envelope);
@@ -504,6 +505,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             const std::int32_t aggregate = batch * verify;
             WorkspaceLayoutBuilder target;
             matrix(target, DType::BF16, TextConfig::hidden, aggregate);
+            if (plan.pp == 2) {
+                matrix(target, DType::I32, verify, batch);
+                matrix(target, DType::I32, verify, batch);
+                for (int control = 0; control < 3; ++control) { matrix(target, DType::I32, batch, 1); }
+            }
             tp_call_roots(target, aggregate, aggregate);
             target_body(target, aggregate, aggregate, qwen3_6::TextPhase::Verify,
                         GdnWorkspacePath::ReplayRecord, batch, verify, verify, text_envelope);
@@ -648,6 +654,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 // `RopeMode::Yarn`. The single caller passes it straight into the sequence plan, so the ceiling is
 // resolved exactly once per Engine construction.
 std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions& options) {
+    if (options.volta_long_attention &&
+        (TextConfig::query_heads != 24 || device.sm() != 70 || options.tp != 2 || options.pp != 1 ||
+         options.max_concurrency != 1 || options.enable_vision ||
+         options.kv_cache != KvCacheStorage::Int8Group64 || options.ram_kv.gpu_tokens != 0 ||
+         options.speculative.backend == SpeculativeBackend::DFlash)) {
+        throw std::invalid_argument("Volta long attention requires SM70 27B TP2 single-request Text/None/MTP with complete INT8 KV");
+    }
     if (options.ram_kv.gpu_tokens != 0) {
         if constexpr (TextConfig::query_heads != 24) {
             throw std::invalid_argument("RAM KV is supported only by the 27B package");
@@ -657,7 +670,7 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
             throw std::invalid_argument("RAM KV requires SM70 TP1/TP2, one Text/MTP request");
         }
         if (options.ram_kv.gpu_tokens % kPagedKVPageSize != 0 ||
-            options.ram_kv.gpu_tokens < options.prefill_chunk + 8192 ||
+            options.ram_kv.gpu_tokens < options.prefill_chunk * (options.pp == 2 ? options.pipeline_chunks : 1U) + 8192 ||
             options.ram_kv.gpu_tokens > options.max_context || options.ram_kv.budget_bytes == 0) {
             throw std::invalid_argument("RAM KV GPU window must be page-aligned, at least prefill_chunk+8192, and no larger than max_context");
         }
@@ -752,6 +765,9 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
     if (device.sm() != 70 && device.sm() != 86 && device.sm() != 89 && device.sm() != 120) {
         throw std::invalid_argument("Qwen3.6 family runtime requires a registered CUDA target");
     }
+    if (options.pp == 2 && device.sm() != 70) {
+        throw std::invalid_argument("PP2 currently requires SM70");
+    }
     return effective_max_context;
 }
 
@@ -781,7 +797,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->device              = inputs.device;
     impl->tp                  = inputs.tp;
+    impl->pp                  = inputs.pp;
+    impl->pipeline_chunks     = inputs.pipeline_chunks;
     impl->ram_kv              = inputs.ram_kv;
+    impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
     impl->persistent          = persistent_layout(*impl);
@@ -795,7 +814,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         };
         add_archive(impl->persistent.decoder.text_kv);
         if (impl->persistent.decoder.mtp_kv) { add_archive(*impl->persistent.decoder.mtp_kv); }
-        if (archive * inputs.tp > inputs.ram_kv.budget_bytes) {
+        if (archive * inputs.tp * inputs.pp > inputs.ram_kv.budget_bytes) {
             throw std::invalid_argument("packed RAM KV archive exceeds configured host budget");
         }
     }
@@ -831,7 +850,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // budget there is one multiplier, 20 MiB, against a 0.3b-style worst case of ~19.9
             // MiB: roughly 1 MiB of headroom. Raising this multiplier, not the warm pass, is the
             // lever if that transient is ever observed at tp 2.
-            const std::uint64_t per_batch = impl->tp > 1 ? 20ULL * kMiB : 12ULL * kMiB;
+            const std::uint64_t per_batch = impl->tp * impl->pp > 1 ? 20ULL * kMiB : 12ULL * kMiB;
             impl->graph_allowance_bytes =
                 checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
@@ -916,7 +935,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .use_cuda_graph = options.use_cuda_graph,
         .device         = options.device,
         .tp             = options.tp,
+        .pp             = options.pp,
+        .pipeline_chunks = options.pp == 2 ? options.pipeline_chunks : 1U,
         .ram_kv         = options.ram_kv,
+        .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     const std::uint32_t minimum_pages = inputs.ram_kv.gpu_tokens != 0

@@ -128,7 +128,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
-           "       --ram-kv-window: experimental approximate lexical RAM-KV; one SM70 27B Text/MTP request, TP1/TP2\n"
+           "       --volta-long-attention: experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ\n"
+           "       --ram-kv-window: experimental approximate Q/K mean-vector RAM-KV; one SM70 27B Text/MTP request, TP1/TP2/PP2\n"
            "       RAM archive budget defaults to 32000000000 bytes (not process RSS); disabled without the window option\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -160,8 +161,11 @@ std::string serve_usage_text(const char* argv0) {
            "across two GPUs and requires --devices; it supports --spec mtp, --spec dflash and "
            "--vision.\n"
            "       --tp 4 supports SM70 Qwen3.8-27B NVFP4/native FP8 Text/MTP with "
-           "--devices 0,1,2,3; Vision and DFlash are unavailable.\n"
-           "       --devices lists one device id per --tp rank, e.g. --devices 1 for --tp 1, or "
+           "--devices 0,1,2,3; Vision and DFlash are unavailable at TP4.\n"
+           "       --pp 2 selects SM70 Qwen3.8 NVFP4/QUASAR layer pipeline "
+           "execution with --tp 1 --devices 0,1 (Text/None/MTP, max-concurrency 1). "
+           "--pipeline-chunks 1..8 controls the prefill wave (default 8; 1 is serial).\n"
+           "       --devices lists --tp * --pp device ids, e.g. --devices 1 for --tp 1, or "
            "--devices 0,1 for --tp 2. When given together with --device they must agree on the "
            "primary device.\n"
            "       --rope selects the rotary regime (default native: the checkpoint\'s own RoPE and "
@@ -229,6 +233,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
+        } else if (arg == "--volta-long-attention") {
+            options.volta_long_attention = true;
         } else if (arg == "--ram-kv-window") {
             options.ram_kv.gpu_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ram-kv-window"), "ram-kv-window"));
@@ -302,6 +308,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             device_explicit = true;
         } else if (arg == "--tp") {
             options.tp = parse_tp(require_value("--tp"));
+        } else if (arg == "--pp") {
+            options.pp = parse_nonnegative_int(require_value("--pp"), "pp");
+            if (options.pp != 1 && options.pp != 2) { throw std::invalid_argument("--pp must be 1 or 2"); }
+        } else if (arg == "--pipeline-chunks") {
+            options.pipeline_chunks = parse_nonnegative_int(require_value("--pipeline-chunks"), "pipeline-chunks");
+            if (options.pipeline_chunks < 1 || options.pipeline_chunks > 8) {
+                throw std::invalid_argument("--pipeline-chunks must be between 1 and 8");
+            }
         } else if (arg == "--devices") {
             options.devices  = parse_devices(require_value("--devices"));
             devices_explicit = true;
@@ -368,14 +382,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.ram_kv.gpu_tokens != 0 ? options.ram_kv.gpu_tokens : options.max_context);
     }
     if (devices_explicit) {
-        if (options.devices.size() != static_cast<std::size_t>(options.tp)) {
-            throw std::invalid_argument("--devices must list exactly --tp device ids");
+        if (options.devices.size() != static_cast<std::size_t>(options.tp * options.pp)) {
+            throw std::invalid_argument("--devices must list exactly --tp * --pp device ids");
         }
         if (device_explicit && options.devices.front() != options.device) {
             throw std::invalid_argument("--device and --devices disagree on the primary device");
         }
         options.device = options.devices.front();
-    } else if (options.tp == 1) {
+    } else if (options.tp * options.pp == 1) {
         options.devices = {options.device};
     }
     if (options.port <= 0 || options.port > 65535) {

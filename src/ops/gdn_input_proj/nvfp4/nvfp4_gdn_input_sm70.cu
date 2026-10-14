@@ -28,6 +28,11 @@ void launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
             WorkspaceArena* workspace, cudaStream_t stream) {
     Nvfp4GdnInputShardOutput<Geometry> output{static_cast<__nv_bfloat16*>(qkv.data),
                                               static_cast<__nv_bfloat16*>(z.data)};
+    if (workspace != nullptr &&
+        nvfp4_volta_qpn_precast_supported(weight.n, weight.k, x.ne[1])) {
+        launch_nvfp4_volta_qpn_with_precast_output(x, weight, output, weight.n, *workspace, stream);
+        return;
+    }
     if (x.ne[1] >= 128 && workspace != nullptr) {
         auto scope = workspace->scope();
         auto projected = workspace->alloc(DType::BF16, {weight.n, x.ne[1]});
@@ -53,7 +58,7 @@ void launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
 } // namespace
 
 std::size_t nvfp4_gdn_input_sm70_workspace_bytes(int rows, int tokens) {
-    if (tokens < 128) { return 0; }
+    if (tokens < 128) { return nvfp4_volta_qpn_precast_workspace_bytes(rows, 5120, tokens); }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {rows, tokens});
     (void)layout.alloc_bytes(nvfp4_cutlass_sm70_workspace_bytes(rows, 5120, tokens));

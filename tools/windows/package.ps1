@@ -1,4 +1,4 @@
-param([string]$Version = '0.1.2', [switch]$SkipArchive)
+param([string]$Version = '0.1.3', [switch]$SkipArchive)
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw 'Use a numeric major.minor.patch version.' }
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path

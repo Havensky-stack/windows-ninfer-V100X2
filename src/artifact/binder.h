@@ -106,6 +106,7 @@ public:
     // Resolves an object's shard map from its artifact name. Installed by a target that binds for
     // tp > 1; when absent (the tp1 path) every device tensor is placed whole on device 0.
     using ShardResolver = std::function<ShardPlacement(std::string_view)>;
+    using DeviceMaskResolver = std::function<std::uint32_t(std::string_view)>;
 
     explicit Binder(const Reader& reader, int device_count = 1, bool storage_only = false);
 
@@ -119,6 +120,7 @@ public:
     [[nodiscard]] bool has_tensor(std::string_view name) const noexcept;
 
     void set_shard_resolver(ShardResolver resolver);
+    void set_device_mask_resolver(DeviceMaskResolver resolver);
 
     ObjectHandle require_tensor(std::string_view name, NumericFormat format, StorageLayout layout,
                                 std::span<const std::uint64_t> shape);
@@ -150,6 +152,7 @@ private:
     std::vector<bool> consumed_;
     std::vector<bool> planned_;
     ShardResolver shard_resolver_;
+    DeviceMaskResolver device_mask_resolver_;
     bool storage_only_ = false;
     MaterializationPlan materialization_;
 };

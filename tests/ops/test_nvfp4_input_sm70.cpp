@@ -1,9 +1,11 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 
 #include "ops/input_projection_test_common.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include <iostream>
 
@@ -40,7 +42,7 @@ int exercise(bool attention, int tp) {
     cudaStream_t stream;
     cuda_check(cudaStreamCreate(&stream), "projection test stream");
     int failures = 0;
-    for (const int tokens : {1, 3, 4, 8, 9, 32, 33, 127, 128, 129}) {
+    for (const int tokens : {1, 3, 4, 5, 6, 8, 9, 32, 33, 127, 128, 129}) {
         const auto x_host = make_bf16_activation(5120, tokens, 449U + tokens);
         auto device_x = to_device_bf16(x_host);
         Tensor x(device_x.p, DType::BF16, {5120, tokens});
@@ -128,6 +130,107 @@ int exercise(bool attention, int tp) {
     return failures;
 }
 
+int exercise_down_projection() {
+    qw::PatternedWeightOptions options;
+    options.decorrelate_coordinates = true;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor = 3.5F;
+    DevicePackedWeight weight(qw::make_patterned_weight(QType::NVFP4, 5120, 8704, 461U, options),
+                               true);
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreate(&stream), "down projection test stream");
+    int failures = 0;
+    for (const int tokens : {4, 5, 6}) {
+        const auto host = make_bf16_activation(8704, tokens, 467U + tokens);
+        auto device_input = to_device_bf16(host);
+        Tensor input(device_input.p, DType::BF16, {8704, tokens});
+        GuardedBf16Tensor result(5120, tokens);
+        auto output = result.tensor();
+        const auto view = weight.view();
+        const auto capacity = ops::linear_workspace_capacity_bytes(
+            QType::NVFP4, 5120, 8704, ops::LinearPolicy::A16Only, tokens, tokens);
+        DeviceArena workspace(capacity);
+        ops::linear(input, view, output, ops::LinearPolicy::A16Only, workspace, stream);
+        cuda_synchronize(stream);
+        const auto expected = from_device<std::uint16_t>(output.data, 5120 * tokens);
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture down");
+        ops::linear(input, view, output, ops::LinearPolicy::A16Only, workspace, stream);
+        cuda_check(cudaStreamEndCapture(stream, &graph), "finish down capture");
+        cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "instantiate down");
+        cuda_check(cudaGraphLaunch(executable, stream), "replay down");
+        cuda_synchronize(stream);
+        const auto name = "NVFP4 TP2 down T=" + std::to_string(tokens);
+        failures += result.verify_guards(name) + result.verify_fully_written(name) +
+            compare(name, gather_rows(result.values(), 5120, 0, 5120, tokens),
+                    projection_oracle(weight.host, 0, 5120, host, 8704, tokens), kA16);
+        if (from_device<std::uint16_t>(output.data, 5120 * tokens) != expected) { ++failures; }
+        cuda_check(cudaGraphExecDestroy(executable), "destroy down executable");
+        cuda_check(cudaGraphDestroy(graph), "destroy down graph");
+        std::cout << name << '\n';
+    }
+    failures += weight.verify_preserved("down projection");
+    cuda_check(cudaStreamDestroy(stream), "destroy down projection stream");
+    return failures;
+}
+
+int exercise_swiglu() {
+    constexpr int n = 8704, k = 5120;
+    qw::PatternedWeightOptions options;
+    options.decorrelate_coordinates = true;
+    options.weight_scale_divisor = 0.125F;
+    options.input_scale_divisor = 3.5F;
+    DevicePackedWeight weight(qw::make_patterned_weight(QType::NVFP4, n * 2, k, 479U, options), true);
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreate(&stream), "SwiGLU test stream");
+    int failures = 0;
+    for (const int tokens : {4, 5, 6}) {
+        const auto host = make_bf16_activation(k, tokens, 487U + tokens);
+        auto device_input = to_device_bf16(host);
+        Tensor input(device_input.p, DType::BF16, {k, tokens});
+        GuardedBf16Tensor result(n, tokens);
+        auto output = result.tensor();
+        DeviceBuffer gate(sizeof(float) * n * tokens), activation(sizeof(std::uint16_t) * k * tokens);
+        const auto view = weight.view();
+        auto invoke = [&] {
+            ops::detail::nvfp4_linear_swiglu_qpn_split_launch(
+                input, view, output, static_cast<float*>(gate.p), activation.p, stream);
+        };
+        invoke();
+        cuda_synchronize(stream);
+        const auto eager_bits = result.bits();
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture SwiGLU");
+        invoke();
+        cuda_check(cudaStreamEndCapture(stream, &graph), "finish SwiGLU capture");
+        cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "instantiate SwiGLU");
+        cuda_check(cudaGraphLaunch(executable, stream), "replay SwiGLU");
+        cuda_synchronize(stream);
+        const auto name = "NVFP4 TP2 prepacked SwiGLU T=" + std::to_string(tokens);
+        std::vector<double> expected;
+        for (const int row : sampled_rows(n, 17)) {
+            for (int token = 0; token < tokens; ++token) {
+                const auto* values = host.data() + static_cast<std::size_t>(token) * k;
+                const double gate_value = qw::dot_fp64(weight.host, row, values, k);
+                const double up_value = qw::dot_fp64(weight.host, row + n, values, k);
+                expected.push_back(gate_value / (1.0 + std::exp(-gate_value)) * up_value);
+            }
+        }
+        failures += result.verify_guards(name) + result.verify_fully_written(name) +
+            compare(name, gather_rows(result.values(), n, 0, n, tokens, 17), expected,
+                    ReductionCriterion{3.3e-3, 5.0e-3, 6.3e-3});
+        if (result.bits() != eager_bits) { ++failures; }
+        cuda_check(cudaGraphExecDestroy(executable), "destroy SwiGLU executable");
+        cuda_check(cudaGraphDestroy(graph), "destroy SwiGLU graph");
+        std::cout << name << '\n';
+    }
+    failures += weight.verify_preserved("SwiGLU");
+    cuda_check(cudaStreamDestroy(stream), "destroy SwiGLU test stream");
+    return failures;
+}
+
 } // namespace
 #endif
 
@@ -140,7 +243,7 @@ int main() {
     cuda_check(cudaGetDeviceProperties(&props, 0), "query projection device");
     if (props.major != 7 || props.minor != 0) { return 77; }
     const int failures = exercise(true, 1) + exercise(false, 1) +
-        exercise(true, 2) + exercise(false, 2);
+        exercise(true, 2) + exercise(false, 2) + exercise_down_projection() + exercise_swiglu();
     std::cout << (failures ? "FAIL" : "OK") << " NVFP4 SM70 input projections\n";
     return failures ? 1 : 0;
 #endif

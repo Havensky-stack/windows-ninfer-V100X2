@@ -282,6 +282,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          state.execution.io, state.execution.prefill_hidden,
                          state.execution.prefill_chunk, 0, {}, &state.text_cache,
                          &state.mtp_cache, std::span(tp).first(state.execution.peers.size()));
+        card.set_pipeline(pipeline_execution(state.execution));
+        card.set_volta_long_attention(state.execution.volta_long_attention);
 
         MtpRoundView v = slice_mtp_frame(frame, batch_size);
 
@@ -345,7 +347,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                     value.verify_ids, value.target_positions, ec.dev[rank]->stream);
             });
             std::array<TargetVerifyFrameView, kMaximumExecutionDevices - 1> peer_frames{};
-            for (int rank = 1; rank < ec.tp; ++rank) {
+            for (int rank = 1; rank < ec.device_count; ++rank) {
                 peer_frames[rank - 1] = verify_view(views[rank], tp[rank - 1].replay_records);
             }
             target_verify_accept(state.execution, state.continuation_hidden_store, card,

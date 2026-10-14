@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/layout.h"
 #include "ops/linear/nvfp4/nvfp4_launch.h"
 #include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
 
@@ -12,7 +13,40 @@ namespace {
 using S = Nvfp4VoltaQpnSchedule;
 static_assert(kNvfp4VoltaQpnRowsPerTile == S::kRowsPerTile,
               "dispatch mirrors the tile height for host code");
+
+__global__ void qpn_cast_activation(const __nv_bfloat16* input, half* output, int count) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) { output[index] = __float2half_rn(__bfloat162float(input[index])); }
+}
 } // namespace
+
+bool nvfp4_volta_qpn_precast_supported(std::int32_t n, std::int32_t k,
+                                      std::int32_t tokens) noexcept {
+    return (tokens >= 4 && tokens <= 6) &&
+           ((k == 5120 && (n == 7168 || n == 8192)) || (n == 5120 && k == 8704));
+}
+
+std::size_t nvfp4_volta_qpn_precast_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                   std::int32_t max_tokens) {
+    if (max_tokens < 4 || !nvfp4_volta_qpn_precast_supported(n, k, 4)) { return 0; }
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::FP16, {k, max_tokens < 6 ? max_tokens : 6});
+    return layout.peak_bytes(1);
+}
+
+void nvfp4_volta_qpn_cast_activation(const Tensor& input, Tensor& output, cudaStream_t stream) {
+    const int count = static_cast<int>(input.numel());
+    qpn_cast_activation<<<(count + 255) / 256, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(input.data), static_cast<half*>(output.data), count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void launch_nvfp4_volta_qpn_precast(const Tensor& x, const Weight& w, Tensor& out,
+                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    launch_nvfp4_volta_qpn_with_precast_output(
+        x, w, Nvfp4ContiguousOutput{static_cast<__nv_bfloat16*>(out.data), out.ne[0]}, out.ne[0],
+        workspace, stream);
+}
 
 bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k, std::int32_t t) noexcept {
     if (n <= 0 || t <= 0) { return false; }

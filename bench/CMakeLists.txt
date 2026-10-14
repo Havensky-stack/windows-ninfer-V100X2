@@ -86,6 +86,13 @@ target_include_directories(ninfer_v100_corpus PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 target_link_libraries(ninfer_v100_corpus PRIVATE ninfer_engine)
 
+add_executable(ninfer_v100_gpqa ${PROJECT_SOURCE_DIR}/tools/v100/bench_gpqa.cpp)
+target_include_directories(ninfer_v100_gpqa PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_v100_gpqa PRIVATE ninfer_engine)
+
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.
 add_executable(ninfer_qwen3_6_27b_mtp_round_bench

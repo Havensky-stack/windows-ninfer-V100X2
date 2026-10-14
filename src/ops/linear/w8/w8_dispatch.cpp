@@ -1,4 +1,7 @@
 #include "ops/linear/w8/w8_dispatch.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/w8/w8_prepack_sm70.h"
+#endif
 
 #include <stdexcept>
 
@@ -276,6 +279,10 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::AllowA8: {
         const W8Launch launch = select_w8_a16_launch(n, k, t);
 #ifdef NINFER_VOLTA_BUILD
+        if (t == 1 && ((k == 5120 && (n == 5120 || n == 7168 || n == 17408)) ||
+                       (n == 5120 && (k == 3072 || k == 8704)))) {
+            return launch_w8_volta_gemv;
+        }
         // The r4_c16 interception that used to sit here is deliberately gone. It was introduced to
         // route around the T=8 collapse, which turned out to be the full-specialization register
         // spill since fixed in w8_rowsplit_gemm_simt.cu. With the spill gone, sliced r8_c8 (via
@@ -300,6 +307,12 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                  cudaStream_t stream) {
     const W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
+#ifdef NINFER_VOLTA_BUILD
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        launch_w8_prepacked_sm70(x, w, out, stream);
+        return;
+    }
+#endif
     launch(x, w, out, stream);
 }
 

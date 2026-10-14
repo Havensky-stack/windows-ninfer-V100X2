@@ -5,16 +5,17 @@ import json
 from tools.bench.run_ninfer_bench_matrix import BenchCase, report_rows
 
 
-def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
+def test_schema_v15_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     report_path = tmp_path / "report.json"
     report_path.write_text(
         json.dumps(
             {
-                "schema_version": 13,
+                "schema_version": 15,
                 "artifact_type": "ninfer_bench_report",
                 "tool": "ninfer_bench",
                 "artifact": {"path": "model.ninfer"},
-                "environment": {"gpu_name": "RTX 5090", "tp": 2, "devices": [1, 0]},
+                "environment": {"gpu_name": "Tesla V100-SXM2-16GB", "tp": 2, "pp": 1,
+                                "pipeline_chunks": 1, "devices": [1, 0]},
                 "load": {
                     "target": "qwen3_6_27b",
                     "weights_id": "nvfp4",
@@ -39,6 +40,7 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
                     "kv_cache": "int8-group64",
                     "mtp_draft_tokens": 5,
                     "proposal_head": "optimized",
+                    "volta_long_attention": True,
                     "decode_path": "cuda-graph",
                     "decode_graph_prime": {"primed": True, "output_tokens": 13},
                     "repetitions": 2,
@@ -80,6 +82,9 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert len(rows) == 1
     row = rows[0]
     assert row["tp"] == 2
+    assert row["pp"] == 1
+    assert row["pipeline_chunks"] == 1
+    assert row["volta_long_attention"] is True
     assert json.loads(row["devices"]) == [1, 0]
     assert (row["suite"], row["case"], row["label"], row["kind"]) == (
         "pure_decode",
@@ -91,7 +96,7 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
         "qwen3_6_27b",
         "nvfp4",
         "model.ninfer",
-        "RTX 5090",
+        "Tesla V100-SXM2-16GB",
     )
     assert (row["decode_path"], row["decode_graph_primed"]) == (
         "cuda-graph",
@@ -109,3 +114,13 @@ def test_schema_v13_report_is_flattened_for_matrix_summary(tmp_path) -> None:
     assert row["decode_engine_tok_s_mean"] == 7.5
     assert row["spec_fallback_steps"] == 3
     assert row["spec_accepted_per_position"] == "[1,1,1,1,1]"
+
+    pipeline = json.loads(report_path.read_text(encoding="utf-8"))
+    pipeline["environment"].update(tp=1, pp=2, pipeline_chunks=8)
+    pipeline["config"]["volta_long_attention"] = False
+    report_path.write_text(json.dumps(pipeline), encoding="utf-8")
+    pipeline_row, = report_rows(report_path, BenchCase("pipeline", "pp2", (), 2, 1))
+    assert pipeline_row["tp"] == 1
+    assert pipeline_row["pp"] == 2
+    assert pipeline_row["pipeline_chunks"] == 8
+    assert pipeline_row["volta_long_attention"] is False

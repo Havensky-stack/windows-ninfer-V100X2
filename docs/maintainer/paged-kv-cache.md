@@ -1449,13 +1449,13 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 
 ## 15. Optional native RAM-KV experiment
 
-`EngineOptions.ram_kv.gpu_tokens>0` 显式启用近似模式，默认关闭。首版是 training-free **lexical
-retrieval**，不是外部 KVMem 的 Q/K mean-vector 检索移植。仅支持 SM70 的 27B、TP1/TP2、单请求
+`EngineOptions.ram_kv.gpu_tokens>0` 显式启用近似模式，默认关闭。现在是 training-free **Q/K
+mean-vector retrieval**，参考外部 KVMem。仅支持 SM70 的 27B、TP1/TP2/PP2、单请求
 Text/None/MTP；Vision、DFlash、TP4、35B-A3B 不支持此模式，其默认路径不变。
 
 逻辑容量仍为 `max_context`。`kv_capacity` 必须显式等于 GPU window；此时 Main 的最小/最大 physical
 page count 均为 `window/64`，不再要求 `kv_capacity>=max_context`。window 必须为 64 的倍数、至少
-`prefill_chunk+8192`，且不超过逻辑容量。MTP 按原有 draft lead 增加 physical headroom，request
+`prefill_chunk+8192`（PP2: `prefill_chunk*pipeline_chunks+8192`），且不超过逻辑容量。MTP 按原有 draft lead 增加 physical headroom，request
 entitlement 不超过其 logical page capacity。GPU workspace 同样按 resident attention ceiling 规划。
 
 每个 allocation 独占一个匿名 RAM archive，按 actual K/V/code/scale planes 规划，不为 GDN 层分配
@@ -1463,10 +1463,18 @@ entitlement 不超过其 logical page capacity。GPU workspace 同样按 residen
 `ram_kv.budget_bytes` 检查全部 ranks 的最大 archive bytes，默认十进制 32 GB，**不是进程 RSS
 限制**；整个服务器的硬预算需另用 cgroup，评测工具设置 MemoryMax=32000000000、swap=0。
 
-Family 用最后 user query 的 bounded token overlap、document-frequency 权重对 256-token 块排序。
-Core 仅消费 page ranking，优先保留全部当前 append pages、最近 4096 tokens、512-token sink，随后
-按排序填充窗口。每个 execution unit 前更新；相同页集合不搬移 resident payload，不在 decode
-graph 中保存 host archive pointers。新 query 可以从 RAM 重新调入冷页。Prefill 超过窗口时也会淘汰，
+`tools/v100/bench_ram_kv.py --ram-budget-bytes N` 设置 archive 上限，
+`--process-memory-limit-bytes N` 独立设置整进程 cgroup 上限，两者均默认 32000000000。
+提高 archive 上限不会扩大参与注意力的历史；召回预算由 `--window`（产品参数
+`--ram-kv-window`）控制，扩大它会增加 GPU 显存与 attention 工作量。实际占用低于 window
+时不会淘汰历史，但检索索引和页表维护仍可能产生开销。
+
+Family 用未旋转 K 的 128-token 块均值与当前 user-query Q 做余弦排序。K 从原始 BF16/INT8
+packed page 解码并逆旋转，仅生成检索索引，不改变注意力里的 packed bytes。Core 仅消费
+page ranking，优先保留全部当前 append pages、最近 4096 tokens、512-token sink，随后按排序填充窗口。
+长 prefill 每 8K token 刷新一次，末尾 query 预跑捕获 Q 后恢复 GDN 状态再重跑；相同页集合不搬移
+resident payload，不在 decode graph 中保存 host archive pointers。新 query 可以从 RAM 重新调入冷页。
+Prefill 超过窗口时也会淘汰，
 因此它不是只改变 decode 的完整语义缓存。
 
 写表继续用 original logical page -> physical page；`read_indices` 将 original logical page 映射到
@@ -1480,6 +1488,6 @@ Main/MTP/peer archives 各自拥有，页操作同序执行。MTP provisional ta
 GDN continuation checkpoint；近似模式复用已有近似状态，不保证与新 query ranking 的 cold rerun
 一致。不能用 KV 字节无损、identity-window parity 或九项 QA 正确声称普遍不降智。
 
-资格检查包括 exact code/scale eviction/reload、FP64 selected-key attention oracle、原始因果位置与
+资格检查包括 exact code/scale eviction/reload、FP64 Q/K mean/cosine and selected-key attention oracle、原始因果位置与
 future-column masking、真实 Engine Text/MTP/prefix。长测结果按实际占用、窗口、committed decode、
 prefill、缓存命中、质量和整进程内存分别报告；外部 llama.cpp 结果不是原生实现的速度证据。

@@ -19,6 +19,50 @@ constexpr int kHidden        = 16384;
 constexpr int kGroups        = kHidden / 32;
 constexpr int kValuesPerLane = 8;
 
+#ifdef NINFER_VOLTA_BUILD
+// Keep the sliced SIMT route's lane-local FMA phases and final shuffle tree;
+// one-token MTP shards do not benefit from staging their weights in shared memory.
+template <int InputRows>
+__global__ __launch_bounds__(128, 4) void w8_rowsplit_sm70_gemv_kernel(
+    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
+    const std::uint16_t* __restrict__ scales, __nv_bfloat16* __restrict__ out,
+    int n, int padded_k) {
+    static_assert(InputRows % 256 == 0);
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (row >= n) { return; }
+    const auto* code_row = codes + static_cast<std::int64_t>(row) * padded_k;
+    const auto* scale_row = scales + static_cast<std::int64_t>(row) * (padded_k / 32);
+    float acc = 0.0f;
+#pragma unroll 4
+    for (int phase = 0; phase < InputRows / 256; ++phase) {
+        const int kk = phase * 256 + lane * 8;
+        const uint2 packed = __ldg(reinterpret_cast<const uint2*>(code_row + kk));
+        const float scale = __half2float(__ushort_as_half(scale_row[kk / 32]));
+        const uint4 raw = *reinterpret_cast<const uint4*>(x + kk);
+        const auto* activation = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const auto word = j < 4 ? packed.x : packed.y;
+            const float weight =
+                static_cast<float>(static_cast<std::int8_t>(word >> ((j & 3) * 8))) * scale;
+            acc = fmaf(weight, __bfloat162float(activation[j]), acc);
+        }
+    }
+    acc = warp_reduce_sum(acc);
+    if (lane == 0) { out[row] = __float2bfloat16(acc); }
+}
+
+template <int InputRows>
+void launch_volta_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    w8_rowsplit_sm70_gemv_kernel<InputRows><<<(w.n + 3) / 4, 128, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint16_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+        w.n, w.padded_shape[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif
+
 template <int RowsPerCta>
 __global__ __launch_bounds__(RowsPerCta * 32, 2) void w8_rowsplit_k16384_decode_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
@@ -88,6 +132,23 @@ void launch_decode(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t s
 }
 
 } // namespace
+
+#ifdef NINFER_VOLTA_BUILD
+void launch_w8_volta_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    if (x.ne[1] != 1 || w.layout != QuantLayout::RowSplit) {
+        throw std::invalid_argument("W8 Volta GEMV requires one column and row-split weights");
+    }
+    if (w.k == 5120 && (w.n == 5120 || w.n == 7168 || w.n == 17408)) {
+        launch_volta_gemv<5120>(x, w, out, stream);
+    } else if (w.n == 5120 && w.k == 3072) {
+        launch_volta_gemv<3072>(x, w, out, stream);
+    } else if (w.n == 5120 && w.k == 8704) {
+        launch_volta_gemv<8704>(x, w, out, stream);
+    } else {
+        throw std::invalid_argument("W8 Volta GEMV: unsupported registered shard");
+    }
+}
+#endif
 
 void launch_w8_decode_r4(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     launch_decode<4>(x, w, out, stream);

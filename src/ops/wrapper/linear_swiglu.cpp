@@ -293,11 +293,11 @@ void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, con
 void validate_swiglu_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
                                 const ExecutionContext& ec) {
     detail::require_split_context(
-        ec, "linear_swiglu column-parallel: requires two or four distinct devices", ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        ec, "linear_swiglu column-parallel: requires two or four distinct devices", ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count) || w.size() != x.size()) {
         throw std::invalid_argument("linear_swiglu: input/weight width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
     if (x[0].ne[1] != x[rank].ne[1]) {
         throw std::invalid_argument(
             "linear_swiglu column-parallel: both ranks must carry the same token count");
@@ -419,9 +419,9 @@ void linear_swiglu_column_parallel(std::span<const Tensor> x, std::span<const We
     std::array<Tensor, 4> destination{};
     for (std::size_t slot = 0; slot < x.size(); ++slot) {
         destination[slot] = out[slot];
-        validate_swiglu_column_rank_semantics(x[slot], w[slot], destination[slot], policy, ec.tp);
+        validate_swiglu_column_rank_semantics(x[slot], w[slot], destination[slot], policy, ec.device_count);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, out[slot].data,
@@ -437,7 +437,7 @@ void linear_swiglu_column_parallel(std::span<const Tensor> x, std::span<const We
                                    std::span<const Tensor> out, const ExecutionContext& ec) {
     const std::array<WorkspaceArena*, 4> workspace{};
     linear_swiglu_column_parallel(x, w, out, LinearPolicy::A16Only,
-                                  std::span(workspace).first(ec.tp), ec);
+                                  std::span(workspace).first(ec.device_count), ec);
 }
 
 } // namespace ninfer::ops

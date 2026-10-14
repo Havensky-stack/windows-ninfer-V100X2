@@ -5,6 +5,7 @@
 #include "ops/common/split_launch.h"
 #include "ops/linear/fp8/fp8_prepack_sm70.h"
 #include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#include "ops/linear/w8/w8_prepack_sm70.h"
 #endif
 #include "targets/qwen3_6_27b/impl/config.h"
 
@@ -923,7 +924,7 @@ ShardPlan plan_for(std::string_view object, int tp, const TextConfig& config,
 }
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features, int tp) {
+                               qwen3_6::StartupFeatures features, int tp, int pp) {
     if (tp != 1 && tp != 2 && tp != 4) {
         throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2 or 4");
     }
@@ -933,8 +934,12 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     const bool native_fp8 = weights_profile == WeightsProfile::Qwen38Fp8;
     const bool quasar = weights_profile == WeightsProfile::Qwen38QuasarNvfp4;
-    if (quasar && (tp != 2 || features.vision)) {
-        throw std::invalid_argument("qwen3.8-27b/quasar-nvfp4 supports TP2 Text/None/MTP/DFlash only");
+    if (pp != 1 && (pp != 2 || tp != 1 || features.vision || features.dflash() ||
+                    (weights_profile != WeightsProfile::Qwen38Nvfp4 && !quasar))) {
+        throw std::invalid_argument("PP2 currently supports Qwen3.8 NVFP4/QUASAR Text/None/MTP only");
+    }
+    if (quasar && ((tp != 2 && pp != 2) || features.vision)) {
+        throw std::invalid_argument("QUASAR requires text-only TP2 or PP2 (DFlash is TP2 only)");
     }
     if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
         throw std::invalid_argument("qwen3.8-27b/fp8 supports TP4 Text/MTP only");
@@ -949,7 +954,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // The binder's arena count and the shard map's device count are two halves of one decision.
     // If they disagree, nothing downstream notices: a tp2 map on a one-device binder would place
     // only device 0's half-shard and size the arena for half a model, and the load would "succeed".
-    if (binder.device_count() != tp) {
+    if (binder.device_count() != tp * pp) {
         throw std::invalid_argument("qwen3_6_27b: binder was built for " +
                                     std::to_string(binder.device_count()) +
                                     " device(s) but bind_artifact was asked for tp " +
@@ -961,8 +966,25 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
             return shard_placement(name, tp, config, weights_profile);
         });
     }
+    if (pp == 2) {
+        binder.set_device_mask_resolver([](std::string_view name) -> std::uint32_t {
+            constexpr std::string_view prefix = "text/layers/";
+            if (name.starts_with(prefix)) {
+                const auto suffix = name.substr(prefix.size());
+                const auto end = suffix.find('/');
+                const int layer = std::stoi(std::string(suffix.substr(0, end)));
+                if (layer < 0 || layer >= kTextLayers) {
+                    throw std::invalid_argument("pipeline layer is outside the registered topology");
+                }
+                return layer < kTextLayers / 2 ? 2U : 1U;
+            }
+            // Embedding is also used by primary-owned MTP. Other endpoints belong to rank zero.
+            return name == "text/token_embedding" ? 3U : 1U;
+        });
+    }
     ArtifactLoadPlan load_plan;
     BindingPlan& out = load_plan.bindings;
+    out.pp          = pp;
     out.frontend     = qwen3_6::bind_frontend_resources(binder);
     out.features     = features;
     const bool ggml_k = weights_profile == WeightsProfile::Qwen38GgmlK;
@@ -1125,17 +1147,17 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 
 LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifact materialized,
                                  int tensor_parallel)
-    : backing(std::move(materialized)), tp(tensor_parallel) {
+    : backing(std::move(materialized)), tp(tensor_parallel), pp(plan.pp) {
     if (tp != 1 && tp != 2 && tp != 4) {
         throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2 or 4");
     }
-    if (tp > backing.device_count()) {
+    if (tp * pp > backing.device_count()) {
         throw std::invalid_argument("qwen3_6_27b: tp exceeds the materialized device count");
     }
     frontend = qwen3_6::take_frontend_resources(backing, plan.frontend);
 
     build_device_view(plan, 0, runtime);
-    for (int rank = 1; rank < tp; ++rank) {
+    for (int rank = 1; rank < tp * pp; ++rank) {
         build_device_view(plan, rank, runtime_peers[rank - 1].emplace());
     }
 }
@@ -1153,6 +1175,10 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
 #endif
     runtime.weights_arena = &backing.device_arena(device);
     runtime.features      = plan.features;
+    if (pp == 2) {
+        runtime.layer_begin = device == 0 ? kTextLayers / 2 : 0;
+        runtime.layer_end   = device == 0 ? kTextLayers : kTextLayers / 2;
+    }
     auto& token_embedding = runtime.token_embedding;
     auto& full_layers     = runtime.full_layers;
     auto& gdn_layers      = runtime.gdn_layers;
@@ -1163,9 +1189,9 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     // gdn/norm, draft_head_token_ids). Sharded extents carry an explicit `/ tp`.
     token_embedding        = materialized_weight(backing, plan.token_embedding, 248320, 5120,
                                                  device);
-    std::size_t full_index = 0;
-    std::size_t gdn_index  = 0;
-    for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
+    std::size_t full_index = runtime.layer_begin / 4;
+    std::size_t gdn_index  = runtime.layer_begin - full_index;
+    for (std::size_t layer = runtime.layer_begin; layer < static_cast<std::size_t>(runtime.layer_end); ++layer) {
         const TextLayerPlan& source = plan.text_layers[layer];
         if (source.is_full_attention) {
             FullAttentionWeights& target = full_layers.at(full_index++);
@@ -1217,15 +1243,19 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
             target.post_mixer = load_mlp(source.mlp, backing, tp, device);
         }
     }
-    if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
+    if (full_index != static_cast<std::size_t>(runtime.layer_end / 4) ||
+        gdn_index != static_cast<std::size_t>(runtime.layer_end - runtime.layer_end / 4)) {
         throw std::logic_error("text topology binding is incomplete");
     }
+    if (pp == 2 && device != 0) { return; }
     final_norm = artifact::materialized_tensor(backing, plan.final_norm, NumericFormat::BF16,
                                                {5120}, device);
     output_head = materialized_weight(backing, plan.output_head, 248320 / tp, 5120, device);
 #ifdef NINFER_VOLTA_BUILD
     if (output_head.qtype == QType::FP8_E4M3FN_ROW_BF16S) {
         ::ninfer::ops::detail::fp8_prepack_qpn_sm70(output_head);
+    } else if (output_head.qtype == QType::W8G32_F16S) {
+        ::ninfer::ops::detail::w8_prepack_qpn_sm70(output_head);
     }
 #endif
     if (plan.features.optimized_proposal()) {

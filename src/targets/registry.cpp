@@ -140,15 +140,14 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     const auto& identity                          = reader.identity();
     const auto weights_profile                    = Target::resolve_weights(identity);
     const ModelSamplingDefaults sampling_defaults = Target::sampling_defaults(identity.model_id);
-    const int tp                                  = execution.tp;
+    const int tp                                  = execution.device_count;
     DeviceContext& device                         = execution.primary();
 
     const int materialization_devices = tp + (execution.has_storage() ? 1 : 0);
     artifact::Binder binder(reader, materialization_devices, execution.has_storage());
     auto load_plan = Target::plan_load(binder, options, weights_profile);
-    // The capacity curve describes ONE device. At tp 2 it is already the per-device curve (halved
-    // KV heads, halved GDN state) because the sequence plan is built with `tp`, so the same curve
-    // serves both devices and the resolver only has to pick the bottleneck device's budget.
+    // The curve describes one device's geometry: TP splits heads, PP splits layers.
+    // Resolve the symmetric runtime reservation against the smallest device budget.
     auto sequence_planner = Target::make_sequence_planner(device, options, weights_profile);
     const runtime::SequenceCapacityCurve curve = sequence_planner.capacity_curve();
     std::vector<std::size_t> preflight_runtime_bytes;
@@ -204,11 +203,12 @@ ConstructedTarget construct_registered(const EngineOptions& options, ExecutionCo
     summary.yarn_origin  = options.rope_mode == RopeMode::Yarn ? options.yarn_origin : 0U;
     // Per-device memory table. `weights_bytes` and the free/total figures are MEASURED per device;
     // the sequence, KV, GDN and workspace figures come from the finalized plan, which is symmetric
-    // across devices by construction (identical page counts, identical halved head geometry).
+    // across devices by construction (identical page counts and stage-local state geometry).
     const MemorySummary memory = instance->program->memory_summary();
     summary.effective_max_context = memory.effective_max_context;
     summary.yarn_mscale           = memory.yarn_mscale;
-    summary.tp                 = tp;
+    summary.tp                 = options.tp;
+    summary.pp                 = options.pp;
     for (int rank = 0; rank < tp; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         DeviceMemoryReport& row = summary.devices[slot];
@@ -279,7 +279,7 @@ Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
 ConstructedTarget construct_target(const EngineOptions& options, ExecutionContext& execution) {
     validate_options(options);
-    if (execution.tp != options.tp) {
+    if (execution.device_count != options.tp * options.pp) {
         throw std::invalid_argument("execution context width does not match EngineOptions.tp");
     }
     const auto load_start = Clock::now();

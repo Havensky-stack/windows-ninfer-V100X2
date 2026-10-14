@@ -1,4 +1,5 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
+#include "core/peer_copy.h"
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
@@ -17,6 +18,7 @@
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
 #include "ninfer/ops/gqa_attention.h"
+#include "ninfer/ops/kv_retrieval.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_pair.h"
@@ -224,13 +226,13 @@ TextContext::TextContext(
     qwen3_6::PagedKVCacheView kv, LinearAttentionStatePool& state, qwen3_6::RoundState& io,
     Tensor& prefill_hidden, std::uint32_t prefill_chunk, std::uint32_t text_kv_base,
     qwen3_6::PagedKVCacheView mtp_kv, const qwen3_6::PagedKVCache* batch_text_kv,
-    const qwen3_6::PagedKVCache* batch_mtp_kv, std::span<const TpExecution> tp)
+    const qwen3_6::PagedKVCache* batch_mtp_kv, std::span<const PeerExecution> tp)
     : ctx_(ctx), weights_(weights), work_(work), kv_(kv), mtp_kv_(mtp_kv), state_(state), io_(io),
       prefill_hidden_(prefill_hidden), prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base),
       rope_frequency_(rope_frequency), batch_text_kv_(batch_text_kv), batch_mtp_kv_(batch_mtp_kv),
       tp_(tp) {
-    for (const TpExecution& peer : tp_) {
-        if (!peer.complete() || peer.execution->tp != static_cast<int>(tp_.size() + 1) ||
+    for (const PeerExecution& peer : tp_) {
+        if (!peer.complete() || peer.execution->device_count != static_cast<int>(tp_.size() + 1) ||
             !peer.events->live()) {
             throw std::invalid_argument("tensor-parallel TextContext binding is incomplete");
         }
@@ -487,10 +489,10 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         Tensor position_batch = positions.view({width, active_sequence_batch_});
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
                            *active_backend_kv_table_rows_, kAttnScale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+                           batch_mtp_kv_->batch_layer_view(0), attention_envelope(envelope), work_, a_batch, s);
     } else {
         ops::gqa_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row, kAttnScale,
-                           batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+                           batch_mtp_kv_->batch_layer_view(0), attention_envelope(envelope), work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -619,7 +621,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                   s);
 
         Tensor a = work_.alloc(DType::BF16, {kCfg.head_dim, kCfg.n_q, 1});
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), envelope,
+        ops::gqa_attention_cached(qn, last_position, kAttnScale, mtp_kv_.layer_view(0), attention_envelope(envelope),
                                   work_, a, s);
         ops::sigmoid_mul(gate, a, s);
 
@@ -890,6 +892,7 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
 }
 
 void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
+    fidx -= weights_.layer_begin / 4;
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
     if (active_gqa_envelope_ == nullptr) {
@@ -920,6 +923,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         active_cache_positions_ != nullptr ? *active_cache_positions_ : io_.pos;
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
+    if (batch_text_kv_->retrieval_keys.data && ph == Phase::Prefill && capture_retrieval_query_) {
+        ops::kv_retrieval_query_summary(qn, cache_positions.view({T}), batch_text_kv_->retrieval_span,
+            batch_text_kv_->retrieval_query.slice(2, fidx, 1),
+            batch_text_kv_->retrieval_fallback.slice(2, fidx, 1),
+            batch_text_kv_->retrieval_counts.slice(0, fidx, 1), s);
+    }
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn, kn, rope_frequency_[0], s);
 
@@ -939,11 +948,16 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
                            kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                           *active_gqa_envelope_, work_, a_batch, s);
+                           attention_envelope(*active_gqa_envelope_), work_, a_batch, s);
     } else {
         ops::gqa_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows, kAttnScale,
-                           batch_text_kv_->batch_layer_view(fidx), *active_gqa_envelope_, work_, a,
+                           batch_text_kv_->batch_layer_view(fidx), attention_envelope(*active_gqa_envelope_), work_, a,
                            s);
+    }
+    if (batch_text_kv_->retrieval_keys.data) {
+        const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        ops::kv_retrieval_key_summary(batch_text_kv_->batch_layer_view(fidx), cache_positions.view({T}),
+            valid, batch_text_kv_->retrieval_keys.slice(3, fidx, 1), rope_frequency_[0], s);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -951,6 +965,7 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
 }
 
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
+    gidx -= weights_.layer_begin - weights_.layer_begin / 4;
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
 
@@ -1066,8 +1081,14 @@ void TextContext::mlp_tail(const Tensor* post_norm, const MlpW& m, Tensor& x, Ph
 
 template <class Tap>
 void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
+    if (pipeline_) { run_pipeline_stage(x, ph); }
+    run_owned_layers(x, ph, tap);
+}
+
+template <class Tap>
+void TextContext::run_owned_layers(Tensor& x, Phase ph, Tap& tap) {
     const bool prefill = ph == Phase::Prefill;
-    for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+    for (int layer = weights_.layer_begin; layer < weights_.layer_end; ++layer) {
         if (ModelConfig::is_full(layer)) {
             const int fidx         = ModelConfig::full_idx(layer);
             const FullLayerW& full = full_.at(static_cast<std::size_t>(fidx));
@@ -1119,6 +1140,74 @@ void TextContext::run_layers(Tensor& x, Phase ph) {
     run_layers(x, ph, tap);
 }
 
+void TextContext::pipeline_prefill_layers(Tensor& x, const Tensor& positions,
+                                          ops::GqaExecutionEnvelope envelope, std::int32_t begin) {
+    const auto& peer = *pipeline_;
+    auto frequency = rope_frequency_;
+    frequency[0] = rope_frequency_[1];
+    Tensor peer_positions = peer.work->alloc(DType::I32, {positions.ne[0]});
+    ops::fill_i32_positions(peer_positions, begin, peer.device->stream);
+    Tensor peer_rope = peer_positions;
+    if (rope_delta_ != 0) {
+        peer_rope = peer.work->alloc(DType::I32, {positions.ne[0]});
+        ops::set_i32_scalar(peer.io->rope_delta, rope_delta_, peer.device->stream);
+        ops::offset_i32_positions(peer_positions, peer.io->rope_delta, peer_rope, peer.device->stream);
+    }
+    TextContext stage(*peer.device, *peer.weights, *peer.work, frequency, {}, *peer.state,
+                       *peer.io, *peer.prefill_hidden, prefill_chunk_, text_kv_base_, {}, peer.batch_kv);
+    stage.set_linear_state_slots(linear_state_current_slot_, linear_state_rewrite_checkpoint_slot_);
+    stage.set_retrieval_query_capture(capture_retrieval_query_);
+    stage.active_cache_positions_ = &peer_positions;
+    stage.active_rope_positions_ = &peer_rope;
+    stage.active_gqa_envelope_ = &envelope;
+    stage.run_layers(x, Phase::Prefill);
+}
+
+void TextContext::run_pipeline_stage(Tensor& x, Phase phase) {
+    if (phase != Phase::Verify) { throw std::logic_error("PP prefill requires a peer-local stem"); }
+    const auto& peer = *pipeline_;
+    const CurrentDevice restore;
+    CUDA_CHECK(cudaSetDevice(peer.device->device));
+    peer.work->reset();
+    Tensor peer_x = peer.work->alloc(x.dtype, {x.ne[0], x.ne[1]});
+    peer_copy_begin(ctx_, *peer.device, peer.events->inputs_ready(0));
+    peer_copy(x, peer_x, ctx_, *peer.device);
+    const auto mirror = [&](const Tensor* source) {
+        if (source == nullptr || source->data == nullptr) { return Tensor{}; }
+        Tensor result = peer.work->alloc(source->dtype,
+                                         {source->ne[0], source->ne[1], source->ne[2], source->ne[3]});
+        peer_copy(*source, result, ctx_, *peer.device);
+        return result;
+    };
+    Tensor positions = mirror(active_cache_positions_);
+    Tensor rope = mirror(active_rope_positions_);
+    Tensor rows = mirror(active_kv_table_rows_);
+    Tensor slots = mirror(active_linear_state_slots_);
+    Tensor valid = mirror(active_valid_columns_);
+    peer_copy_end(ctx_, *peer.device, peer.events->pull_done(1));
+    CUDA_CHECK(cudaSetDevice(peer.device->device));
+    auto frequency = rope_frequency_;
+    frequency[0] = rope_frequency_[1];
+    TextContext stage(*peer.device, *peer.weights, *peer.work, frequency, {}, *peer.state,
+                       *peer.io, *peer.prefill_hidden, prefill_chunk_, text_kv_base_, {}, peer.batch_kv);
+    stage.set_linear_state_slots(linear_state_current_slot_, linear_state_rewrite_checkpoint_slot_);
+    stage.set_gdn_state_action(gdn_state_action_, gdn_state_action_ == GdnStateAction::RecordForReplay
+                                                   ? peer.replay_records : nullptr);
+    stage.active_cache_positions_ = positions.data != nullptr ? &positions : nullptr;
+    stage.active_rope_positions_ = rope.data != nullptr ? &rope : nullptr;
+    stage.active_kv_table_rows_ = rows.data != nullptr ? &rows : nullptr;
+    stage.active_linear_state_slots_ = slots.data != nullptr ? &slots : nullptr;
+    stage.active_valid_columns_ = valid.data != nullptr ? &valid : nullptr;
+    stage.active_gqa_envelope_ = active_gqa_envelope_;
+    stage.active_sequence_batch_ = active_sequence_batch_;
+    stage.active_sequence_width_ = active_sequence_width_;
+    stage.run_layers(peer_x, phase);
+    peer_copy_begin(*peer.device, ctx_, peer.events->inputs_ready(1));
+    peer_copy(peer_x, x, *peer.device, ctx_);
+    peer_copy_end(*peer.device, ctx_, peer.events->pull_done(0));
+    CUDA_CHECK(cudaSetDevice(ctx_.device));
+}
+
 template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
@@ -1131,6 +1220,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     const int T              = static_cast<int>(ids.size());
     const int chunk          = static_cast<int>(prefill_chunk_);
     const std::uint32_t base = text_kv_base_;
+    if (pipeline_) {
+        if (pipeline_upload_ == nullptr) { throw std::logic_error("PP prefill requires pinned ingress"); }
+        std::copy(ids.begin(), ids.end(), pipeline_upload_);
+    }
 
     if (text_prefill != nullptr) {
         if (multimodal != nullptr || base != text_prefill->begin ||
@@ -1177,12 +1270,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         throw std::logic_error("MTP proposal extent exceeds the configured draft window");
     }
     int t0 = 0;
+    int tail_column = 0;
     for (; t0 < T;) {
         int len = std::min(chunk, T - t0);
         if (checkpoint_rel > 0 && t0 < checkpoint_rel && t0 + len > checkpoint_rel) {
             len = checkpoint_rel - t0;
         }
         work_.reset();
+        if (pipeline_) { pipeline_->work->reset(); }
 
         VisionChunk vision_chunk;
         const std::uint32_t prompt_t0 = base + static_cast<std::uint32_t>(t0);
@@ -1219,7 +1314,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             const auto roots             = workspace_recipe::text_prefill_roots<TextConfig>(
                 work_, len, rope_axes, static_cast<std::int32_t>(local_scatter_indices.size()));
             Tensor ids_device = roots.ids;
-            copy_i32(ids.data() + t0, ids_device, s);
+            if (!pipeline_) { copy_i32(ids.data() + t0, ids_device, s); }
 
             Tensor positions = roots.positions;
             ops::fill_i32_positions(positions, base_i + t0, s);
@@ -1248,7 +1343,22 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             ScopedEnvelope scoped_envelope(active_gqa_envelope_, chunk_envelope);
 
             Tensor x = roots.residual;
-            ops::embedding(ids_device, *embed_, x, s);
+            if (!pipeline_) { ops::embedding(ids_device, *embed_, x, s); }
+            if (pipeline_) {
+                const auto& peer = *pipeline_;
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(peer.device->device));
+                Tensor peer_ids = peer.work->alloc(DType::I32, {len});
+                copy_i32(pipeline_upload_ + t0, peer_ids, peer.device->stream);
+                Tensor peer_x = peer.work->alloc(DType::BF16, {kCfg.hidden, len});
+                ops::embedding(peer_ids, peer.weights->token_embedding, peer_x, peer.device->stream);
+                // The peer stem must not wait for the previous primary chunk.
+                pipeline_prefill_layers(peer_x, positions, chunk_envelope, base_i + t0);
+                peer_copy_begin(*peer.device, ctx_, peer.events->inputs_ready(1));
+                peer_copy(peer_x, x, *peer.device, ctx_);
+                peer_copy_end(*peer.device, ctx_, peer.events->pull_done(0));
+                CUDA_CHECK(cudaSetDevice(ctx_.device));
+            }
             if (!local_scatter_indices.empty()) {
                 Tensor indices_device = roots.scatter_indices;
                 copy_i32(local_scatter_indices.data(), indices_device, s);
@@ -1257,7 +1367,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 ops::scatter(embeddings, indices_device, x, s);
             }
             if constexpr (Tap::enabled) { tap.begin(x); }
-            run_layers(x, Phase::Prefill, tap);
+            run_owned_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
                 tap.capture_positions(positions, s);
             }
@@ -1317,7 +1427,12 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
 
                 Tensor mtp_ids = work_.alloc(DType::I32, {len});
-                copy_i32(mtp_ids_host.data(), mtp_ids, s);
+                if (pipeline_) {
+                    std::copy(mtp_ids_host.begin(), mtp_ids_host.end(), pipeline_upload_ + T + t0);
+                    copy_i32(pipeline_upload_ + T + t0, mtp_ids, s);
+                } else {
+                    copy_i32(mtp_ids_host.data(), mtp_ids, s);
+                }
                 Tensor mtp_input_embeddings;
                 const Tensor* mtp_input_embeddings_ptr = nullptr;
                 if (multimodal != nullptr) {
@@ -1383,10 +1498,17 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
         if (checkpoint_rel > 0 && t0 + len == checkpoint_rel) {
             state_.copy_slot(linear_state_current_slot_, rewrite_checkpoint_slot, s);
+            if (pipeline_) {
+                const CurrentDevice restore;
+                CUDA_CHECK(cudaSetDevice(pipeline_->device->device));
+                pipeline_->state->copy_slot(linear_state_current_slot_, rewrite_checkpoint_slot,
+                                            pipeline_->device->stream);
+            }
         }
 
+        tail_column = len - 1;
         t0 += len;
-        break;
+        if (!pipeline_) { break; }
     }
 
     prefill_rewrite_checkpoint_frontier_ = -1;
@@ -1394,7 +1516,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
     ctx_.synchronize();
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(t0),
-                              .finalized        = finalize_at_end && t0 == T};
+                              .finalized        = finalize_at_end && t0 == T,
+                              .tail_column      = static_cast<std::uint32_t>(tail_column)};
 }
 
 PrefillChunkResult TextContext::prefill_chunk(std::span<const int> full_ids, std::uint32_t begin,
@@ -1494,13 +1617,13 @@ std::array<std::optional<WorkspaceArena::Scope>, kMaximumExecutionDevices>
 TextContext::workspace_scopes() const {
     std::array<std::optional<WorkspaceArena::Scope>, kMaximumExecutionDevices> out{};
     const auto work = workspaces();
-    for (int rank = 0; rank < ec().tp; ++rank) { out[rank].emplace(work[rank]->scope()); }
+    for (int rank = 0; rank < ec().device_count; ++rank) { out[rank].emplace(work[rank]->scope()); }
     return out;
 }
 
 void TextContext::synchronize_all() const {
     ctx_.synchronize();
-    for (const TpExecution& peer : tp_) { peer.device->synchronize(); }
+    for (const PeerExecution& peer : tp_) { peer.device->synchronize(); }
 }
 
 const Tensor& TextContext::rank_cache_positions(int rank) const {
@@ -1594,19 +1717,19 @@ void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecu
     std::array<Tensor, kMaximumExecutionDevices> gate_flat;
     std::array<Tensor, kMaximumExecutionDevices> k_flat;
     std::array<Tensor, kMaximumExecutionDevices> v_flat;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         const auto projection =
             workspace_recipe::text_attention_projection<TextConfig>(*ws[r], T,
-                                                                    ec().tp);
+                                                                    ec().device_count);
         h[r]         = projection.hidden;
-        q[r]         = projection.query.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
-        gate[r]      = projection.gate.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
-        k[r]         = projection.key.view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-        v[r]         = projection.value.view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-        q_flat[r]    = q[r].view({(kCfg.q_size / ec().tp), T});
-        gate_flat[r] = gate[r].view({(kCfg.q_size / ec().tp), T});
-        k_flat[r]    = k[r].view({(kCfg.kv_size / ec().tp), T});
-        v_flat[r]    = v[r].view({(kCfg.kv_size / ec().tp), T});
+        q[r]         = projection.query.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
+        gate[r]      = projection.gate.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
+        k[r]         = projection.key.view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+        v[r]         = projection.value.view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+        q_flat[r]    = q[r].view({(kCfg.q_size / ec().device_count), T});
+        gate_flat[r] = gate[r].view({(kCfg.q_size / ec().device_count), T});
+        k_flat[r]    = k[r].view({(kCfg.kv_size / ec().device_count), T});
+        v_flat[r]    = v[r].view({(kCfg.kv_size / ec().device_count), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
@@ -1618,12 +1741,12 @@ void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecu
     std::array<Tensor, kMaximumExecutionDevices> qn;
     std::array<Tensor, kMaximumExecutionDevices> kn;
     std::array<Tensor, kMaximumExecutionDevices> a;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         const auto results =
-            workspace_recipe::text_attention_results<TextConfig>(*ws[r], T, ec().tp);
-        qn[r] = results.normalized_query.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
-        kn[r] = results.normalized_key.view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-        a[r]  = results.attention.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
+            workspace_recipe::text_attention_results<TextConfig>(*ws[r], T, ec().device_count);
+        qn[r] = results.normalized_query.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
+        kn[r] = results.normalized_key.view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+        a[r]  = results.attention.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r        = static_cast<std::size_t>(rank);
@@ -1632,11 +1755,16 @@ void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecu
         const Tensor& rope  = rank_rope_positions(rank);
         ops::rmsnorm(q[r], *w[r]->q_norm, kCfg.rms_eps, true, qn[r], s);
         ops::rmsnorm(k[r], *w[r]->k_norm, kCfg.rms_eps, true, kn[r], s);
+        const qwen3_6::PagedKVCache& pages = rank == 0 ? *batch_text_kv_ : *tp_[rank - 1].batch_kv;
+        if (pages.retrieval_keys.data && ph == Phase::Prefill && capture_retrieval_query_) {
+            ops::kv_retrieval_query_summary(qn[r], cache.view({T}), pages.retrieval_span,
+                pages.retrieval_query.slice(2, fidx, 1), pages.retrieval_fallback.slice(2, fidx, 1),
+                pages.retrieval_counts.slice(0, fidx, 1), s);
+        }
         Tensor rope_for_op = active_sequence_batch_ != 0 ? rope.view({T}) : rope;
         ops::rope(rope_for_op, kCfg.rotary_dim, kCfg.rope_theta, qn[r], kn[r],
                   rope_frequency_[r], s);
 
-        const qwen3_6::PagedKVCache& pages = rank == 0 ? *batch_text_kv_ : *tp_[rank - 1].batch_kv;
         if (active_sequence_batch_ != 0) {
             const std::int32_t width = active_sequence_width_;
             if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -1644,26 +1772,30 @@ void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecu
                     "Text sequence batch binding does not match aggregate columns");
             }
             Tensor q_batch =
-                qn[r].view({kCfg.head_dim, (kCfg.n_q / ec().tp), width, active_sequence_batch_});
+                qn[r].view({kCfg.head_dim, (kCfg.n_q / ec().device_count), width, active_sequence_batch_});
             Tensor k_batch =
-                kn[r].view({kCfg.head_dim, (kCfg.n_kv / ec().tp), width, active_sequence_batch_});
+                kn[r].view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), width, active_sequence_batch_});
             Tensor v_batch =
-                v[r].view({kCfg.head_dim, (kCfg.n_kv / ec().tp), width, active_sequence_batch_});
+                v[r].view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), width, active_sequence_batch_});
             Tensor a_batch =
-                a[r].view({kCfg.head_dim, (kCfg.n_q / ec().tp), width, active_sequence_batch_});
+                a[r].view({kCfg.head_dim, (kCfg.n_q / ec().device_count), width, active_sequence_batch_});
             Tensor position_batch = cache.view({width, active_sequence_batch_});
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, rank_valid_columns(rank),
                                rank_kv_table_rows(rank), kAttnScale, pages.batch_layer_view(fidx),
-                               *active_gqa_envelope_, *ws[r], a_batch, s);
+                               attention_envelope(*active_gqa_envelope_), *ws[r], a_batch, s);
         } else {
             ops::gqa_attention(qn[r], kn[r], v[r], cache, Tensor{}, rank_kv_table_rows(rank),
-                               kAttnScale, pages.batch_layer_view(fidx), *active_gqa_envelope_,
+                               kAttnScale, pages.batch_layer_view(fidx), attention_envelope(*active_gqa_envelope_),
                                *ws[r], a[r], s);
+        }
+        if (pages.retrieval_keys.data) {
+            ops::kv_retrieval_key_summary(pages.batch_layer_view(fidx), cache.view({T}),
+                rank_valid_columns(rank), pages.retrieval_keys.slice(3, fidx, 1), rope_frequency_[r], s);
         }
         ops::sigmoid_mul(gate[r], a[r], s);
     });
 
-    Variant::attention_output_projection(active(rank_map([&](int rank) { return a[rank].view({kCfg.q_size / ec().tp, T}); })),
+    Variant::attention_output_projection(active(rank_map([&](int rank) { return a[rank].view({kCfg.q_size / ec().device_count, T}); })),
                                          active(rank_map([&](int rank) { return *w[rank]->o_proj; })), active(x), active(staging), ph, active(ws), execution,
                                          *tp_[0].events);
 }
@@ -1681,15 +1813,15 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
     std::array<Tensor, kMaximumExecutionDevices> qc;
     std::array<Tensor, kMaximumExecutionDevices> kc;
     std::array<Tensor, kMaximumExecutionDevices> vc;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         const auto control = workspace_recipe::gdn_control<TextConfig>(*ws[r], T,
-                                                                      ec().tp);
+                                                                      ec().device_count);
         h[r]               = control.hidden;
         g[r]               = control.g;
         beta[r]            = control.beta;
         const auto projection =
-            workspace_recipe::gdn_projection<TextConfig>(*ws[r], T, ec().tp);
-        z[r]  = projection.output_gate.view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().tp), T});
+            workspace_recipe::gdn_projection<TextConfig>(*ws[r], T, ec().device_count);
+        z[r]  = projection.output_gate.view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), T});
         qc[r] = projection.query;
         kc[r] = projection.key;
         vc[r] = projection.value;
@@ -1720,13 +1852,13 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
         std::array<Tensor, kMaximumExecutionDevices> conv_states;
         std::array<Tensor, kMaximumExecutionDevices> valid;
         std::array<Tensor, kMaximumExecutionDevices> slots;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
             const int rank      = static_cast<int>(r);
             projection_input[r] = h[r].view({kCfg.hidden, width, active_sequence_batch_});
-            query_output[r]     = qc[r].view({(kCfg.key_dim / ec().tp), width, active_sequence_batch_});
-            key_output[r]       = kc[r].view({(kCfg.key_dim / ec().tp), width, active_sequence_batch_});
-            value_output[r]     = vc[r].view({(kCfg.value_dim / ec().tp), width, active_sequence_batch_});
-            gate_output[r]      = z[r].view({(kCfg.value_dim / ec().tp), width, active_sequence_batch_});
+            query_output[r]     = qc[r].view({(kCfg.key_dim / ec().device_count), width, active_sequence_batch_});
+            key_output[r]       = kc[r].view({(kCfg.key_dim / ec().device_count), width, active_sequence_batch_});
+            value_output[r]     = vc[r].view({(kCfg.value_dim / ec().device_count), width, active_sequence_batch_});
+            gate_output[r]      = z[r].view({(kCfg.value_dim / ec().device_count), width, active_sequence_batch_});
             conv_weight[r]      = *w[r]->conv1d;
             conv_states[r]      = state_for(rank).conv.at(static_cast<std::size_t>(gidx));
             valid[r]            = rank_valid_columns(rank);
@@ -1741,7 +1873,7 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
             // columns of the same rows -- only the head range differs -- so the two folds commit
             // the same accepted prefix without any agreement protocol.
             std::array<Tensor, kMaximumExecutionDevices> conv_record;
-            for (std::size_t r = 0; r < ec().tp; ++r) {
+            for (std::size_t r = 0; r < ec().device_count; ++r) {
                 const GdnReplayRecords* records = replay_records_for(static_cast<int>(r));
                 if (records == nullptr) {
                     throw std::logic_error("Replay-record GDN has no record storage");
@@ -1762,9 +1894,9 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
     } else {
         std::array<Tensor, kMaximumExecutionDevices> qkv;
         std::array<Tensor, kMaximumExecutionDevices> qkv_c;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
             const auto conv =
-                workspace_recipe::gdn_prefill_conv<TextConfig>(*ws[r], T, ec().tp);
+                workspace_recipe::gdn_prefill_conv<TextConfig>(*ws[r], T, ec().device_count);
             qkv[r]   = conv.projected;
             qkv_c[r] = conv.convolved;
         }
@@ -1778,38 +1910,38 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
             // Shard-local section offsets: this device's convolved block is its own
             // q(1024) | k(1024) | v(3072), not the model's 2048 | 2048 | 6144.
             ops::extract_bf16_columns(qkv_c[r], 0, qc[r], s);
-            ops::extract_bf16_columns(qkv_c[r], (kCfg.key_dim / ec().tp), kc[r], s);
-            ops::extract_bf16_columns(qkv_c[r], 2 * (kCfg.key_dim / ec().tp), vc[r], s);
+            ops::extract_bf16_columns(qkv_c[r], (kCfg.key_dim / ec().device_count), kc[r], s);
+            ops::extract_bf16_columns(qkv_c[r], 2 * (kCfg.key_dim / ec().device_count), vc[r], s);
         });
     }
 
     std::array<Tensor, kMaximumExecutionDevices> o;
     std::array<Tensor, kMaximumExecutionDevices> on;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
-        o[r] = workspace_recipe::gdn_recurrent_output<TextConfig>(*ws[r], T, ec().tp)
-                   .view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().tp), T});
-        on[r] = workspace_recipe::gdn_normalized_output<TextConfig>(*ws[r], T, ec().tp)
-                    .view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().tp), T});
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
+        o[r] = workspace_recipe::gdn_recurrent_output<TextConfig>(*ws[r], T, ec().device_count)
+                   .view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), T});
+        on[r] = workspace_recipe::gdn_normalized_output<TextConfig>(*ws[r], T, ec().device_count)
+                    .view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r       = static_cast<std::size_t>(rank);
         cudaStream_t s     = stream_for(rank);
-        Tensor q_recurrent = qc[r].view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().tp), T});
-        Tensor k_recurrent = kc[r].view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().tp), T});
-        Tensor vv          = vc[r].view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().tp), T});
+        Tensor q_recurrent = qc[r].view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().device_count), T});
+        Tensor k_recurrent = kc[r].view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().device_count), T});
+        Tensor vv          = vc[r].view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), T});
         if (ph == Phase::Verify) {
             Tensor& recurrent_states = state_for(rank).recurrent.at(static_cast<std::size_t>(gidx));
             const std::int32_t width = active_sequence_width_;
             Tensor q_batch =
-                q_recurrent.view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().tp), width, active_sequence_batch_});
+                q_recurrent.view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().device_count), width, active_sequence_batch_});
             Tensor k_batch =
-                k_recurrent.view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().tp), width, active_sequence_batch_});
+                k_recurrent.view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().device_count), width, active_sequence_batch_});
             Tensor v_batch =
-                vv.view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().tp), width, active_sequence_batch_});
-            Tensor g_batch    = g[r].view({(kCfg.gdn_v_heads / ec().tp), width, active_sequence_batch_});
-            Tensor beta_batch = beta[r].view({(kCfg.gdn_v_heads / ec().tp), width, active_sequence_batch_});
+                vv.view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), width, active_sequence_batch_});
+            Tensor g_batch    = g[r].view({(kCfg.gdn_v_heads / ec().device_count), width, active_sequence_batch_});
+            Tensor beta_batch = beta[r].view({(kCfg.gdn_v_heads / ec().device_count), width, active_sequence_batch_});
             Tensor out_batch =
-                o[r].view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().tp), width, active_sequence_batch_});
+                o[r].view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), width, active_sequence_batch_});
             const Tensor valid = rank_valid_columns(rank);
             const Tensor slots = rank_linear_state_slots(rank);
             if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
@@ -1837,7 +1969,7 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
     });
 
     Variant::gdn_output_projection(
-        active(rank_map([&](int rank) { return on[rank].view({kCfg.value_dim / ec().tp, T}); })),
+        active(rank_map([&](int rank) { return on[rank].view({kCfg.value_dim / ec().device_count, T}); })),
         active(rank_map([&](int rank) { return *w[rank]->out_proj; })), active(x), active(staging), ph, active(ws), execution, *tp_[0].events);
 }
 
@@ -1920,7 +2052,7 @@ void TextContext::logits_tp2(
     const std::array<Tensor, kMaximumExecutionDevices>& hidden,
     const std::array<Tensor, kMaximumExecutionDevices>& logits) {
     const int columns = hidden[0].ne[1];
-    const int rows = kCfg.vocab / ec().tp;
+    const int rows = kCfg.vocab / ec().device_count;
     const auto work = workspaces();
     auto scopes = workspace_scopes();
     const auto shards = rank_map([&](int rank) {
@@ -1977,13 +2109,13 @@ void TextContext::head_argmax_tp(
         Tensor value = values[rank].view({columns}), index = indices[rank].view({columns});
         ops::argmax_with_value(shards[rank], value, index, valid, stream_for(rank));
     });
-    Tensor gathered_values = work_.alloc(DType::FP32, {ec().tp, columns});
-    Tensor gathered_indices = work_.alloc(DType::I32, {ec().tp, columns});
+    Tensor gathered_values = work_.alloc(DType::FP32, {ec().device_count, columns});
+    Tensor gathered_indices = work_.alloc(DType::I32, {ec().device_count, columns});
     ops::gather_columns_rank0(gathered_values, active(values), ec(), *tp_[0].events);
     ops::gather_columns_rank0(gathered_indices, active(indices), ec(), *tp_[0].events);
     Tensor result = target_tokens[0];
     ops::merge_argmax_shards(gathered_values, gathered_indices, result, rows, ctx_.stream);
-    ops::broadcast_rank0(result, std::span(target_tokens).subspan(1, ec().tp - 1),
+    ops::broadcast_rank0(result, std::span(target_tokens).subspan(1, ec().device_count - 1),
                          ec(), *tp_[0].events);
 }
 
@@ -2036,7 +2168,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
     int len = std::min(chunk, T);
     if (checkpoint_rel > 0 && len > checkpoint_rel) { len = checkpoint_rel; }
     work_.reset();
-    for (const TpExecution& peer : tp_) { peer.work->reset(); }
+    for (const PeerExecution& peer : tp_) { peer.work->reset(); }
     VisionChunk vision_chunk;
     if (multimodal != nullptr) {
         vision_chunk = multimodal->vision->prepare_chunk(text_kv_base_, len);
@@ -2067,7 +2199,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
     nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                   static_cast<std::uint64_t>(len));
     work_.reset();
-    for (const TpExecution& peer : tp_) { peer.work->reset(); }
+    for (const PeerExecution& peer : tp_) { peer.work->reset(); }
     {
         auto scopes = workspace_scopes();
         std::array<Tensor, kMaximumExecutionDevices> ids_device;
@@ -2076,7 +2208,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         std::array<Tensor, kMaximumExecutionDevices> scatter_device;
         std::array<Tensor, kMaximumExecutionDevices> x;
         std::array<Tensor, kMaximumExecutionDevices> staging;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
             const auto roots = workspace_recipe::text_prefill_roots<TextConfig>(
                 *ws[r], len, multimodal != nullptr ? 3 : (rope_delta_ != 0 ? 1 : 0),
                 static_cast<std::int32_t>(scatter_indices.size()));
@@ -2086,7 +2218,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                                                                      : positions[r];
             scatter_device[r] = roots.scatter_indices;
             x[r]             = roots.residual;
-            staging[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, len * (ec().tp == 4 ? 4 : 1)});
+            staging[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, len * (ec().device_count == 4 ? 4 : 1)});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r   = static_cast<std::size_t>(rank);
@@ -2139,7 +2271,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         std::array<Tensor, kMaximumExecutionDevices> xf;
         xf[0] = prefill_hidden_.data != nullptr ? matrix_window(prefill_hidden_, len)
                                                 : ws[0]->alloc(DType::BF16, {kCfg.hidden, len});
-        for (int rank = 1; rank < ec().tp; ++rank) {
+        for (int rank = 1; rank < ec().device_count; ++rank) {
             Tensor* hidden = tp_[rank - 1].prefill_hidden;
             xf[rank] = hidden != nullptr && hidden->data != nullptr
                            ? matrix_window(*hidden, len)
@@ -2251,7 +2383,7 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                     Tensor prev_token = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                     Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
                     std::array<Tensor, kMaximumExecutionDevices> next_hidden;
-                    for (std::size_t r = 0; r < ec().tp; ++r) {
+                    for (std::size_t r = 0; r < ec().device_count; ++r) {
                         next_hidden[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
                     }
                     const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
@@ -2301,9 +2433,10 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
         synchronize_all();
     }
     work_.reset();
-    for (const TpExecution& peer : tp_) { peer.work->reset(); }
+    for (const PeerExecution& peer : tp_) { peer.work->reset(); }
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(len),
-                              .finalized        = finalize_at_end && len == T};
+                              .finalized        = finalize_at_end && len == T,
+                              .tail_column      = static_cast<std::uint32_t>(len - 1)};
 }
 
 void TextContext::ordinary_decode_batch_tp2(
@@ -2353,7 +2486,7 @@ void TextContext::ordinary_decode_batch_tp2(
         auto scopes = workspace_scopes();
         auto x = rank_map([&](int rank) { return work[rank]->alloc(DType::BF16, {kCfg.hidden, batch}); });
         const auto staging = rank_map([&](int rank) {
-            return work[rank]->alloc(DType::BF16, {kCfg.hidden, batch * (ec().tp == 4 ? 4 : 1)});
+            return work[rank]->alloc(DType::BF16, {kCfg.hidden, batch * (ec().device_count == 4 ? 4 : 1)});
         });
         for_each_rank(ec(), [&](int rank) {
             ops::embedding(rank_ids[rank], embedding_for(rank), x[rank], stream_for(rank));
@@ -2385,14 +2518,14 @@ void TextContext::mtp_forward_stem_tp2(
     const std::array<Tensor, kMaximumExecutionDevices>& staging,
     const Tensor* input_embeddings) {
     const int columns = ids.ne[0] * ids.ne[1];
-    const int input_rows = kCfg.mtp_fc_in / ec().tp;
+    const int input_rows = kCfg.mtp_fc_in / ec().device_count;
     const auto work = workspaces();
-    const int embedding_ranks = ec().tp / 2;
+    const int embedding_ranks = ec().device_count / 2;
     const auto roots = rank_map([&](int rank) {
         require_tensor_shape(hidden[rank].view({kCfg.hidden, columns}), DType::BF16,
                              {kCfg.hidden, columns}, "MTP hidden");
         return workspace_recipe::mtp_stem<TextConfig>(*work[rank], columns,
-                                                      rank < embedding_ranks, ec().tp);
+                                                      rank < embedding_ranks, ec().device_count);
     });
     Tensor flat_ids = ids.view({columns});
     const auto rank_ids = rank_map([&](int rank) {
@@ -2400,7 +2533,7 @@ void TextContext::mtp_forward_stem_tp2(
     });
     // Ranks 0..TP/2-1 contract normalized embedding slices. Others contract hidden slices.
     // Draft tokens live on rank 0, so broadcast them before any embedding reader can launch.
-    ops::broadcast_rank0(flat_ids, std::span(rank_ids).subspan(1, ec().tp - 1),
+    ops::broadcast_rank0(flat_ids, std::span(rank_ids).subspan(1, ec().device_count - 1),
                          ec(), *tp_[0].events);
     const auto inputs = rank_map([&](int rank) {
         return work[rank]->alloc(DType::BF16, {input_rows, columns});
@@ -2461,18 +2594,18 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, kMaximumExecutionDevic
     std::array<Tensor, kMaximumExecutionDevices> gate_flat;
     std::array<Tensor, kMaximumExecutionDevices> k_flat;
     std::array<Tensor, kMaximumExecutionDevices> v_flat;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         const auto projection =
             workspace_recipe::mtp_attention_projection<TextConfig>(*ws[r], T,
-                                                                   ec().tp);
-        q[r]         = projection.query.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
-        k[r]         = projection.key.view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-        gate[r]      = projection.gate.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
-        v[r]         = projection.value.view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-        q_flat[r]    = q[r].view({(kCfg.q_size / ec().tp), T});
-        gate_flat[r] = gate[r].view({(kCfg.q_size / ec().tp), T});
-        k_flat[r]    = k[r].view({(kCfg.kv_size / ec().tp), T});
-        v_flat[r]    = v[r].view({(kCfg.kv_size / ec().tp), T});
+                                                                   ec().device_count);
+        q[r]         = projection.query.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
+        k[r]         = projection.key.view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+        gate[r]      = projection.gate.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
+        v[r]         = projection.value.view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+        q_flat[r]    = q[r].view({(kCfg.q_size / ec().device_count), T});
+        gate_flat[r] = gate[r].view({(kCfg.q_size / ec().device_count), T});
+        k_flat[r]    = k[r].view({(kCfg.kv_size / ec().device_count), T});
+        v_flat[r]    = v[r].view({(kCfg.kv_size / ec().device_count), T});
     }
     Variant::mtp_attention_projection(
         active(ah), active(rank_map([&](int rank) { return &mtp_weights_for(rank).payload->attention; })),
@@ -2481,12 +2614,12 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, kMaximumExecutionDevic
     std::array<Tensor, kMaximumExecutionDevices> qn;
     std::array<Tensor, kMaximumExecutionDevices> kn;
     std::array<Tensor, kMaximumExecutionDevices> a;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         const auto results =
-            workspace_recipe::mtp_attention_results<TextConfig>(*ws[r], T, ec().tp);
-        qn[r] = results.normalized_query.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
-        kn[r] = results.normalized_key.view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-        a[r]  = results.attention.view({kCfg.head_dim, (kCfg.n_q / ec().tp), T});
+            workspace_recipe::mtp_attention_results<TextConfig>(*ws[r], T, ec().device_count);
+        qn[r] = results.normalized_query.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
+        kn[r] = results.normalized_key.view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+        a[r]  = results.attention.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r    = static_cast<std::size_t>(rank);
@@ -2506,21 +2639,21 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, kMaximumExecutionDevic
                 throw std::logic_error("MTP sequence batch binding is incomplete");
             }
             Tensor q_batch =
-                qn[r].view({kCfg.head_dim, (kCfg.n_q / ec().tp), width, active_sequence_batch_});
+                qn[r].view({kCfg.head_dim, (kCfg.n_q / ec().device_count), width, active_sequence_batch_});
             Tensor k_batch =
-                kn[r].view({kCfg.head_dim, (kCfg.n_kv / ec().tp), width, active_sequence_batch_});
+                kn[r].view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), width, active_sequence_batch_});
             Tensor v_batch =
-                v[r].view({kCfg.head_dim, (kCfg.n_kv / ec().tp), width, active_sequence_batch_});
+                v[r].view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), width, active_sequence_batch_});
             Tensor a_batch =
-                a[r].view({kCfg.head_dim, (kCfg.n_q / ec().tp), width, active_sequence_batch_});
+                a[r].view({kCfg.head_dim, (kCfg.n_q / ec().device_count), width, active_sequence_batch_});
             Tensor position_batch = positions[r].view({width, active_sequence_batch_});
             ops::gqa_attention(q_batch, k_batch, v_batch, position_batch, rank_valid_columns(rank),
                                rank_backend_kv_table_rows(rank), kAttnScale,
-                               pages.batch_layer_view(0), envelope, *ws[r], a_batch, s);
+                               pages.batch_layer_view(0), attention_envelope(envelope), *ws[r], a_batch, s);
         } else {
             ops::gqa_attention(qn[r], kn[r], v[r], positions[r], Tensor{},
                                io_for(rank).backend_kv_table_row, kAttnScale,
-                               pages.batch_layer_view(0), envelope, *ws[r], a[r], s);
+                               pages.batch_layer_view(0), attention_envelope(envelope), *ws[r], a[r], s);
         }
         ops::sigmoid_mul(gate[r], a[r], s);
     });
@@ -2531,12 +2664,12 @@ void TextContext::mtp_forward_tail_tp2(std::array<Tensor, kMaximumExecutionDevic
     // per-rank `residual_add` over the all-reduced result.
     std::array<Tensor, kMaximumExecutionDevices> o;
     std::array<Tensor, kMaximumExecutionDevices> mh;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         const auto post   = workspace_recipe::mtp_post_attention<TextConfig>(*ws[r], T);
         o[r]              = post.output;
         mh[r]             = post.post_mixer_hidden;
     }
-    ops::linear_row_parallel(active(rank_map([&](int rank) { return a[rank].view({kCfg.q_size / ec().tp, T}); })),
+    ops::linear_row_parallel(active(rank_map([&](int rank) { return a[rank].view({kCfg.q_size / ec().device_count, T}); })),
                              active(rank_map([&](int rank) { return *mtp_weights_for(rank).o_proj; })), active(o), active(staging),
                              execution, *tp_[0].events);
     for_each_rank(execution, [&](int rank) {
@@ -2574,8 +2707,8 @@ void TextContext::mtp_forward_core_tp2(const Tensor& ids, const std::array<Tenso
     auto scope_all = workspace_scopes();
     const int T                             = ids.ne[0] * ids.ne[1];
     std::array<Tensor, kMaximumExecutionDevices> staging;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
-        staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T * (ec().tp == 4 ? 4 : 1)});
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
+        staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T * (ec().device_count == 4 ? 4 : 1)});
     }
     std::array<Tensor, kMaximumExecutionDevices> x;
     std::array<Tensor, kMaximumExecutionDevices> ah;
@@ -2597,7 +2730,7 @@ void TextContext::proposal_argmax_tp2(
         }
         return *head;
     });
-    const int total = proposal_head_ == nullptr ? kCfg.token_domain : proposal_head_n_ * ec().tp;
+    const int total = proposal_head_ == nullptr ? kCfg.token_domain : proposal_head_n_ * ec().device_count;
     const auto work = workspaces();
     auto scopes = workspace_scopes();
     const auto destinations = rank_map([&](int rank) {
@@ -2633,7 +2766,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
     // Both ranks' extents are validated, not just rank 0's: rank 1's destinations live on the
     // other device, where an undersized buffer is a silent out-of-bounds write -- a defect of
     // exactly this class was once live here, invisible at batch 1 and out of bounds at batch > 1.
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         require_tensor_shape(ids[r], DType::I32, {width, batch}, "target verify batch ids");
         require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
                              "target verify batch cache positions");
@@ -2653,7 +2786,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
     }
 
     work_.reset();
-    for (const TpExecution& peer : tp_) { peer.work->reset(); }
+    for (const PeerExecution& peer : tp_) { peer.work->reset(); }
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions[0]);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions[0]);
@@ -2676,9 +2809,9 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
         auto scopes = workspace_scopes();
         std::array<Tensor, kMaximumExecutionDevices> x;
         std::array<Tensor, kMaximumExecutionDevices> staging;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
             x[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, columns});
-            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, columns * (ec().tp == 4 ? 4 : 1)});
+            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, columns * (ec().device_count == 4 ? 4 : 1)});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r    = static_cast<std::size_t>(rank);
@@ -2689,7 +2822,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
 
         std::array<Tensor, kMaximumExecutionDevices> flat_hidden;
         std::array<Tensor, kMaximumExecutionDevices> flat_logits;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
             flat_hidden[r] = hidden[r].view({kCfg.hidden, columns});
             flat_logits[r] = logits[r].view({kCfg.vocab, columns});
         }
@@ -2713,7 +2846,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
         }
     }
     work_.reset();
-    for (const TpExecution& peer : tp_) { peer.work->reset(); }
+    for (const PeerExecution& peer : tp_) { peer.work->reset(); }
 }
 
 void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecutionDevices>& ids,
@@ -2736,7 +2869,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("tensor-parallel DFlash target verify shape is invalid");
     }
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         require_tensor_shape(ids[r], DType::I32, {width, batch}, "DFlash target verify ids");
         require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
                              "DFlash target verify cache positions");
@@ -2756,7 +2889,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
                              "DFlash target verify tokens");
     }
     work_.reset();
-    for (const TpExecution& peer : tp_) { peer.work->reset(); }
+    for (const PeerExecution& peer : tp_) { peer.work->reset(); }
     {
         ScopedPositions cache_binding(active_cache_positions_, cache_positions[0]);
         ScopedPositions rope_binding(active_rope_positions_, rope_positions[0]);
@@ -2774,9 +2907,9 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
         auto scopes = workspace_scopes();
         std::array<Tensor, kMaximumExecutionDevices> x;
         std::array<Tensor, kMaximumExecutionDevices> staging;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
             x[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch});
-            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch * (ec().tp == 4 ? 4 : 1)});
+            staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, width * batch * (ec().device_count == 4 ? 4 : 1)});
         }
         for_each_rank(execution, [&](int rank) {
             const auto r = static_cast<std::size_t>(rank);
@@ -2786,7 +2919,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
         run_layers_tp2(x, Phase::Verify, staging, &sink);
         std::array<Tensor, kMaximumExecutionDevices> flat_hidden;
         std::array<Tensor, kMaximumExecutionDevices> flat_logits;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
             flat_hidden[r] = hidden[r].view({kCfg.hidden, width * batch});
             flat_logits[r] = logits[r].view({kCfg.vocab, width * batch});
             for_each_rank(execution, [&](int rank) {
@@ -2809,7 +2942,7 @@ void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecution
         }
     }
     work_.reset();
-    for (const TpExecution& peer : tp_) { peer.work->reset(); }
+    for (const PeerExecution& peer : tp_) { peer.work->reset(); }
 }
 
 void TextContext::mtp_forward_decode_batch(const Tensor& ids,
@@ -2831,7 +2964,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids,
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, width, batch},
                              "MTP decode batch target hidden");
         require_tensor_shape(cache_positions[r], DType::I32, {width, batch},
@@ -2858,7 +2991,7 @@ void TextContext::mtp_propose_batch(const std::array<Tensor, kMaximumExecutionDe
                                     const std::array<Tensor, kMaximumExecutionDevices>& logits, Tensor& draft_tokens) {
     if (!tp2()) { throw std::logic_error("tensor-parallel MTP proposal requires a peer"); }
     const std::int32_t batch = hidden[0].ne[1];
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, batch},
                              "MTP proposal batch hidden");
         require_tensor_shape(logits[r], DType::BF16, {kCfg.vocab, batch},
@@ -2885,7 +3018,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 
         throw std::invalid_argument("MTP batch T must be in [1,prefill_chunk]");
     }
     require_tensor_shape(ids, DType::I32, {T}, "MTP ids");
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         require_tensor_shape(positions[r], DType::I32, {T}, "MTP positions");
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP hidden");
         require_tensor_shape(mtp_hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP output hidden");
@@ -2901,7 +3034,7 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const std::array<Tensor, 
         if (logits == nullptr || draft_token == nullptr) {
             throw std::invalid_argument("MTP logits and draft_token outputs are required");
         }
-        for (const Tensor& destination : std::span(*logits).first(ec().tp)) {
+        for (const Tensor& destination : std::span(*logits).first(ec().device_count)) {
             require_tensor_shape(destination, DType::BF16, {kCfg.vocab, 1}, "MTP logits");
         }
         require_tensor_shape(*draft_token, DType::I32, {1}, "MTP draft token");
@@ -2927,7 +3060,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token,
     }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         require_tensor_shape(position[r], DType::I32, {1}, "MTP AR position");
         require_tensor_shape(previous_hidden[r], DType::BF16, {kCfg.hidden, 1},
                              "MTP AR previous hidden");
@@ -2938,7 +3071,7 @@ void TextContext::mtp_forward_ar_step(const Tensor& token,
     const std::array<WorkspaceArena*, kMaximumExecutionDevices> ws = workspaces();
     auto position_scope_all = workspace_scopes();
     std::array<Tensor, kMaximumExecutionDevices> rope_position;
-    for (std::size_t r = 0; r < ec().tp; ++r) { rope_position[r] = ws[r]->alloc(DType::I32, {1}); }
+    for (std::size_t r = 0; r < ec().device_count; ++r) { rope_position[r] = ws[r]->alloc(DType::I32, {1}); }
     for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         ops::offset_i32_positions(position[r], io_for(rank).rope_delta, rope_position[r],
@@ -2968,7 +3101,7 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
     nvtx::ScopedRange mtp_prefill_range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
                                         static_cast<std::uint64_t>(T));
     require_tensor_shape(ids, DType::I32, {T}, "MTP prefill ids");
-    for (std::size_t r = 0; r < ec().tp; ++r) {
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
         require_tensor_shape(hidden[r], DType::BF16, {kCfg.hidden, T}, "MTP prefill hidden");
         require_tensor_shape(positions[r], DType::I32, {T}, "MTP prefill positions");
         const Tensor& rope = rope_positions[r];
@@ -2989,13 +3122,13 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
     std::array<Tensor, kMaximumExecutionDevices> last_staging;
     std::array<Tensor, kMaximumExecutionDevices> x_last;
     std::array<Tensor, kMaximumExecutionDevices> ah_last;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
-        staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T * (ec().tp == 4 ? 4 : 1)});
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
+        staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, T * (ec().device_count == 4 ? 4 : 1)});
         if (final_chunk) {
             // The final-chunk stage reduces ONE column, and `linear_row_parallel` requires the
             // staging buffer to match its output's shape exactly on both devices -- the chunk's
             // [hidden, T] staging would be the wrong shape for it.
-            last_staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1 * (ec().tp == 4 ? 4 : 1)});
+            last_staging[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1 * (ec().device_count == 4 ? 4 : 1)});
             x_last[r]       = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
             ah_last[r]      = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
         }
@@ -3009,9 +3142,9 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
 
         std::array<Tensor, kMaximumExecutionDevices> k_flat;
         std::array<Tensor, kMaximumExecutionDevices> v_flat;
-        for (std::size_t r = 0; r < ec().tp; ++r) {
-            k_flat[r] = ws[r]->alloc(DType::BF16, {(kCfg.kv_size / ec().tp), T});
-            v_flat[r] = ws[r]->alloc(DType::BF16, {(kCfg.kv_size / ec().tp), T});
+        for (std::size_t r = 0; r < ec().device_count; ++r) {
+            k_flat[r] = ws[r]->alloc(DType::BF16, {(kCfg.kv_size / ec().device_count), T});
+            v_flat[r] = ws[r]->alloc(DType::BF16, {(kCfg.kv_size / ec().device_count), T});
         }
         Variant::mtp_kv_projection(
             active(ah), active(rank_map([&](int rank) { return &mtp_weights_for(rank).payload->attention; })),
@@ -3020,9 +3153,9 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
             const auto r    = static_cast<std::size_t>(rank);
             cudaStream_t s  = stream_for(rank);
             const MtpW& mtp = mtp_weights_for(rank);
-            Tensor k        = k_flat[r].view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-            Tensor v        = v_flat[r].view({kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
-            Tensor kn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, (kCfg.n_kv / ec().tp), T});
+            Tensor k        = k_flat[r].view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+            Tensor v        = v_flat[r].view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
+            Tensor kn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
             ops::rmsnorm(k, *mtp.k_norm, kCfg.rms_eps, true, kn, s);
             ops::rope(rope_positions[r], kCfg.rotary_dim, kCfg.rope_theta, kn,
                       rope_frequency_[r], s);
@@ -3047,9 +3180,9 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
 
     std::array<Tensor, kMaximumExecutionDevices> q_flat;
     std::array<Tensor, kMaximumExecutionDevices> gate_flat;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
-        q_flat[r]    = ws[r]->alloc(DType::BF16, {(kCfg.q_size / ec().tp), 1});
-        gate_flat[r] = ws[r]->alloc(DType::BF16, {(kCfg.q_size / ec().tp), 1});
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
+        q_flat[r]    = ws[r]->alloc(DType::BF16, {(kCfg.q_size / ec().device_count), 1});
+        gate_flat[r] = ws[r]->alloc(DType::BF16, {(kCfg.q_size / ec().device_count), 1});
     }
     Variant::mtp_q_gate_projection(
         active(ah_last), active(rank_map([&](int rank) { return &mtp_weights_for(rank).payload->attention; })),
@@ -3057,8 +3190,8 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
     std::array<Tensor, kMaximumExecutionDevices> a;
     std::array<Tensor, kMaximumExecutionDevices> o;
     std::array<Tensor, kMaximumExecutionDevices> mh;
-    for (std::size_t r = 0; r < ec().tp; ++r) {
-        a[r]  = ws[r]->alloc(DType::BF16, {kCfg.head_dim, (kCfg.n_q / ec().tp), 1});
+    for (std::size_t r = 0; r < ec().device_count; ++r) {
+        a[r]  = ws[r]->alloc(DType::BF16, {kCfg.head_dim, (kCfg.n_q / ec().device_count), 1});
         o[r]  = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
         mh[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
     }
@@ -3066,9 +3199,9 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
         const auto r    = static_cast<std::size_t>(rank);
         cudaStream_t s  = stream_for(rank);
         const MtpW& mtp = mtp_weights_for(rank);
-        Tensor q        = q_flat[r].view({kCfg.head_dim, (kCfg.n_q / ec().tp), 1});
-        Tensor gate     = gate_flat[r].view({kCfg.head_dim, (kCfg.n_q / ec().tp), 1});
-        Tensor qn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, (kCfg.n_q / ec().tp), 1});
+        Tensor q        = q_flat[r].view({kCfg.head_dim, (kCfg.n_q / ec().device_count), 1});
+        Tensor gate     = gate_flat[r].view({kCfg.head_dim, (kCfg.n_q / ec().device_count), 1});
+        Tensor qn       = ws[r]->alloc(DType::BF16, {kCfg.head_dim, (kCfg.n_q / ec().device_count), 1});
         ops::rmsnorm(q, *mtp.q_norm, kCfg.rms_eps, true, qn, s);
         Tensor last_position = positions[r].slice(0, T - 1, 1);
         Tensor last_rope;
@@ -3085,11 +3218,11 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const std::array<Tens
         }
         ops::rope(last_rope, kCfg.rotary_dim, kCfg.rope_theta, qn, rope_frequency_[r], s);
         qwen3_6::PagedKVCacheView pages = rank == 0 ? mtp_kv_ : tp_[rank - 1].mtp_kv;
-        ops::gqa_attention_cached(qn, last_position, kAttnScale, pages.layer_view(0), envelope,
+        ops::gqa_attention_cached(qn, last_position, kAttnScale, pages.layer_view(0), attention_envelope(envelope),
                                   *ws[r], a[r], s);
         ops::sigmoid_mul(gate, a[r], s);
     });
-    ops::linear_row_parallel(active(rank_map([&](int rank) { return a[rank].view({kCfg.q_size / ec().tp, 1}); })),
+    ops::linear_row_parallel(active(rank_map([&](int rank) { return a[rank].view({kCfg.q_size / ec().device_count, 1}); })),
                              active(rank_map([&](int rank) { return *mtp_weights_for(rank).o_proj; })), active(o),
                              active(last_staging), execution, *tp_[0].events);
     for_each_rank(execution, [&](int rank) {

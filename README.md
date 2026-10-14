@@ -1,6 +1,6 @@
 # NInfer Windows 双 V100
 
-[English](README.en.md) · [下载 Windows 应用 v0.1.2](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.2-windows-preview) · [使用与构建详情](docs/windows-toolchain.md)
+[English](README.en.md) · [下载 Windows 应用 v0.1.3](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.3-windows-preview) · [使用与构建详情](docs/windows-toolchain.md)
 
 在 **Windows 原生环境**中，用两张 V100 运行 Qwen3.8-27B。支持保留 GRID/WDDM 游戏配置，也可按需切换 TCC 提高推理速度；无需替换系统 CUDA。
 
@@ -29,10 +29,24 @@
 
 感谢这些项目的工作。代码遵循 [Apache-2.0](LICENSE)，来源说明见 [NOTICE](NOTICE)。第三方组件及模型分别遵循其许可证。
 
+## 本次上游同步
+
+已集成直接上游的 [Volta 优化](https://github.com/tuxKOH/ninfer-V100X2/commit/861633e8) 和
+[测试接口修正](https://github.com/tuxKOH/ninfer-V100X2/commit/756d1363)：包括 W8 词表头的加载时精确排列、
+NVFP4 投影与 INT8 注意力优化，并保留本项目的 Windows 适配、WDDM 通信路线和中文启动器。
+原始模型文件及量化 code/scale 不重新量化。
+
+**0.1.3 本机复测：DFlash7 数数为 189.19 tok/s，旧版为 189.50 tok/s；未测出明显提速，答案逐字节一致。**
+新版算子与平台检查通过；投机解码原有的 1/64 严格校验失败仍存在，保持实验状态。
+
+上游同时带来的 PP2、`--volta-long-attention` 和 Q/K 均值检索 RAM-KV 均为实验选项，
+默认关闭，未加入启动器。PP2 和实验长注意力不支持 DFlash；RAM-KV 属于近似注意力。
+上游 Linux/P2P/QUASAR 成绩不作为本机 Coder390 性能结论；本机测量见[Windows 性能报告](docs/windows-performance.md)。
+
 ## 小白使用：下载、解压、双击
 
 1. 安装适合自己显卡的 NVIDIA 驱动。**本机验证的是 GRID 553.62，WDDM 与 TCC 均完成测速**，不是要求所有机器盲目更换到该版本。
-2. 从 [v0.1.2 Release](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.2-windows-preview) 下载 `NInfer-Windows-V100X2-0.1.2.zip`，完整解压，双击 **`NInfer.exe`**。不要在压缩包内直接运行。
+2. 从 [v0.1.3 Release](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.3-windows-preview) 下载 `NInfer-Windows-V100X2-0.1.3.zip`，完整解压，双击 **`NInfer.exe`**。不要在压缩包内直接运行。
 3. 选择已有的兼容 `.ninfer` 模型；没有模型时点击 **“下载推荐模型”**。模型约 **23.8GB**，需预留至少 25GB 磁盘空间，支持取消后续传及完整性校验。
 4. 选择解码模式及启动选项，点击 **“启动模型”**，等待服务就绪。默认普通解码、思考开启、128K 容量；选择 DFlash 会将草稿数设为 7、并发设为 1，并把超过 96K 的容量降到 96K 建议值。显存不足时降低容量。
 5. 在界面提问，点击 **“发送单轮提问”**。每次问答独立；多轮聊天可使用自己的 OpenAI API 客户端。
@@ -89,9 +103,11 @@
 
 ## 本机实测与限制
 
-**v0.1.2 发布包已包含 WDDM 通信优化、实验 MTP/DFlash 开关和完整启动选项。** 旧 0.1.0 ZIP 不包含这些更新；下面的速度来自同一推理实现的 CLI/API 对照，不是开启思考后的速度保证。
+**v0.1.3 发布包已包含 WDDM 通信优化、实验 MTP/DFlash 开关和完整启动选项。** 旧 0.1.0 ZIP 不包含这些更新；下面的速度来自同一推理实现的 CLI/API 对照，不是开启思考后的速度保证。
 
 ### 推理速度与并发
+
+以下表格保留 **v0.1.2** 的驱动模式基准；本次上游同步后的 DFlash7 对照见[性能报告](docs/windows-performance.md#上游-volta-更新本机复测)。
 
 2026-10-14，Windows 11、两张 V100-SXM2 16GB、GRID 553.62、CUDA 12.8、SM70、TP2、CUDA Graph。
 Coder390 v3 原始权重不重新量化，INT8 group-64 KV，prefill chunk 256，关闭 thinking。
@@ -135,7 +151,7 @@ Windows 11、2× V100-SXM2 16GB、GRID 553.62/WDDM、PCIe 3.0 ×16，**无 P2P�
 | [restore-wddm.cmd](tools/windows/restore-wddm.cmd) | 双击，为两张 V100 请求 WDDM 游戏模式。 |
 | [set-v100-mode.ps1](tools/windows/set-v100-mode.ps1) | 共用实现，自动识别恰好两张 Tesla V100，按查询到的 UUID 操作。 |
 
-v0.1.2 ZIP 的 `tools/` 目录也包含这三个脚本，启动器上的切换按钮调用同一实现。
+v0.1.3 ZIP 的 `tools/` 目录也包含这三个脚本，启动器上的切换按钮调用同一实现。
 
 先退出使用 V100 的游戏和推理程序，再双击相应 `.cmd`，允许 Windows UAC 管理员授权。**确认两卡 Pending 均为目标模式后，保存工作并重启**；重启后 Current 应与 Pending 一致。TCC 下 V100 不能承担游戏图形渲染，RX550 可继续输出画面。脚本不强制切换、不自动重启，也不安装驱动或改动其他型号显卡；驱动拒绝或只完成一张时会报错并显示状态，恢复 WDDM 可使用同一恢复入口。
 

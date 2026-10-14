@@ -266,12 +266,12 @@ void validate_column_rank_semantics(const Tensor& x, const Weight& a_weight,
 void validate_split_pair(std::span<const Tensor> x, const ExecutionContext& ec) {
     detail::require_split_context(
         ec, "gdn_gating_proj column-parallel: requires an ExecutionContext with two or four distinct "
-            "devices", ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp)) {
+            "devices", ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count)) {
         throw std::invalid_argument(
             "gdn_gating_proj column-parallel: argument width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
       if (x[0].ne[1] != x[rank].ne[1]) {
         throw std::invalid_argument(
             "gdn_gating_proj column-parallel: both ranks must carry the same token count");
@@ -347,13 +347,13 @@ void gdn_gating_proj_column_parallel(std::span<const Tensor> x,
         throw std::invalid_argument("gdn_gating_proj column-parallel: argument width mismatch");
     }
     for (std::size_t slot = 0; slot < x.size(); ++slot) {
-        if (a_weight[slot].n != 48 / ec.tp || b_weight[slot].n != 48 / ec.tp) {
+        if (a_weight[slot].n != 48 / ec.device_count || b_weight[slot].n != 48 / ec.device_count) {
             throw std::invalid_argument("GDN control shard does not match TP width");
         }
         validate_column_rank_semantics(x[slot], a_weight[slot], b_weight[slot], A_log[slot],
                                        dt_bias[slot], g[slot], beta[slot]);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, a_weight[slot].payload, g[slot].data,
@@ -379,7 +379,7 @@ void gdn_gating_proj_column_parallel(std::span<const Tensor> x,
         ws.size() != x.size() || g.size() != x.size() || beta.size() != x.size()) {
         throw std::invalid_argument("gdn_gating_proj column-parallel: argument width mismatch");
     }
-    const int heads = 48 / ec.tp;
+    const int heads = 48 / ec.device_count;
     std::array<Weight, kMaximumExecutionDevices> a_weight{};
     std::array<Weight, kMaximumExecutionDevices> b_weight{};
     for (std::size_t slot = 0; slot < x.size(); ++slot) {
@@ -394,7 +394,7 @@ void gdn_gating_proj_column_parallel(std::span<const Tensor> x,
         validate_column_rank_semantics(x[slot], a_weight[slot], b_weight[slot], A_log[slot],
                                        dt_bias[slot], g[slot], beta[slot]);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, ab_weight[slot].payload, g[slot].data,

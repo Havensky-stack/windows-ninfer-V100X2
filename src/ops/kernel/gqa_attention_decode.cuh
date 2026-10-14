@@ -148,13 +148,33 @@ __device__ __forceinline__ int gqa_small_t_default_splits(int window) {
     return splits < Geometry::DecodeSplits ? splits : Geometry::DecodeSplits;
 }
 
+inline constexpr int kGqaVoltaLongKeysPerSplit = 1072;
+
+template <typename Geometry>
+__host__ __device__ inline constexpr int gqa_volta_long_i8_splits(int window, int tokens,
+                                                                bool enabled = false) {
+#ifdef NINFER_VOLTA_BUILD
+    if constexpr (Geometry::QHeads == 12) {
+        if (enabled && window > 65536 && (tokens == 1 || tokens == 5 || tokens == 6)) {
+            // Eight-warp TC attention amortizes staging better over longer KV partitions.
+            const int splits = div_up(window, kGqaVoltaLongKeysPerSplit);
+            return splits < Geometry::DecodeSplits ? splits : Geometry::DecodeSplits;
+        }
+    }
+#endif
+    return 0;
+}
+
 template <typename Geometry, bool Int8>
 __device__ __forceinline__ int gqa_small_t_active_splits(int window, int launch_capacity,
-                                                         int tokens) {
+                                                         int tokens, bool volta_long_attention = false) {
     if (window <= 0) { return launch_capacity; }
     int splits = 0;
     if constexpr (Int8) {
-        if (tokens == 5 && window > 128 && window <= 512) {
+        const int long_splits = gqa_volta_long_i8_splits<Geometry>(window, tokens, volta_long_attention);
+        if (long_splits > 0) {
+            splits = long_splits;
+        } else if (tokens == 5 && window > 128 && window <= 512) {
             splits = div_up(window, 32 / Geometry::DecodeSplitScale);
         } else if (tokens == 6 && window > 128 && window <= 160) {
             splits = div_up(window, 24 / Geometry::DecodeSplitScale);
@@ -197,12 +217,13 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
-template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
+template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
+          int SplitTile = 256 / DChunk>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, __nv_bfloat16* out, bool volta_long_attention = false) {
     static_assert(DChunk > 0 && DChunk <= kGqaHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -239,11 +260,11 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
 
     const int window = last_pos + 1;
     const int active_split_count =
-        gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
+        gqa_small_t_active_splits<Geometry, Int8>(window, split_count, tokens, volta_long_attention);
 
     __shared__ float reduce[256];
     __shared__ float weights[Geometry::DecodeSplits];
-    __shared__ float values[256];
+    __shared__ float values[SplitTile * DChunk];
 
     float local_m = -CUDART_INF_F;
     for (int split = tid; split < active_split_count; split += blockDim.x) {
@@ -293,20 +314,23 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     // ascending order. Weight sharing removes repeated exp/stat loads; staging overlaps
     // the vector reads without changing the FP32 denominator or numerator association.
     static_assert(DChunk >= 32 && 256 % DChunk == 0);
-    constexpr int kSplitTile = 256 / DChunk;
+    constexpr int kSplitTile = SplitTile;
     const int group = tid / DChunk;
     const int local_d = tid % DChunk;
     const int d = d_start + local_d;
     float numerator = 0.0f;
     if (head_l > 0.0f) {
         for (int first = 0; first < active_split_count; first += kSplitTile) {
-            const int split = first + group;
-            float value = 0.0f;
-            if (split < active_split_count && weights[split] >= 0.0f) {
-                value = __bfloat162float(
-                    partial_acc[gqa_partial_acc_index<Geometry>(q_head, d, token, split, tokens)]);
+            for (int item = tid; item < kSplitTile * DChunk; item += blockDim.x) {
+                const int split = first + item / DChunk;
+                const int source_d = d_start + item % DChunk;
+                float value = 0.0f;
+                if (split < active_split_count && weights[split] >= 0.0f) {
+                    value = __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
+                        q_head, source_d, token, split, tokens)]);
+                }
+                values[item] = value;
             }
-            values[tid] = value;
             __syncthreads();
             if (group == 0) {
 #pragma unroll

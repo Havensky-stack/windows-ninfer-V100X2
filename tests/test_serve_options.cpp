@@ -27,11 +27,18 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    const auto pp2 = parse({"ninfer-serve", "model.ninfer", "--pp", "2", "--devices", "1,0",
+                            "--pipeline-chunks", "4"});
+    failures += check(pp2.tp == 1 && pp2.pp == 2 && pp2.pipeline_chunks == 4 &&
+                          pp2.devices == std::vector<int>({1, 0}), "PP2 server geometry mismatch");
     const auto tp4 = parse({"ninfer-serve", "model.ninfer", "--tp", "4", "--devices", "3,1,0,2"});
     failures += check(tp4.tp == 4 && tp4.devices == std::vector<int>({3, 1, 0, 2}),
                       "TP4 server lost the four-rank device order");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--volta-long-attention"}).volta_long_attention &&
+                          !defaults.volta_long_attention,
+                      "server Volta long attention must be explicit and disabled by default");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

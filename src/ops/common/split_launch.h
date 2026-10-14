@@ -63,10 +63,10 @@ private:
 
 inline void require_split_context(const ExecutionContext& ec, const char* message,
                                   int expected_ranks = 2) {
-    if ((ec.tp != 2 && ec.tp != 4) || ec.tp != expected_ranks) {
+    if ((ec.device_count != 2 && ec.device_count != 4) || ec.device_count != expected_ranks) {
         throw std::invalid_argument(message);
     }
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         if (!ec.dev[rank].has_value()) { throw std::invalid_argument(message); }
         for (int other = 0; other < rank; ++other) {
             if (ec.dev[rank]->device == ec.dev[other]->device) {
@@ -114,7 +114,7 @@ inline void require_rank_residency([[maybe_unused]] const ExecutionContext& ec,
 template <class Body>
 void for_each_rank(const ExecutionContext& ec, Body&& body) {
     const CurrentDeviceScope scope;
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         CurrentDeviceScope::set(ec.dev[rank]->device);
         body(rank);
     }

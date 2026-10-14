@@ -284,6 +284,7 @@ struct DFlashPlan {
 };
 
 struct BindingPlan {
+    int pp = 1;
     qwen3_6::FrontendResourcePlan frontend;
     qwen3_6::StartupFeatures features;
     artifact::NumericFormat draft_format = artifact::NumericFormat::Q4G64_F16S;
@@ -316,7 +317,7 @@ struct ArtifactLoadPlan {
 // arena size), and at tp > 1 a shard resolver derived from `shard_mapping_for` is installed on the
 // binder so each device's arena receives only its own rows/columns.
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_profile,
-                               qwen3_6::StartupFeatures features, int tp = 1);
+                               qwen3_6::StartupFeatures features, int tp = 1, int pp = 1);
 
 struct DensePostMixerPayload {
     Weight gate_up;
@@ -397,7 +398,7 @@ public:
     // model -- every sharded extent in the view is already divided by tp.
     [[nodiscard]] const RuntimeModelView& view(int rank) const {
         if (rank == 0) { return runtime; }
-        if (rank > 0 && rank < tp && runtime_peers[rank - 1].has_value()) {
+        if (rank > 0 && rank < tp * pp && runtime_peers[rank - 1].has_value()) {
             return *runtime_peers[rank - 1];
         }
         throw std::out_of_range("qwen3_6_27b model view rank is out of range");
@@ -406,6 +407,7 @@ public:
     artifact::MaterializedArtifact backing;
     qwen3_6::FrontendResources frontend;
     int tp = 1;
+    int pp = 1;
     RuntimeModelView runtime;
     std::array<std::optional<RuntimeModelView>, 3> runtime_peers;
 

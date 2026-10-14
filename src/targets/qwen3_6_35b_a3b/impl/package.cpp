@@ -74,6 +74,7 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
                                      WeightsProfile weights_profile) {
+    if (options.pp != 1) { throw std::invalid_argument("35B-A3B does not support pipeline execution"); }
     const bool expert_storage = binder.device_count() == 2 && options.tp == 1;
     if (binder.device_count() != 1 && !expert_storage) {
         throw std::invalid_argument("qwen3_6_35b_a3b accepts either one device or expert storage mode");
@@ -115,7 +116,7 @@ std::unique_ptr<Package::Program>
 Package::create_program(const LoadedModel& model, SequencePlan&& plan,
                         ExecutionContext& execution) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
-    if (execution.tp != 1) {
+    if (execution.device_count != 1) {
         throw std::invalid_argument("qwen3_6_35b_a3b has no tensor-parallel execution path");
     }
     return qwen3_6::create_program<detail::Variant>(model.impl_->data.runtime, {},

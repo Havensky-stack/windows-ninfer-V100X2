@@ -8,7 +8,15 @@
 
 namespace v100x2_test {
 
+inline int pp() {
+    const char* pipeline = std::getenv("NINFER_TEST_PP");
+    if (!pipeline || std::strcmp(pipeline, "1") == 0) { return 1; }
+    if (std::strcmp(pipeline, "2") == 0) { return 2; }
+    throw std::runtime_error("NINFER_TEST_PP must be 1 or 2");
+}
+
 inline int tp() {
+    if (pp() == 2) { return 1; }
     const char* width=std::getenv("NINFER_TEST_TP");
     if(!width || std::strcmp(width,"2")==0) {return 2;}
     if(std::strcmp(width,"4")==0) {return 4;}
@@ -17,7 +25,7 @@ inline int tp() {
 
 inline std::vector<int> devices() {
     std::vector<int> result;
-    for(int rank=0;rank<tp();++rank) {result.push_back(rank);}
+    for(int rank=0;rank<tp()*pp();++rank) {result.push_back(rank);}
     return result;
 }
 
@@ -53,7 +61,7 @@ inline ninfer::SpeculativeOptions profile(ninfer::ProposalHead default_mtp_head)
 
 inline void check_identity(const ninfer::Engine& engine) {
     const auto summary = engine.load_summary();
-    if (summary.tp != tp() || summary.model_id != "qwen3.8-27b" ||
+    if (summary.tp != tp() || summary.pp != pp() || summary.model_id != "qwen3.8-27b" ||
         (summary.weights_id != "gguf-q4-k-m" && summary.weights_id != "nvfp4" &&
          summary.weights_id != "quasar-nvfp4" &&
          summary.weights_id != "fp8")) {
@@ -64,7 +72,7 @@ inline void check_identity(const ninfer::Engine& engine) {
 // The published peer-egress diagnostic belongs to the MTP transaction. DFlash
 // is instead covered by exact graph/eager commits and prefix-state replay.
 inline void check_peer_egress(ninfer::Engine& engine, ninfer::SpeculativeBackend backend) {
-    if (backend == ninfer::SpeculativeBackend::Mtp) {
+    if (pp() == 1 && backend == ninfer::SpeculativeBackend::Mtp) {
         const auto [rounds, mismatches] = engine.debug_peer_egress_check_counts();
         if (rounds == 0 || mismatches != 0) {
             throw std::runtime_error("parallel ranks disagree on speculative egress");

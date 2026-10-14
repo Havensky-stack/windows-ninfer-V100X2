@@ -46,6 +46,11 @@ endif()
 option(NINFER_BUILD_APPS "Build the NInfer CLI and server" ON)
 option(BUILD_TESTING "Build NInfer tests" OFF)
 option(NINFER_BUILD_BENCHMARKS "Build NInfer benchmarks" OFF)
+# CUDA device selection is a runtime concern. When set, CTest injects this value as
+# CUDA_VISIBLE_DEVICES so tests using logical devices 0/1 can run on a selected pair on
+# multi-GPU hosts without changing the product's device numbering or compile target.
+set(NINFER_TEST_CUDA_VISIBLE_DEVICES "" CACHE STRING
+  "CUDA_VISIBLE_DEVICES value injected into CTest (for example 4,6)")
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

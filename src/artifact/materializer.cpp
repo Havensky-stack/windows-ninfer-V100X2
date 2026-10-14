@@ -583,7 +583,7 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
                                  ExecutionContext& execution, LoadProgress* progress) {
     std::array<DeviceContext*, kMaximumDevices> devices{};
     std::size_t count = 0;
-    for (int rank = 0; rank < execution.tp; ++rank) {
+    for (int rank = 0; rank < execution.device_count; ++rank) {
         if (count >= kMaximumDevices) {
             throw ArtifactError("artifact materialization supports at most two execution devices");
         }

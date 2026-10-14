@@ -31,7 +31,7 @@ double represented(std::uint16_t word) {
     return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16);
 }
 void synchronize(const ExecutionContext& ec) {
-    for (int r = 0; r < ec.tp; ++r) {
+    for (int r = 0; r < ec.device_count; ++r) {
         CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
         ec.dev[r]->synchronize();
     }

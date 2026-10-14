@@ -14,13 +14,18 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
         if (!executable->ready()) {
             throw std::logic_error("decode graph was not prepared at load time");
         }
-        for (const TpPeerCore& peer : state.execution.peers) {
+        for (const PeerCore& peer : state.execution.peers) {
             if (peer.graph_bridge == nullptr) {
                 throw std::logic_error("tensor-parallel graph launch requires a peer bridge");
             }
             // See DecodeGraphPeerBridge::gate_launch: the eager path issues rank 1's kernels on
             // rank 1's own stream and is therefore automatically ordered after the round's
             // mirrored KV page materialization; a graph launched on rank 0's stream is not.
+            peer.graph_bridge->gate_launch(peer.device->stream, state.execution.device.stream);
+        }
+        if (state.execution.pipeline != nullptr) {
+            const PeerCore& peer = *state.execution.pipeline;
+            if (peer.graph_bridge == nullptr) { throw std::logic_error("PP graph requires a peer bridge"); }
             peer.graph_bridge->gate_launch(peer.device->stream, state.execution.device.stream);
         }
         executable->launch(state.execution.device.stream);
@@ -43,21 +48,27 @@ void run_prepared(Context& state, DecodeGraphExecutable* executable, Body&& body
 template <class Context, class Body>
 void capture_graph(Context& state, DecodeGraphDefinition& definition, Body&& body) {
     state.execution.work.reset();
-    if (state.execution.peers.empty()) {
+    if (state.execution.peers.empty() && state.execution.pipeline == nullptr) {
         definition.capture(state.execution.device.stream, body);
         return;
     }
     std::array<DecodeGraphPeerCapture, kMaximumExecutionDevices - 1> captures{};
     for (std::size_t index = 0; index < state.execution.peers.size(); ++index) {
-        const TpPeerCore& peer = state.execution.peers[index];
+        const PeerCore& peer = state.execution.peers[index];
         if (peer.graph_bridge == nullptr) {
             throw std::logic_error("tensor-parallel graph capture requires every peer bridge");
         }
         peer.work->reset();
         captures[index] = {peer.graph_bridge, peer.device->stream};
     }
-    definition.capture(state.execution.device.stream, body,
-                       std::span(captures).first(state.execution.peers.size()));
+    std::size_t count = state.execution.peers.size();
+    if (state.execution.pipeline != nullptr) {
+        const PeerCore& peer = *state.execution.pipeline;
+        if (peer.graph_bridge == nullptr) { throw std::logic_error("PP graph requires a peer bridge"); }
+        peer.work->reset();
+        captures[count++] = {peer.graph_bridge, peer.device->stream};
+    }
+    definition.capture(state.execution.device.stream, body, std::span(captures).first(count));
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

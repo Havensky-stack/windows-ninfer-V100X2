@@ -1,4 +1,5 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
+#include "core/device.h"
 
 #include <limits>
 #include <stdexcept>
@@ -45,7 +46,7 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
         }
     }
-    return PagedKVCacheLayout{
+    PagedKVCacheLayout layout{
         .pool        = plan_paged_kv_pool(builder, pool_spec),
         .layers      = layers,
         .max_context = capacity,
@@ -54,6 +55,19 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .dtype       = dtype,
         .quant_group = quant_group,
     };
+    if (ram_kv) {
+        layout.retrieval_keys = builder.add_tensor(DType::FP32,
+            {head_dim, kv_heads, static_cast<int>(logical_pages), static_cast<int>(layers)}, 256, "retrieval K");
+        layout.retrieval_query = builder.add_tensor(DType::FP32,
+            {head_dim, kv_heads, static_cast<int>(layers)}, 256, "retrieval Q");
+        layout.retrieval_fallback = builder.add_tensor(DType::FP32,
+            {head_dim, kv_heads, static_cast<int>(layers)}, 256, "retrieval fallback Q");
+        layout.retrieval_counts = builder.add_tensor(DType::I32, {static_cast<int>(layers)}, 256, "retrieval counts");
+        layout.retrieval_span = builder.add_tensor(DType::I32, {2}, 256, "retrieval span");
+        layout.retrieval_scores = builder.add_tensor(DType::FP32,
+            {static_cast<int>((logical_pages + 1) / 2)}, 256, "retrieval scores");
+    }
+    return layout;
 }
 
 } // namespace
@@ -75,7 +89,19 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
 PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
       kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
-      quant_group_(layout.quant_group) {}
+      quant_group_(layout.quant_group) {
+    if (layout.pool.spec.ram_enabled) {
+        retrieval_keys = layout.retrieval_keys.bind(backing);
+        retrieval_query = layout.retrieval_query.bind(backing);
+        retrieval_fallback = layout.retrieval_fallback.bind(backing);
+        retrieval_counts = layout.retrieval_counts.bind(backing);
+        retrieval_span = layout.retrieval_span.bind(backing);
+        retrieval_scores = layout.retrieval_scores.bind(backing);
+        CUDA_CHECK(cudaMemset(retrieval_counts.data, 0, retrieval_counts.bytes()));
+        CUDA_CHECK(cudaMemset(retrieval_query.data, 0, retrieval_query.bytes()));
+        CUDA_CHECK(cudaMemset(retrieval_fallback.data, 0, retrieval_fallback.bytes()));
+    }
+}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
     : cache_(&cache), block_table_(block_table) {}

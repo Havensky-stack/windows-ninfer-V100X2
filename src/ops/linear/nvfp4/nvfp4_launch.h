@@ -20,6 +20,13 @@ void launch_nvfp4_small_t(const Tensor& x, const Weight& weight, Tensor& out, cu
 inline constexpr std::int32_t kNvfp4VoltaQpnRowsPerTile = 8;
 inline constexpr std::int32_t kNvfp4VoltaQpnMaxTokens   = 32;
 void launch_nvfp4_volta_qpn(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_nvfp4_volta_qpn_precast(const Tensor&, const Weight&, Tensor&, WorkspaceArena&,
+                                    cudaStream_t);
+void nvfp4_volta_qpn_cast_activation(const Tensor&, Tensor&, cudaStream_t);
+[[nodiscard]] bool nvfp4_volta_qpn_precast_supported(std::int32_t n, std::int32_t k,
+                                                    std::int32_t tokens) noexcept;
+[[nodiscard]] std::size_t nvfp4_volta_qpn_precast_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                                 std::int32_t max_tokens);
 [[nodiscard]] bool nvfp4_volta_qpn_supported(std::int32_t n, std::int32_t k,
                                              std::int32_t t) noexcept;
 

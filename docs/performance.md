@@ -7,7 +7,7 @@ Windows/GRID measurements and the local dual-V100 latency diagnosis are document
 
 ### Separate NVLink deployment: TP2 stage
 
-The [NVLink deployment table](../README.md#nvlink-deployment-tp2-stage) is measured on
+The [NVLink deployment table](https://github.com/tuxKOH/ninfer-V100X2/blob/756d136377499c47f0938494461ec71a697f5f08/README.md#nvlink-deployment-tp2-stage) is measured on
 2026-10-02 on a different four-V100-SXM2-16GB host, all-pairwise NV2, 300 W per card,
 driver 580.178.04 / CUDA 12.8 / SM70. NInfer uses only devices 0,1 at TP2; devices 2,3
 are idle. A verified direct NVLink mesh bypasses the PCIe-only translated-IOMMU guard,
@@ -75,7 +75,7 @@ native block-scaled FP8 decoder.
 ### Separate NVLink deployment: NInfer TP4
 
 Measured on 2026-10-03 on the same four-V100/NV2 host, all devices 0,1,2,3 active. The
-[TP4 occupancy table](../README.md#nvlink-deployment-ninfer-tp4) uses the same saved final-task
+[TP4 occupancy table](https://github.com/tuxKOH/ninfer-V100X2/blob/756d136377499c47f0938494461ec71a697f5f08/README.md#nvlink-deployment-ninfer-tp4) uses the same saved final-task
 inputs as the earlier TP2 snapshot: official Qwen3.8 NVFP4 v3, 180000 capacity (180032
 allocated), INT8 group-64 KV, chunk 2560, greedy optimized MTP3, CUDA Graphs and two cold
 requests per point. One prefill output plus 512 committed timed decode outputs; no prefix
@@ -168,7 +168,7 @@ preserve their final task and assistant suffix, but their source bodies and acce
 differ; this is not a single-variable causal experiment in prompt length. Fixed output windows
 are not scored as complete code solutions.
 
-The separate [capacity sweep](../README.md#nvfp4-v3-capacity-sweep-fixed-512-token-input) holds
+The separate [capacity sweep](https://github.com/tuxKOH/ninfer-V100X2/blob/756d136377499c47f0938494461ec71a697f5f08/README.md#nvfp4-v3-capacity-sweep-fixed-512-token-input) holds
 occupancy at 512 tokens and uses 256 timed decode tokens, chunk 1024, one discarded warmup
 and three measured requests at each of 1024/2048/4096/8192/16384/32768/65536 capacities.
 It measured 105.96–106.12 wall decode tok/s, 1438.44–1443.78 prefill tok/s and 70.04% acceptance.
@@ -380,6 +380,149 @@ reproduce all output IDs and speculative counters. Before/after short-input traj
 first differ at output position 270; numerical qualification does not prove unchanged
 end-to-end quality. No BF16 quality score or full-180K/256K occupied-context result is claimed.
 Reports: `profiles/bench/quasar-qpn-projections/{before-mtp3,after-mtp3,after-85k-mtp3-warm}.json`.
+
+#### QUASAR v3: final long-context decode evaluation
+
+Measured on 2026-10-13 on two V100-SXM2-16GB cards, CUDA 12.8 / SM70, qualified
+PCIe P2P without NVLink. The artifact is `qwen3.8-27b/quasar-nvfp4`; the code input
+is the saved `profiles/bench/v100-code-85000-iommu-pt.ids`. Both routes use 85000
+actual input tokens, 180000 capacity (180032 allocated), complete INT8 group-64 KV,
+chunk 2560, greedy optimized-head MTP4 and CUDA Graphs. Each has two measured cold
+requests, no prefix reuse or extra request warmup, one prefill output and 512 timed
+committed decode outputs. Loading and graph priming are outside request timing.
+Rates are mean ± sample SD; wall decode is `512 / (total_seconds - first_token_seconds)`.
+
+| Route | Prefill tok/s | Committed wall decode tok/s | MTP acceptance |
+|---|---:|---:|---:|
+| Default complete-history MTP4 | 1313.37 ± 3.89 | 126.894 ± 0.028 | 79.02% |
+| `--volta-long-attention` / MTP4 | 1307.41 ± 2.96 | 143.459 ± 0.013 | 76.74% |
+
+| Route | Prepare, s | Prefill, s | First token, s | Decode phase, s | Total request, s |
+|---|---:|---:|---:|---:|---:|
+| Default | 0.001544 | 64.719 | 64.721 | 4.031 | 68.756 |
+| Experimental attention | 0.001593 | 65.014 | 65.016 | 3.566 | 68.585 |
+
+Prepare uses saved IDs, not raw-text tokenizer latency. First-token time includes
+prefill; the phase columns are not all additive. Experimental attention improves
+decode 13.05% in this pair; prefill variation leaves total request time almost equal.
+Both routes repeat all 513 output IDs and speculative counters and match their own
+previously qualified controls. Their trajectories differ across profiles. The
+requested 150 tok/s was not reached; the user accepted this result and ended that goal.
+
+The retained default optimizations share QK/softmax work across dimension warps,
+decode packed INT8 KV cooperatively, stage split-output reduction while retaining
+its ascending FP32 association, and precast selected narrow NVFP4 activations.
+Paired gate/up warp groups retain FP32 SiLU/product before one BF16 rounding.
+The W8 vocabulary head has an exact load-time code/scale permutation, without
+requantization or a second resident copy. Its narrow consumers, the W8 MTP
+projections and the Q4 proposal head use measured unroll/direct-read paths.
+Single-query attention uses eight-row Volta QPN tiles with the default eight-key
+softmax and FP16 contribution rounding; five-query attention removes the shared
+QK-score handoff while retaining its accumulation associations.
+
+These routes have independent FP64 decoded-weight projection/attention oracles,
+exact layout/codec checks, cache/guard checks and CUDA Graph replay evidence.
+Twenty-five teacher-forced 85K vocabulary checkpoints of the default attention
+changes equal the saved reference exactly. Real-model default and experimental
+MTP4 gates separately check 64 graph/eager commits, acceptance counters, partial
+commit/fallback and peer egress. Exactness is established for the represented
+comparisons, not universal source-model quality.
+
+The optional `--volta-long-attention` flag is startup-fixed and defaults off.
+It supports SM70 27B TP2/PP1, one Text/None/MTP request and complete INT8 KV;
+Vision, RAM-KV and DFlash are excluded. Above 16390 keys it selects FP32 PV
+accumulation for one/five/six-query paths. One/six-query kernels use eight-row
+QPN tiles and 32-key online-softmax updates; five-query verification combines
+sixteen keys per update. Above 65536 keys those widths target about 1072
+keys per split, reducing staging and final-reduction overhead. At 85K the
+default has about 355 splits, versus 80 in the experimental profile. Every
+causally visible historical KV entry remains included. Wide prefill is unchanged.
+
+Full 85K attention passes the independent FP64 relative-L2 criterion of 0.00315,
+with exact packed cache bytes and graph/eager boundary checks. However, the
+experimental MTP4 profile fails the separate near-lossless full-vocabulary gate:
+25/25 argmax matches, minimum cosine 0.998905, maximum KL 0.007842 nats, against
+bounds of cosine ≥0.9999 and KL ≤0.005. More FP32 accumulation and changed
+partition/softmax association do not imply bit identity or task-level equivalence.
+This is why the profile remains opt-in.
+
+Final local reports are `profiles/bench/quasar-150-tp2/final-20261013-mtp4-{default,long}.json`.
+Reproduce either route with the public benchmark; add `--volta-long-attention`
+for the experimental row:
+
+```bash
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64" \
+  build-v100-tp4/bench/ninfer_bench \
+  --weights /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --tp 2 --devices 0,1 --max-ctx 180000 --kv-dtype int8 --prefill-chunk 2560 \
+  --spec mtp --draft-tokens 4 --lm-head-draft \
+  --corpus profiles/bench/v100-code-85000-iommu-pt.ids \
+  -pg 85000,512 --warmup 0 -r 2 --capture-generation -o json \
+  --output-file profiles/bench/quasar-final-default.json
+```
+
+##### Local GPQA-Diamond comparison: 104 paired questions
+
+This is an **85K unrelated-code occupancy variant**, not standard short-context
+GPQA-Diamond. A frozen data-independent shuffled order and identical question/
+answer-choice prompts are shared by all four routes. Each input occupies 85000
+tokens; capacity is 131072, output budget 32768, chunk 2560, greedy MTP4,
+`reasoning_effort=xhigh`, complete INT8 KV and no prefix reuse. Embedded frontend
+resources match across artifacts. Scoring uses the final `ANSWER: A/B/C/D`;
+missing or truncated answers count as incorrect in the full score.
+
+| Local artifact / profile | Correct / 104 | Accuracy | Output-budget truncations |
+|---|---:|---:|---:|
+| QUASAR, default attention | 88 | 84.62% | 11 |
+| QUASAR, experimental attention | 90 | 86.54% | 8 |
+| Official NVFP4 | 90 | 86.54% | 5 |
+| GGUF-derived Q4_K_M | 87 | 83.65% | 5 |
+
+Default → experimental has two losses and four gains, +1.92 percentage points;
+paired McNemar exact two-sided p=0.6875. There is no detected accuracy decrease
+in this sample, but no statistical noninferiority or universal quality-equivalence
+claim follows. Truncation affects the score; no BF16/FP8 local reference was run.
+The user accepted this comparison and stopped at 104 common questions. The
+remaining 94 questions were not run; this is not a completed 198-question score.
+
+Runner: `tools/v100/bench_gpqa.py` and the public-Engine `ninfer_v100_gpqa` target.
+Saved local results: `profiles/bench/gpqa-85k-matrix/{default,long,nvfp4,q4,summary}.json`.
+The summary preserves `complete=false`.
+
+##### Original short JSONL DFlash7 retest
+
+The 2026-10-13 retest uses the original **32-record arithmetic JSONL generation**
+case that measured 249.00 tok/s, not the demo-page JSON→JSONL conversion prompt.
+Input is 118 tokens; capacity 98304, chunk 1024, complete INT8 group-64 KV,
+greedy full-head DFlash7, CUDA Graphs, no prefix reuse and model-default stopping.
+One full warmup precedes two measured requests.
+
+| Measurement | Prefill tok/s | Committed wall decode tok/s | Acceptance |
+|---|---:|---:|---:|
+| Original 2026-10-03 | 564.22 ± 0.33 | 249.00 ± 0.08 | 99.05% |
+| Final 2026-10-13 | 580.95 ± 0.01 | 255.31 ± 0.11 | 99.05% |
+
+Each final answer publishes 1190 tokens, with 1189 timed after the first, and
+stops naturally. All 32 record values, arithmetic and field order pass exact
+checks. All output IDs and speculative counters equal the original measurement.
+Committed throughput is 2.53% higher; **300 tok/s was not reached**. This is
+high-acceptance structured generation, not a general code/prose speed claim.
+The experimental attention flag is off and unsupported for DFlash.
+Report: `profiles/bench/quasar-150-tp2/final-20261013-jsonl-native-dflash7.json`;
+reproduce with `ninfer_v100_task_bench`, task `structured_jsonl`, occupancy `native`
+and the existing `profiles/bench/other_inputs_20261001/cases.json`.
+Detailed health logs accompany all three final cases: no reset, zero volatile
+uncorrected ECC, maximum observed GPU temperature 64°C and host CPU use below 37%.
+This short run does not establish long-duration hardware stability.
+
+Release checks rebuild the CLI, server and affected benchmarks; artifact, CLI/server
+option and report-contract tests pass. GPQA scoring tests and schema-v15 matrix
+consumption pass, including both saved final reports. Current 85K MTP4 graph/eager
+state checks pass with identical commit IDs/counters and zero peer-egress mismatches.
+A broader public FP64 attention rerun was stopped by its wrapper's 560-second
+timeout while computing the six-query reference, without a numerical failure being
+reported; no completed verdict is claimed for that rerun. The affected five-query
+operator and full-vocabulary comparisons above retain their completed evidence.
 
 #### QUASAR v3: stop-aware task matrix
 
@@ -751,6 +894,119 @@ story/translation; their first differences are at total output tokens 20/692, 24
 not strict same-output speedups. No claim of universally token-identical or quality-loss-free
 DFlash behavior follows from this sweep.
 
+#### Native RAM-KV: larger windows and short inputs
+
+Measured on the local two V100-SXM2-16GB cards, CUDA 12.8 / SM70, PCIe P2P without NVLink,
+using `qwen3.8-27b/quasar-nvfp4`, INT8 group-64 KV, optimized-head greedy MTP3 and a 1024-token
+prefill chunk. RAM-KV is approximate Q/K mean-vector retrieval, including during long prefill;
+the ordinary route retains the complete history.
+
+The matched long code fixture occupies 261556 input tokens at 262144 capacity and generates
+512 committed output tokens. Each row is one cold request. The output-window check counts
+literal credential strings, not complete code correctness; retrieval counts are selected
+fact pages at the measured frontier, not a general quality score.
+
+| GPU history window | Prefill tok/s | Committed decode tok/s | Fact pages resident | Credential strings in output |
+|---|---:|---:|---:|---:|
+| Complete history | 759.95 | 55.33 | 15/15 | 6/6 |
+| 98304 (96K) | 903.29 | 80.71 | 13/15 | 5/6 |
+| 163840 (160K) | 745.46 | 63.25 | 14/15 | 5/6 |
+| 196608 (192K) | 742.62 | 55.79 | 15/15 | 6/6 |
+
+The 192K row raises the RAM archive ceiling to 64000000000 bytes. Its planned packed archive
+is only 9412018176 bytes; the whole-process cgroup remains capped at 32000000000 bytes,
+with swap disabled and a measured memory peak of 7079198720 bytes. Raising the archive ceiling
+does not increase retrieved history: `--ram-kv-window` controls that and consumes GPU memory
+and attention work. The 192K window improves these narrow recall checks, but loses almost
+all measured decode benefit over complete history. These results do not establish general
+quality equivalence.
+
+The short-input sweep fixes 180000 capacity, a 163840-token RAM-KV window, the same saved
+code input IDs for each paired row and 256 timed committed decode tokens plus one prefill
+output. Each route has one cold request per row; loading, graph priming and three-minute
+cooldowns are excluded.
+
+| Actual input tokens | Complete prefill tok/s | RAM-KV prefill tok/s | Complete decode tok/s | RAM-KV decode tok/s |
+|---:|---:|---:|---:|---:|
+| 512 | 1425.75 | 1367.38 | 130.70 | 123.24 |
+| 3072 | 1650.62 | 1589.31 | 134.03 | 125.60 |
+| 8192 | 1632.64 | 1572.99 | 125.42 | 117.37 |
+| 16384 | 1582.70 | 1523.91 | 132.87 | 124.84 |
+| 32768 | 1490.49 | 1426.89 | 120.74 | 113.71 |
+| 65536 | 1320.83 | 1270.56 | 99.68 | 93.61 |
+| 85000 | 1232.81 | 1183.35 | 99.61 | 93.75 |
+
+All seven pairs reproduce the same 257 output IDs and complete MTP counters, with zero
+RAM-KV transfer bytes. These inputs never fill the window, so no history is evicted;
+index/page-table maintenance still costs about 6% decode throughput. Use complete KV for
+these short inputs. This identity-window parity is not evidence for quality at a sparse
+long-context window. These saved sweeps precede the later paired gate/up optimization;
+their rates must not be substituted for that route's 85K results above.
+
+Local reports: `profiles/bench/kvmem-native-qk/256k-{full,w96k,w160k}-tp2/report.json`,
+`256k-w192k-ram64g-tp2/report.json`, and the `short-{full,w160k}-tp2/` reports in the same
+directory. See the [native RAM-KV contract](maintainer/paged-kv-cache.md#15-optional-native-ram-kv-experiment)
+for the approximate semantics and separate archive/process budgets.
+
+#### Experimental PP2 layer pipeline
+
+Measured on 2026-10-07 on the local two V100-SXM2-16GB cards, CUDA 12.8 / SM70,
+PCIe 3.0 x16 PHB, qualified PCIe P2P and no NVLink. The artifact is
+`qwen3.8-27b/quasar-nvfp4`, at
+`/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer`. This is a startup-fixed
+alternative to TP2, not an automatic long-input switch or PP-prefill/TP-decode hybrid.
+
+`--tp 1 --pp 2 --devices 0,1` places layers 0..31 on device 1 and layers 32..63,
+final norm, output head and MTP on device 0. Each stage retains complete head/channel
+geometry and owns its half of the text KV/GDN layers. `--pipeline-chunks 8` submits
+up to eight chronological 1024-token chunks per wave. Source retirement waits only
+for the residual copy, permitting the next first-stage chunk to proceed during the
+previous second-stage chunk. `--pipeline-chunks 1` is the serialized control.
+Decode, including MTP target verification, traverses both stages serially.
+
+The matched sweep fixes capacity at 180000 (180032 allocated), complete INT8 group-64
+KV, greedy sampling, CUDA Graphs and a 1024-token prefill chunk. None and optimized
+MTP3 each run 512/3072/8192/16384/32768/65536/85000 actual input tokens. All three
+layouts use the same saved code-task IDs at each occupancy, with two cold requests,
+no prefix reuse or extra request warmup, one prefill output and 256 committed timed
+decode outputs. Loading and graph priming are excluded. Active batches have at most
+480 seconds before a three-minute cooldown, with an early rest when the next case
+would exceed that window; cooldowns are excluded from request measurements.
+
+The PP2 real-model gate checks exact graph/eager commits and sampled routing; all
+64 teacher-forced positions agree with the ordinary argmax, with zero emitted-logit
+deficit. The prefix gate passes repeated restore, append, checkpoint, partial-stop
+and exact-frontier state controls. One cached/cold continuation diverges at output
+position 4 with a 0.125 logit deficit; cold re-prefill is not bit-identical. The
+24-layer, 48-value-head GDN replay geometry passes its independent recurrent-state
+oracle. These checks do not establish source-checkpoint task accuracy or universal
+TP2/PP2 token parity. In the occupancy sweep the two layouts can produce different
+output IDs and MTP acceptance rates, so cross-layout results are descriptive, not
+strict same-output or quality-equivalence claims.
+
+PP2 supports one Text request, None/MTP and prefix reuse on SM70 Qwen3.8 NVFP4/QUASAR.
+Vision, DFlash, expert storage and concurrent requests are rejected. Optional Q/K RAM-KV is
+admitted. TP2 remains recommended for decode; PP2 cannot switch back to TP2 at the prefill boundary.
+
+Reproduce the saved-input sweep with the selected Python 3.11 environment:
+
+```bash
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64" \
+  .venv/bin/python tools/v100/bench_pipeline.py \
+  --weights /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --bench build-v100-tp4/bench/ninfer_bench \
+  --output-dir profiles/bench/pipeline/complete --corpus-dir profiles/bench \
+  --backends tp2 pp2-serial pp2 \
+  --prompts 512 3072 8192 16384 32768 65536 85000 --drafts 0 3 \
+  --capacity 180000 --prefill-chunk 1024 --output-tokens 256 \
+  --repetitions 2 --active-seconds 480 --cooldown 180
+```
+
+The script saves individual commands/reports, request phases, per-card memory, repetition
+checks and PP2 wave/serial equivalence under `profiles/bench/pipeline/complete/`.
+Completed cases are reused only if the saved command matches. Raw reports and corpora
+are local measurement prerequisites, not committed assets.
+
 #### Reproduction on the current host
 
 Use the existing artifact and saved corpus; if regenerating a corpus, keep the final task and
@@ -878,7 +1134,7 @@ truncated at the output limit and is not scored as a complete solution. The 3,07
 1,502,358,016 bytes of workspace per GPU; a 4,096-token chunk does not fit alongside the same
 180K capacity on this host. The retained local report is
 `profiles/bench/nvfp4_85k_fp32_swiglu.json`; the
-[P2P-disabled README area](../README.md#p2p-disabled) summarizes these earlier results.
+[P2P-disabled README area](https://github.com/tuxKOH/ninfer-V100X2/blob/756d136377499c47f0938494461ec71a697f5f08/README.md#p2p-disabled) summarizes these earlier results.
 Current reproduction commands are above.
 
 The earlier 72.28, 75.53 and 78.90 tok/s figures preceded the wide SwiGLU correction. Those paths
@@ -1026,7 +1282,7 @@ do not relabel the retained staging attribution as a measurement of the current 
   approximate attention policy, not a transparent full-180K KV spill: it changes which history
   participates in attention. The default V100X2 route keeps complete-context semantics. The
   [optional native RAM-KV experiment](maintainer/paged-kv-cache.md#15-optional-native-ram-kv-experiment)
-  instead uses explicitly selected lexical retrieval; it is not the KVMem Q/K-vector algorithm.
+  instead uses Q/K mean-vector retrieval adapted to NInfer's paged cache. It remains approximate.
 
 #### Historical pre-v3 DFlash2 route
 
@@ -1081,10 +1337,10 @@ all-reduce and **53.18 tok/s** on one 85K decode run (89/114 drafts accepted). T
 removed after whole-prefill profiling showed higher aggregate transfer time than the single UVA D2D
 node; its numbers are historical and are not attributed to the active route.
 
-A pipeline-parallel 32/32 layer split would replace per-layer collectives with a layer-boundary
-transfer, but that is a runtime/state/KV/CUDA-Graph architecture change, not a kernel tweak, and
-is outside the current TP2 contract. It is not the only possible way to improve software throughput;
-the measured P2P configuration improves the existing schedule without changing its mathematics.
+The later [PP2 experiment](#experimental-pp2-layer-pipeline) implements a startup-fixed 32/32
+layer split for SM70 Qwen3.8 NVFP4/QUASAR. It replaces per-layer TP collectives with a
+layer-boundary transfer, but decode must visit both stages serially. It is distinct from
+this historical TP2 transport evaluation and does not replace the default TP2 route.
 
 The active port uses two Tesla V100-SXM2 16 GB cards, CUDA 12.8 (`sm_70`), and the local
 `qwen3.8-27b/gguf-q4-k-m` artifact converted from LM Studio's Qwen3.8-27B Q4_K_M GGUF.

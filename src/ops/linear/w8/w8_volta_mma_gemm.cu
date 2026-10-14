@@ -30,10 +30,17 @@ void launch_w8_volta_mma(const Tensor& x, const Weight& w, Tensor& out, cudaStre
 
     const dim3 grid(static_cast<unsigned>((n + S::kRowsPerCta - 1) / S::kRowsPerCta),
                     static_cast<unsigned>((t + S::kTTile - 1) / S::kTTile));
-    w8_volta_mma_gemm_kernel<<<grid, S::kThreads, 0, stream>>>(
-        static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data), n, k, t,
-        padded_groups, out_ld);
+    const auto launch = [&]<bool Prepacked>() {
+        w8_volta_mma_gemm_kernel<Prepacked><<<grid, S::kThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const std::uint8_t*>(w.scales),
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<__nv_bfloat16*>(out.data), n, k, t,
+            padded_groups, out_ld);
+    };
+    if (w.layout == QuantLayout::VoltaQpnPrepacked) {
+        launch.template operator()<true>();
+    } else {
+        launch.template operator()<false>();
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

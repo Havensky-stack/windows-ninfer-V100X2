@@ -127,13 +127,11 @@ struct RewriteCheckpoint {
 struct SequenceKVBundle {
     PagedKVAllocation text;
     std::optional<PagedKVAllocation> backend;
-    // Rank 1's allocation in ITS OWN text KV pool at tp == 2. The two pools have identical page
-    // geometry (only the per-page byte count differs, because rank 1 holds 2 of the 4 KV heads),
-    // and every pool operation below is issued on both in the same order, so the two allocations
-    // hold the same page ids and publish identical block tables.
+    // Each peer owns its text KV pool: TP splits heads; PP splits layers. Lockstep pool
+    // operations preserve matching page identifiers and block tables across compute devices.
     std::array<std::optional<PagedKVAllocation>, kMaximumExecutionDevices - 1> text_peers;
-    // Rank 1's allocation in ITS OWN MTP (backend) KV pool at tp == 2. Same lockstep argument as
-    // `text_peer`: identical page geometry, every pool operation issued on both in the same order.
+    // Peer backend allocations use the same lockstep page ownership. In PP2 the peer's
+    // symmetric MTP reservation is unused by computation.
     std::array<std::optional<PagedKVAllocation>, kMaximumExecutionDevices - 1> backend_peers;
 };
 
@@ -179,6 +177,8 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RewriteCheckpoint rewrite_checkpoint;
+    TokenSpan ram_query;
+    std::uint32_t ram_rank_frontier = 0;
 };
 
 // Request/round control is not retained with a reusable SequenceState. A later concurrent Engine
@@ -292,13 +292,17 @@ public:
     const LoadedModelData& model;
     ExecutionContext& execution;
     DeviceContext& device;
-    const int tp;
+    const int device_count;
+    const int pp;
+    const std::uint32_t pipeline_chunks;
+    std::optional<PinnedHostBuffer> pipeline_upload;
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const RamKvOptions ram_kv;
+    const bool volta_long_attention;
     const SpeculativeBackend speculative_backend;
     const DType kv_dtype;
     const std::int32_t kv_quant_group;
@@ -326,7 +330,7 @@ public:
     //
     // `rope_frequency_storage[rank]` is a dedicated 32-float device allocation on rank `rank`'s OWN
     // device, made once here and never touched again: CUDA Graph capture bakes the pointer into the
-    // replayed rope launch node, so it must outlive every replay, and at tp 2 each rank ropes its
+    // replayed rope launch node, so it must outlive every replay, and at device_count 2 each rank ropes its
     // own head-local q/k on its own device, where a pointer into the other rank's allocation is not
     // addressable. It is deliberately NOT part of the planned persistent arena: under
     // `RopeMode::Native` nothing is allocated at all, which is what keeps a native plan and its
@@ -341,9 +345,12 @@ public:
     const double yarn_mscale;
     std::vector<std::unique_ptr<PeerRuntime>> peers;
     std::optional<ops::PeerEvents> peer_events;
-    std::array<schedule::TpPeerCore, kMaximumExecutionDevices - 1> peer_cores{};
-    [[nodiscard]] std::span<const schedule::TpPeerCore> peer_views() const noexcept {
-        return std::span(peer_cores).first(peers.size());
+    std::array<schedule::PeerCore, kMaximumExecutionDevices - 1> peer_cores{};
+    [[nodiscard]] std::span<const schedule::PeerCore> peer_views() const noexcept {
+        return std::span(peer_cores).first(pp == 1 ? peers.size() : 0);
+    }
+    [[nodiscard]] const schedule::PeerCore* pipeline_view() const noexcept {
+        return pp == 2 ? &peer_cores[0] : nullptr;
     }
     std::unique_ptr<qwen3_6::DecoderState> decoder;
     std::optional<GdnReplayRecords> replay_records;
@@ -370,7 +377,7 @@ public:
     // production path (tp1 or tp2) is changed. With it on, the buffer is overwritten every time a
     // token is sampled from io.logits at prefill finalization, for both tp1 and tp2 (io is rank
     // 0's window; logits_tp2 gathers into it the same way the tp1 leaf writes it), so no
-    // tp-specific code is needed. Prefill only -- the decode path is CUDA-graph-capturable and an
+    // device_count-specific code is needed. Prefill only -- the decode path is CUDA-graph-capturable and an
     // unconditional memcpy inside a captured region is rejected at capture time; a probe that
     // requests exactly one output token completes on prefill's own sampled token and never runs a
     // decode round, which is what the parity harness (tools/tp2/parity.cpp) uses. Valid only
@@ -419,7 +426,7 @@ public:
     // executor holds its execution mutex across this call).
     void enable_logits_capture(bool enabled);
 
-    // Debug-only, OFF by default: after each MTP decode round at tp == 2, read rank 1's MTP egress
+    // Debug-only, OFF by default: after each MTP decode round at device_count == 2, read rank 1's MTP egress
     // back and compare it field for field with rank 0's. The two ranks run the acceptance Op over
     // bit-identical inputs, so their egress records are argued to agree; enabling this turns that
     // induction into a measurement. Costs one ~1 KiB device-to-host copy plus a host compare per
@@ -485,6 +492,7 @@ private:
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
+    void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

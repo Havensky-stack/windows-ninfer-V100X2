@@ -2,6 +2,8 @@
 
 Native RAM-KV checks: `ninfer_ram_kv_test` covers exact packed page eviction/reload and sparse
 GQA against the independent FP64 oracle (TP2 geometry, BF16/INT8, decode/cached/Volta prefill).
+It also checks Q aggregation, inverse-RoPE cached-K means, masked partial-page replacement and
+cosine scoring against independent FP64 formulas at H=2/4, including original positions near 85K.
 `NINFER_RAM_KV_REAL_WEIGHTS=/absolute/model.ninfer ctest -R '^ninfer_ram_kv_real_test$'`
 is opt-in: default/full-window token parity, real 29.8K eviction, MTP partial commit, complete
 checkpoint replay, and appended-query reuse on two V100s. It does not qualify general quality
@@ -60,8 +62,8 @@ record and public TP2 split checks.
   Responses Item/state/SSE behavior, and incremental tool-call behavior;
 - `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
   preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
-- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
-- `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
+- `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v15 reports;
+- `test_bench_matrix.py` — schema-v15 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
 - device/tensor/arena tests — reusable lower-component behavior; KV tests cover the core physical
   container, family runtime tests cover dimension-driven GDN storage/view mechanics, and Op tests
@@ -84,6 +86,24 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
+On a host with more GPUs, select the physical cards for CTest at configuration time:
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DNINFER_TEST_CUDA_VISIBLE_DEVICES=4,6
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure -j1
+```
+
+This sets `CUDA_VISIBLE_DEVICES=4,6` for every CTest process, including child processes.
+CUDA renumbers that pair as logical devices `0,1`, in the selected order. Four-device tests
+skip with only two visible devices; select four physical cards to run them. An empty value
+(`-DNINFER_TEST_CUDA_VISIBLE_DEVICES=`) leaves the calling environment unchanged, so
+`CUDA_VISIBLE_DEVICES=4,6 ctest --test-dir build ...` also works without a configured mask.
+Compilation targets the selected architecture and needs no GPU or fixed GPU count. Directly
+invoked executables use their environment and the CLI's `--devices`/`--device` options;
+the CTest mask does not select GPUs for an independently launched server or CLI.
+
 Run a focused target for a localized change:
 
 ```bash
@@ -103,6 +123,51 @@ actual error, active limit, and error-to-limit ratio. The switch changes reporti
 statistics still drive the normal verdict. Passing tests remain quiet without it.
 
 Linear tests are independently runnable by weight and activation-compute profile:
+
+`ninfer_linear_w8_prepacked_sm70_test` additionally checks the exact load-time W8 vocabulary
+permutation at full/half/quarter-head geometries, the independent FP64 projection oracle,
+original-layout output parity, graph replay and persistent-plane/input guards. It covers
+one/two-column SIMT, narrow QPN and wide MMA consumers through public `linear()`.
+
+`ninfer_linear_w8_volta_decode_test` checks the five SM70 one-token MTP shard
+projections against the independent FP64 oracle and the original SIMT output,
+including CUDA Graph replay, output guards and unchanged activation/weight bytes.
+
+`ninfer_linear_q4_volta_proposal_test` checks the SM70 TP2 one-token Q4 proposal
+head against the independent FP64 oracle and original staged GEMV output, with
+CUDA Graph replay and unchanged activation, weight and output-guard bytes.
+
+`ninfer_long_attention_real_test` is an opt-in SM70 TP2 QUASAR 85K full-history
+logit/state check, not a routine CTest. It uses one explicit artifact, corpus,
+captured continuation report and output prefix. Set
+`NINFER_LONG_ATTENTION_TEST_DRAFTS=4` or `5`. Run `reference` before `candidate`,
+and `graph` before `eager`:
+
+```bash
+NINFER_LONG_ATTENTION_TEST_DRAFTS=4 \
+  build-v100-tp4/tests/ninfer_long_attention_real_test reference \
+  /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  profiles/bench/v100-code-85000-iommu-pt.ids \
+  profiles/bench/quasar-150-tp2/mtp4-single-qpn.json \
+  profiles/bench/quasar-150-tp2/long-qpn-mtp4-quality
+```
+
+The reference and candidate share teacher-forced history across single-token and
+verification-width suffixes. The diagnostic `control` changes only the default
+prefill chunk from 2560 to 1024; its arithmetic variation does not waive the
+candidate's bounds. State modes check graph/eager commit IDs, acceptance counters,
+peer egress and output-prefix equality with the supplied benchmark report. These
+checks do not establish general model quality equivalence.
+The `default` mode instead requires every captured BF16 vocabulary logit to equal
+the saved default reference exactly. `default-graph` and `default-eager` check
+the default arithmetic's MTP state using its own measured continuation report.
+
+`tools/v100/bench_gpqa.py` and `ninfer_v100_gpqa` run a frozen paired GPQA-Diamond
+**85K unrelated-code occupancy variant**, with resumable per-question results.
+`python3 -m unittest tests.test_gpqa` checks paired scoring, truncation accounting
+and shared-setting validation. The delivered evaluation stopped at 104 common
+questions; this does not qualify a full 198-question score or universal numerical
+equivalence. See the [local results and limits](../docs/performance.md#local-gpqa-diamond-comparison-104-paired-questions).
 
 ```bash
 cmake --build build --parallel --target \
@@ -183,6 +248,12 @@ The V100X2-named gates accept registered Qwen3.8 Q4_K_M/NVFP4 at TP2 (default), 
 Qwen3.8 NVFP4/native block-FP8 on four SM70 cards with `NINFER_TEST_TP=4`.
 `NINFER_V100X2_SPEC=mtp` (default) selects MTP3; `dflash` selects DFlash7 and requires an
 artifact with the optional drafter. `NINFER_V100X2_PROPOSAL_HEAD=optimized` is MTP-only.
+`NINFER_TEST_PP=2` selects the experimental SM70 Qwen3.8 NVFP4/QUASAR TP1/PP2
+single-request gates. Its real gate retains graph/eager, sampling and all 64
+teacher-forced checks but does not run the unsupported B=2 TP test. The prefix gate
+keeps checkpoint/append/partial-stop/exact-frontier replay across both layer-local
+states. `ninfer_gdn_replay_fold_test` qualifies the 24-layer, 48-value-head PP2
+geometry against the independent recurrent-state oracle.
 The real gate checks exact graph/eager commits, sampled routing and B=2 state. Q4_K_M/NVFP4
 require strict non-speculative teacher-forced argmax at all 64 output positions. Native FP8
 additionally measures ordinary decode's re-prefill discrepancy: each prompt's speculative

@@ -344,11 +344,11 @@ namespace {
 void validate_add_split_pair(std::span<const Tensor> x, std::span<const Weight> w,
                              const ExecutionContext& ec) {
     detail::require_split_context(
-        ec, "linear_add split: requires two or four distinct devices", ec.tp);
-    if (x.size() != static_cast<std::size_t>(ec.tp) || w.size() != x.size()) {
+        ec, "linear_add split: requires two or four distinct devices", ec.device_count);
+    if (x.size() != static_cast<std::size_t>(ec.device_count) || w.size() != x.size()) {
         throw std::invalid_argument("linear_add split: argument width must equal TP width");
     }
-    for (int rank = 1; rank < ec.tp; ++rank) {
+    for (int rank = 1; rank < ec.device_count; ++rank) {
         if (x[0].ne[1] != x[rank].ne[1]) {
             throw std::invalid_argument("linear_add split: ranks must carry the same token count");
         }
@@ -364,7 +364,7 @@ void validate_add_split_pair(std::span<const Tensor> x, std::span<const Weight> 
 void validate_add_split_residency(std::span<const Tensor> x, std::span<const Weight> w,
                                   std::span<const Tensor> residual,
                                   const ExecutionContext& ec) {
-    for (int rank = 0; rank < ec.tp; ++rank) {
+    for (int rank = 0; rank < ec.device_count; ++rank) {
         const auto slot = static_cast<std::size_t>(rank);
         detail::require_rank_residency(
             ec, rank, x[slot].data, w[slot].payload, residual[slot].data,
@@ -376,9 +376,9 @@ void validate_add_split_widths(std::span<const Tensor> residual,
                                std::span<const Tensor> staging,
                                std::span<WorkspaceArena* const> workspace,
                                const ExecutionContext& ec, const PeerEvents& events) {
-    const auto width = static_cast<std::size_t>(ec.tp);
+    const auto width = static_cast<std::size_t>(ec.device_count);
     if (residual.size() != width || staging.size() != width || workspace.size() != width ||
-        !events.live() || events.ranks() != ec.tp) {
+        !events.live() || events.ranks() != ec.device_count) {
         throw std::invalid_argument("linear_add split: output/staging/workspace/events must match TP width");
     }
 }
@@ -437,7 +437,7 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
     validate_add_split_residency(x, w, residual, ec);
 
     std::array<Tensor, kMaximumExecutionDevices> target{};
-    for (int rank = 0; rank < ec.tp; ++rank) { target[rank] = residual[rank]; }
+    for (int rank = 0; rank < ec.device_count; ++rank) { target[rank] = residual[rank]; }
     // TP4 staging contains four output contributions. Rank 0's BF16 decomposition needs only
     // the first plane, before the collective has populated any staging data.
     Tensor scratch(staging[0].data, staging[0].dtype, {w[0].n, x[0].ne[1]});
@@ -453,7 +453,7 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
     });
     // allreduce_sum owns staging residency, shape and non-overlap checks, and the selected
     // reduction profile. Public numerical evidence compares directly with the complete formula.
-    allreduce_sum(std::span(target).first(ec.tp), staging, ec, events);
+    allreduce_sum(std::span(target).first(ec.device_count), staging, ec, events);
 }
 
 void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
@@ -462,7 +462,7 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
                              const PeerEvents& events) {
     const std::array<WorkspaceArena*, kMaximumExecutionDevices> workspace{};
     linear_add_row_parallel(x, w, residual, staging, LinearPolicy::A16Only,
-                            std::span(workspace).first(ec.tp), ec,
+                            std::span(workspace).first(ec.device_count), ec,
                             events);
 }
 
