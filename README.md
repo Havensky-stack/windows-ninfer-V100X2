@@ -835,6 +835,13 @@ cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-v100 -j2
 ```
 
+GPU count is not fixed at build time: an eight-GPU host can run this build on any supported
+subset. For example, `--tp 2 --devices 4,6` selects CUDA devices 4 and 6. With
+`CUDA_VISIBLE_DEVICES=4,6`, CUDA renumbers them as 0 and 1, so use `--tp 2 --devices 0,1`.
+To restrict CTest to that pair, configure with `-DBUILD_TESTING=ON` and
+`-DNINFER_TEST_CUDA_VISIBLE_DEVICES=4,6`; see [test device selection](tests/README.md#build-and-run).
+The supported tensor-parallel degrees remain 1, 2 and 4; eight installed cards do not imply TP8.
+
 For the recommended QUASAR model, download the published v3 container with an existing Hugging
 Face CLI and verify the publisher's checksum (no local weight conversion is needed):
 

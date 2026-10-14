@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -48,7 +49,7 @@ int check_context(const ninfer::DeviceContext& ctx, const char* label) {
 
 } // namespace
 
-// ExecutionContext's own contract: distinct ids only, tp follows the list, and rank 0 is left
+// ExecutionContext's own contract: distinct ids only, device_count follows the list, and rank 0 is left
 // current. The duplicate-id rejection is the one that has to be a regression test rather than a
 // one-off manual check -- it guards a SILENT failure (two contexts on one GPU halve nothing and
 // make the peer copies alias their own source), so nothing downstream would notice its removal.
@@ -67,22 +68,30 @@ int check_execution_context(int device_count) {
         ++failures;
     } catch (const std::runtime_error&) {}
 
-    ninfer::ExecutionContext single({0});
-    if (single.tp != 1 || !single.dev[0].has_value() || single.dev[1].has_value() ||
-        single.primary().device != 0) {
-        std::cerr << "ExecutionContext({0}) did not describe one device on rank 0\n";
-        ++failures;
-    }
-
-    if (device_count >= 2) {
-        ninfer::ExecutionContext pair({0, 1});
-        if (pair.tp != 2 || !pair.dev[0].has_value() || !pair.dev[1].has_value() ||
-            pair.dev[0]->device != 0 || pair.dev[1]->device != 1) {
-            std::cerr << "ExecutionContext({0, 1}) did not describe two distinct devices\n";
+    for (const auto& ids : {std::vector{0}, std::vector{0, 1}, std::vector{1, 0},
+                            std::vector{0, 1, 2, 3}}) {
+        if (ids.size() > static_cast<std::size_t>(device_count)) { continue; }
+        ninfer::ExecutionContext execution(ids);
+        if (execution.device_count != static_cast<int>(ids.size()) ||
+            execution.primary().device != ids.front()) {
+            std::cerr << "ExecutionContext did not describe the selected device count/primary\n";
             ++failures;
         }
+        for (std::size_t rank = 0; rank < execution.dev.size(); ++rank) {
+            if (rank < ids.size()) {
+                if (!execution.dev[rank].has_value() ||
+                    execution.dev[rank]->device != ids[rank]) {
+                    std::cerr << "ExecutionContext did not preserve device order at rank "
+                              << rank << '\n';
+                    ++failures;
+                }
+            } else if (execution.dev[rank].has_value()) {
+                std::cerr << "ExecutionContext populated an unselected rank " << rank << '\n';
+                ++failures;
+            }
+        }
         int current = -1;
-        if (cudaGetDevice(&current) != cudaSuccess || current != pair.dev[0]->device) {
+        if (cudaGetDevice(&current) != cudaSuccess || current != ids.front()) {
             std::cerr << "ExecutionContext construction did not leave rank 0 current (current="
                       << current << ")\n";
             ++failures;

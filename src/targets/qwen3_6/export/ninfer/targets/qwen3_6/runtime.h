@@ -213,9 +213,9 @@ template <class Variant>
 make_sequence_planner(DeviceContext& device, const EngineOptions& options,
                       typename Variant::WeightsProfile weights_profile);
 
-// `peer_model` is rank 1's own model view at tp == 2 and nullptr at tp == 1; `execution` supplies
-// the device contexts (one or two). The two must agree: a non-null peer view with a tp1 execution
-// context, or the reverse, is rejected.
+// `peer_models` contains one non-null model view per execution rank after rank 0, in rank order.
+// Its size must be execution.device_count - 1 (empty for one device), and execution.device_count
+// must match the plan's tp * pp.
 template <class Variant>
 [[nodiscard]] std::unique_ptr<Program<Variant>>
 create_program(const typename Variant::ModelView& model,

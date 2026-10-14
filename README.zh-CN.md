@@ -678,6 +678,12 @@ cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-v100 -j2
 ```
 
+构建不绑定显卡数量，八卡主机也可以只选其中两卡运行。例如 `--tp 2 --devices 4,6`
+选择 CUDA 设备 4、6；若先设置 `CUDA_VISIBLE_DEVICES=4,6`，它们会重编号为逻辑卡 0、1，
+此时应使用 `--tp 2 --devices 0,1`。构建时加 `-DBUILD_TESTING=ON` 和
+`-DNINFER_TEST_CUDA_VISIBLE_DEVICES=4,6`，即可让 CTest 只在所选卡上运行，
+详见[测试选卡](tests/README.md#build-and-run)。支持的 TP 仍为 1、2、4，八卡主机不代表 TP8。
+
 构建并发按本机情况调整，保留交互余量，整机 CPU 使用率不要超过约 85%。
 模型、原始语料和 profiler 文件是本地前提，不随代码仓库提交；C++ 产品只读取 `.ninfer`。
 主推 QUASAR，使用现有 Hugging Face CLI 下载固定 v3 成品并校验发布者 checksum，

@@ -567,3 +567,12 @@ foreach(test_target IN LISTS ninfer_qwen3_6_27b_internal_tests)
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
     ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
 endforeach()
+
+# Apply after all registrations, including aliases with their own ENVIRONMENT property.
+# CUDA performs physical-to-logical ordinal mapping for every test and its child processes.
+# An empty cache value leaves a caller-provided CUDA_VISIBLE_DEVICES unchanged.
+if(NOT NINFER_TEST_CUDA_VISIBLE_DEVICES STREQUAL "")
+  get_property(ninfer_registered_tests DIRECTORY PROPERTY TESTS)
+  set_property(TEST ${ninfer_registered_tests} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+    "CUDA_VISIBLE_DEVICES=set:${NINFER_TEST_CUDA_VISIBLE_DEVICES}")
+endif()

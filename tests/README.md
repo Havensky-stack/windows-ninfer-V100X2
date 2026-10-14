@@ -86,6 +86,24 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
+On a host with more GPUs, select the physical cards for CTest at configuration time:
+
+```bash
+cmake -S . -B build -DBUILD_TESTING=ON -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DNINFER_TEST_CUDA_VISIBLE_DEVICES=4,6
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure -j1
+```
+
+This sets `CUDA_VISIBLE_DEVICES=4,6` for every CTest process, including child processes.
+CUDA renumbers that pair as logical devices `0,1`, in the selected order. Four-device tests
+skip with only two visible devices; select four physical cards to run them. An empty value
+(`-DNINFER_TEST_CUDA_VISIBLE_DEVICES=`) leaves the calling environment unchanged, so
+`CUDA_VISIBLE_DEVICES=4,6 ctest --test-dir build ...` also works without a configured mask.
+Compilation targets the selected architecture and needs no GPU or fixed GPU count. Directly
+invoked executables use their environment and the CLI's `--devices`/`--device` options;
+the CTest mask does not select GPUs for an independently launched server or CLI.
+
 Run a focused target for a localized change:
 
 ```bash
