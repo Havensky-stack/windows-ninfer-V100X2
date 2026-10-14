@@ -80,6 +80,12 @@ weight decoding.
 
 ## Build and run
 
+The standard-library TUI launcher checks do not build CUDA tests or load a model:
+
+```bash
+python3 -m unittest discover -s tests -p test_ninfer_tui.py
+```
+
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build --parallel

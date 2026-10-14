@@ -43,7 +43,7 @@ template's default. An artifact whose template does not expose effort rejects th
 
 `--tp 4 --devices 0,1,2,3` selects the new Qwen3.8-27B NVFP4/native FP8 Text/MTP route on
 SM70. NVFP4 four-card model/state and occupied-context results are recorded in
-[`performance.md`](performance.md); native FP8 TP4 qualification and the measured occupancy
+[`tp4.md`](tp4.md); native FP8 TP4 qualification and the measured occupancy
 and capacity controls are complete.
 The native `qwen3.8-27b/fp8` identity requires TP4; neither TP4 profile supports Vision or
 DFlash. Existing TP2 qualification and results remain separate.

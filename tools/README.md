@@ -25,6 +25,7 @@ for the selected tool.
 | Record read-only V100/reset telemetry | [`v100/health_log.py`](v100/health_log.py) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Start/configure a local HTTP server with PyQt | [`v100/ninfer_gui.py`](v100/ninfer_gui.py) and [`../docs/gui.md`](../docs/gui.md) |
+| Start/configure a local HTTP server in a terminal or SSH session | [`v100/ninfer_tui.py`](v100/ninfer_tui.py) and [`../docs/tui.md`](../docs/tui.md) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 
 ## Artifact workflow

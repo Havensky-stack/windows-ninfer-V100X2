@@ -7,7 +7,7 @@ measurements.
 
 It is a maintainer reference, not a user guide. User-facing option contracts live in
 [CLI](../cli.md) and [HTTP serving](../serving.md); the measured throughput, memory and retrieval
-tables live in [Performance](../performance.md) and the project [README](../../README.md). What is
+tables live in [Performance](../performance-upstream.md) and the project [README](../../README.md). What is
 here is the material a maintainer needs before changing any of it: why the transport is shaped the
 way it is, why the YaRN constants are what they are, and what each correctness gate actually
 proves.
@@ -50,7 +50,7 @@ by the collectives in both directions. CUDA selects driver-managed staging in th
 The V100X2 host now boots with `iommu=pt`; both GPU domains are `identity` and driver peer
 read/write checks pass. The same startup path automatically enables and verifies direct PCIe
 P2P. This remains PCIe 3.0 ×16 through PHB, not NVLink. See the
-[P2P evaluation](../performance.md#p2p-enabled) for the same-input throughput and exact-transfer
+[P2P evaluation](../performance-v100.md#p2p-enabled) for the same-input throughput and exact-transfer
 checks. An identity domain permits qualification; it does not imply that every motherboard or
 GPU pair supports peer access.
 
@@ -391,11 +391,11 @@ at ten-plus new shapes; it is Op work, not integration work. See
 |---|---|
 | **400 W** per GPU | The main campaign. The minimum settable limit on these cards; sampled draw sat at 346–353 W, so the limit was binding |
 | **575 W** per GPU | The re-measurement of the publishable subset |
-| **500 W** per GPU | The cross-engine comparison against vLLM (see [Performance](../performance.md)) |
+| **500 W** per GPU | The cross-engine comparison against vLLM (see [Performance](../performance-upstream.md)) |
 
 Vendor defaults are 600 W and 575 W; the maximum is 600 W on both cards. Do not quote a figure
 without its condition, do not compare rows across conditions, and do not compare any of them
-against the single-GPU campaigns elsewhere in [Performance](../performance.md), which were taken
+against the single-GPU campaigns elsewhere in [Performance](../performance-upstream.md), which were taken
 under none of the three.
 
 Lifting the cap helps TP1 more than TP2: one card running the whole model saturates its limit (peak
@@ -410,7 +410,7 @@ CSVs carry their own power condition; the earliest campaign CSVs do not.
 | Item | Status |
 |---|---|
 | Shard-extent FP64-oracle conformance beyond the FP8 A8 row extents | Open — see §6.6. Currently covered pairwise plus model-level evidence |
-| vLLM-NVFP4 like-for-weights throughput comparison | Measured, at a **500 W** per-GPU cap — a third power condition distinct from the 400 W campaign and the 575 W re-measurement. The table and its caveats are in the cross-engine section of [Performance](../performance.md); §7.3 below records what vLLM can serve and why the weights are not identical. Still open within it: no vLLM MTP-off row, and the prefill-chunk difference was not swept |
+| vLLM-NVFP4 like-for-weights throughput comparison | Measured, at a **500 W** per-GPU cap — a third power condition distinct from the 400 W campaign and the 575 W re-measurement. The table and its caveats are in the cross-engine section of [Performance](../performance-upstream.md); §7.3 below records what vLLM can serve and why the weights are not identical. Still open within it: no vLLM MTP-off row, and the prefill-chunk difference was not swept |
 | CUDA Graph per-device allowance at 1M | Open. The 20 MiB allowance is too tight against a capture pool that is not deterministic: successful boots capture 2.00–3.44 MiB per device, but one 1,048,576-token boot claimed 44,433,408 bytes and aborted, then booted normally on the immediate retry with no change to the command line. Workaround: retry. Fix candidates: raise the allowance, or size it from a measured reservation rather than a fixed per-request multiplier. Log retained at `eval/results/cross-engine-nvfp4/ninfer-500w-700000-mtp0-cudagraph-allowance-failure.txt`, and the successful boots' capacity summaries at `ninfer-boot-summaries.txt` in the same directory |
 | Concurrency C=2 at 575 W | Not re-measured; C=1 and C=4 were |
 | A seeded temperature > 0 soak | Not run. The soak is greedy, which is what makes its two passes hash-comparable; a sampled soak needs a seeded run and a different determinism criterion |
@@ -455,7 +455,7 @@ capability difference.
 Any throughput row against vLLM also compares **two quantizations**, not one: the vLLM side uses an
 independent NVFP4 quantization of the same base fine-tune rather than NInfer's own conversion. The
 cross-engine numbers, taken at a **500 W** per-GPU cap, live in
-[Performance](../performance.md).
+[Performance](../performance-upstream.md).
 
 **Freeing the GPUs after a vLLM run needs `SIGKILL`.** `kill -TERM` to the `vllm serve` process
 group leaves its `VLLM::Worker_TP*` processes re-parented to init and still holding about 14.6 GiB
@@ -520,7 +520,7 @@ capture and transport probes all live in `tools/tp2/`. The 1M needle, soak and p
 
 ## 10. Related documents
 
-- [Performance](../performance.md) — the measured throughput, memory and latency tables, with their
+- [Performance](../performance-upstream.md) — the measured throughput, memory and latency tables, with their
   power conditions and reproduction commands.
 - [CLI](../cli.md) and [HTTP serving](../serving.md) — the `--tp`, `--devices`, `--rope` and
   `--yarn-*` option contracts.
