@@ -144,6 +144,57 @@ checkpoint isolation and TP2 Vision prefix regression all pass. CLI and serving 
 rebuilt. The existing long-attention quality caveat still applies. Evidence and health logs are under
 `profiles/bench/quasar-cached-ttft-20261019/` (`baseline-controls.json`, `final.json`, `summary.json`).
 
+## HTTP fully cached first-token latency (2026-10-19)
+
+Measured through the actual `http://127.0.0.1:6198/v1/chat/completions` port with a Python
+3.11 standard-library client. The interval begins before sending the request and ends when
+the client receives the first **nonempty text delta**, excluding the empty assistant-role
+event. Unlike the Engine-only numbers above, it includes connection setup when applicable,
+HTTP parsing, prompt preparation and SSE delivery. It does not include a remote network,
+reverse proxy or GUI rendering.
+
+The server uses QUASAR TP2/MTP4, optimized proposals, 262144 capacity, complete INT8 group-64
+KV, chunk 2560, CUDA Graphs, long attention on, fast decode off and Vision off. Requests are
+greedy with zero penalties, exactly 300 prompt tokens, all 300 cached and zero computed prefill,
+with 64 output tokens. Both `preserve_thinking` settings were checked. Each of four cases has
+two warmups and 15 measurements: **60 measured requests per build**, before and after.
+The before/after builds differ only by enabling `TCP_NODELAY` on the HTTP server sockets.
+
+| Chat-history preservation | Connection | Before median first text | After median first text |
+|---|---|---:|---:|
+| On | Fresh | 6.128 ms | 6.076 ms |
+| On | Reused | 44.082 ms | **5.873 ms** |
+| Off | Fresh | 6.054 ms | 6.092 ms |
+| Off | Reused | 43.758 ms | **5.925 ms** |
+
+The reused-connection reduction is **86.46–86.68%**. The previous server left Nagle enabled;
+small SSE frames following the response headers could wait for the peer's delayed ACK.
+With `TCP_NODELAY`, the median first SSE event moves from 43.68–44.00 ms to 3.59–3.60 ms,
+and the first actual text arrives around 5.9 ms. Fresh connections show no material change.
+This removes a transport wait rather than speeding up model computation. All paired visible
+outputs, completion/cache usage and speculative counters match exactly.
+
+After the change, median server preparation is about 2.6 ms and server-reported TTFT about
+5.3 ms, versus 5.9–6.1 ms at the client. That remaining difference includes HTTP framing,
+socket delivery and client parsing, not just wire time. Total 64-output request time remains
+about 265 ms. The existing long-attention quality caveat applies; this socket change adds no
+numerical approximation. OpenAI Chat/Responses streaming and non-streaming contract checks,
+Anthropic non-streaming and fresh/reused Anthropic SSE checks pass on the rebuilt server.
+
+To measure an already-running, idle server with prefix reuse enabled:
+
+```bash
+python3 tools/v100/bench_http_ttft.py \
+  --base-url http://127.0.0.1:6198 --model qwen3.8-27b \
+  --output profiles/bench/http-ttft.json
+```
+
+The tool checks the exact expanded token count, full cache usage and repeated greedy text,
+consumes each stream completely, and separately records response headers, first SSE event,
+first nonempty text and total time. Saved evidence and detailed health logs are under
+`profiles/bench/quasar-http-ttft-20261019/` (`baseline.json`, `nodelay.json`, `summary.json`,
+`*-requests.jsonl`, `*-health/`, `contract.json`, `messages-stream-check.txt`).
+
 ## QUASAR Text / Vision handoff (2026-10-19)
 
 One published QUASAR v3 file serves both startup modes. Text-only loads no Vision GPU objects;

@@ -138,6 +138,9 @@ HttpServer::HttpServer(ServeOptions options)
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
+    // SSE sends headers and small token frames separately. Nagle can hold the first
+    // frame behind a delayed ACK on a reused connection, adding about 40 ms to TTFT.
+    server_.set_tcp_nodelay(true);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }

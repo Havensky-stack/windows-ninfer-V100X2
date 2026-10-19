@@ -147,6 +147,13 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
+The HTTP server enables `TCP_NODELAY` so small SSE frames following the headers are sent
+without Nagle/delayed-ACK stalls on persistent connections. SSE responses also set
+`Cache-Control: no-cache` and `X-Accel-Buffering: no`. Clients should read incrementally;
+proxy buffering and remote network latency can still delay visible output. The local
+[fully cached HTTP TTFT measurement](performance.md#http-fully-cached-first-token-latency-2026-10-19)
+times the first nonempty text delta, not the initial role or lifecycle event.
+
 ## OpenAI Chat Completions
 
 ```bash
