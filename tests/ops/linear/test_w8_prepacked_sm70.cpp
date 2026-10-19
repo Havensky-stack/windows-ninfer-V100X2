@@ -16,8 +16,7 @@ namespace qw = ninfer::test::quantized_weight;
 #ifdef NINFER_VOLTA_BUILD
 namespace {
 
-int check_shape(int n, std::span<const int> widths) {
-    constexpr int k = 5120;
+int check_shape(int n, int k, std::span<const int> widths, bool exact_baseline = true) {
     qw::PatternedWeightOptions options;
     options.decorrelate_coordinates = true;
     fixture::DevicePackedWeight weight(qw::make_patterned_weight(QType::W8G32_F16S, n, k, 149U, options));
@@ -65,7 +64,7 @@ int check_shape(int n, std::span<const int> widths) {
         ops::linear(x, view, result_tensor, stream);
         cuda_synchronize(stream);
         const auto expected_bits = expected.bits();
-        if (result.bits() != expected_bits) {
+        if (exact_baseline && result.bits() != expected_bits) {
             std::cerr << "W8 prepacked baseline mismatch N=" << n << " T=" << t << '\n';
             ++failures;
         }
@@ -80,12 +79,25 @@ int check_shape(int n, std::span<const int> widths) {
         cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
         cuda_check(cudaGraphInstantiate(&executable, graph, 0), "instantiate");
         for (int replay = 0; replay < 2; ++replay) {
+            const auto changed = fixture::make_bf16_activation(k, t, 191U + t + replay);
+            const auto changed_bits = fixture::bf16_bits(changed);
+            cuda_check(cudaMemcpyAsync(input.p, changed_bits.data(), input.bytes,
+                                        cudaMemcpyHostToDevice, stream), "changed input upload");
             cuda_check(cudaGraphLaunch(executable, stream), "graph replay");
             cuda_synchronize(stream);
-            if (result.bits() != expected_bits) { ++failures; }
+            const auto changed_oracle = fixture::projection_oracle(weight.host, 0, n, changed, k, t, 17);
+            failures += fixture::compare("W8 prepacked changed-input Graph FP64",
+                fixture::gather_rows(result.values(), n, 0, n, t, 17), changed_oracle,
+                ReductionCriterion{1.0 / 256, 1.0 / 256, 2.0 / 256});
+            if (exact_baseline) {
+                ops::linear(x, baseline_view, expected_tensor, stream);
+                cuda_synchronize(stream);
+                if (result.bits() != expected.bits()) { ++failures; }
+            }
+            failures += fixture::verify_preserved("W8 prepacked changed activation", input,
+                                                  changed_bits);
         }
         failures += result.verify_guards("W8 prepacked output");
-        failures += fixture::verify_preserved("W8 prepacked activation", input, fixture::bf16_bits(host));
         cudaGraphExecDestroy(executable);
         cudaGraphDestroy(graph);
         std::cout << "W8 prepacked N=" << n << " K=" << k << " T=" << t
@@ -111,9 +123,14 @@ int main() {
     try {
         const std::array tp2_widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33};
         const std::array other_widths{1, 2, 5, 9};
-        int failures = check_shape(124160, tp2_widths);
-        failures += check_shape(62080, other_widths);
-        failures += check_shape(248320, other_widths);
+        int failures = check_shape(124160, 5120, tp2_widths);
+        failures += check_shape(62080, 5120, other_widths);
+        failures += check_shape(248320, 5120, other_widths);
+        const std::array mtp_widths{1, 2, 3, 5, 8, 9, 33};
+        for (const auto [n, k] : std::array<std::pair<int, int>, 5>{
+                 {{5120, 5120}, {7168, 5120}, {17408, 5120}, {5120, 3072}, {5120, 8704}}}) {
+            failures += check_shape(n, k, mtp_widths, false);
+        }
         return failures ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

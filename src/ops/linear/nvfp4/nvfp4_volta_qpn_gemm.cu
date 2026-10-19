@@ -4,6 +4,7 @@
 #include "ops/linear/nvfp4/nvfp4_volta_qpn_gemm.cuh"
 
 #include <cuda_bf16.h>
+#include <algorithm>
 
 namespace ninfer::ops::detail {
 
@@ -22,15 +23,19 @@ __global__ void qpn_cast_activation(const __nv_bfloat16* input, half* output, in
 
 bool nvfp4_volta_qpn_precast_supported(std::int32_t n, std::int32_t k,
                                       std::int32_t tokens) noexcept {
-    return (tokens >= 4 && tokens <= 6) &&
-           ((k == 5120 && (n == 7168 || n == 8192)) || (n == 5120 && k == 8704));
+    const bool gdn_output = n == 5120 && k == 3072 && tokens >= 1 && tokens <= 8;
+    return gdn_output || ((tokens >= 4 && tokens <= 6) &&
+           ((k == 5120 && (n == 7168 || n == 8192)) || (n == 5120 && k == 8704)));
 }
 
 std::size_t nvfp4_volta_qpn_precast_workspace_bytes(std::int32_t n, std::int32_t k,
                                                    std::int32_t max_tokens) {
-    if (max_tokens < 4 || !nvfp4_volta_qpn_precast_supported(n, k, 4)) { return 0; }
+    const bool gdn_output = n == 5120 && k == 3072;
+    const int first = gdn_output ? 1 : 4;
+    const int last = gdn_output ? 8 : 6;
+    if (max_tokens < first || !nvfp4_volta_qpn_precast_supported(n, k, first)) { return 0; }
     WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::FP16, {k, max_tokens < 6 ? max_tokens : 6});
+    (void)layout.alloc(DType::FP16, {k, std::min(max_tokens, last)});
     return layout.peak_bytes(1);
 }
 

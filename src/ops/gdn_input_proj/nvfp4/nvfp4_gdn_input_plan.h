@@ -21,6 +21,10 @@ namespace ninfer::ops::detail {
 [[nodiscard]] std::size_t nvfp4_gdn_input_sm70_workspace_bytes(int rows, int tokens);
 void nvfp4_gdn_input_sm70_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
                                 Tensor& z, WorkspaceArena* workspace, cudaStream_t stream);
+void nvfp4_gdn_input_sm70_record_launch(
+    const Tensor& x, const Weight& weight, const Tensor& conv_weight, const Tensor& state,
+    const Tensor& valid_columns, const Tensor& initial_slots, Tensor& record, Tensor& query,
+    Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 #endif
 
 void nvfp4_gdn_input_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,

@@ -503,6 +503,9 @@ int run_int8_split_policy_cases() {
         {6, 6138, 8199, 603u},
         {5, 32764, 32769, 604u},
         {1, 16390, 16391, 605u},
+        // TP2 MTP4 verifier: fragmented pages, an incomplete final key tile and
+        // enough tiles per split to exercise the packed-KV lookahead repeatedly.
+        {5, 85000, 85005, 607u},
     };
     int failures = 0;
     for (const AttentionCase& test_case : cases) {

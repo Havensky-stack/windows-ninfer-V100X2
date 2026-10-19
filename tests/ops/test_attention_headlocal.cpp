@@ -1029,6 +1029,12 @@ int main(int argc, char** argv) {
         failures += run_case(DType::I8,
             {"gqa_attention_cached", 1, 32767, 32768, MappingPattern::Offset, 1722u, false}, false, true);
         failures += run_case(DType::I8,
+            {"gqa_attention", 5, 16386, 16391, MappingPattern::Fragmented, 1751u, false, 3}, false, true);
+        failures += run_case(DType::I8,
+            {"gqa_attention", 5, 16386, 16391, MappingPattern::Offset, 1752u, false, 0}, false, true);
+        failures += run_case(DType::I8,
+            {"gqa_attention_cached", 5, 32763, 32768, MappingPattern::Fragmented, 1753u, false}, false, true);
+        failures += run_case(DType::I8,
             {"gqa_attention", 6, 16385, 16391, MappingPattern::Fragmented, 1723u, false}, false, true);
         failures += run_case(DType::I8,
             {"gqa_attention", 6, 16385, 16391, MappingPattern::Fragmented, 1724u, false, 4}, false, true);

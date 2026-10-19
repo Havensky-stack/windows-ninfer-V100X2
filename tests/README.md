@@ -80,10 +80,15 @@ weight decoding.
 
 ## Build and run
 
-The standard-library TUI launcher checks do not build CUDA tests or load a model:
+The standard-library TUI launcher checks cover admission, saved preferences, metrics and owned
+child lifetime, including an actual curses session in a pseudo-terminal with a fixture server.
+The GUI checks use Qt when installed (otherwise only the log consumer checks run). Neither
+suite builds CUDA tests or loads a model:
 
 ```bash
 python3 -m unittest discover -s tests -p test_ninfer_tui.py
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p test_gui_cache.py
+python3 -m unittest discover -s tests -p test_launcher_resources.py
 ```
 
 ```bash
@@ -252,7 +257,8 @@ uses another numerical/execution path's generated tokens as a golden.
 
 The V100X2-named gates accept registered Qwen3.8 Q4_K_M/NVFP4 at TP2 (default), or
 Qwen3.8 NVFP4/native block-FP8 on four SM70 cards with `NINFER_TEST_TP=4`.
-`NINFER_V100X2_SPEC=mtp` (default) selects MTP3; `dflash` selects DFlash7 and requires an
+`NINFER_V100X2_SPEC=mtp` (default) selects MTP3; `NINFER_TEST_MTP_DRAFTS=4` selects MTP4.
+`dflash` selects DFlash7 and requires an
 artifact with the optional drafter. `NINFER_V100X2_PROPOSAL_HEAD=optimized` is MTP-only.
 `NINFER_TEST_PP=2` selects the experimental SM70 Qwen3.8 NVFP4/QUASAR TP1/PP2
 single-request gates. Its real gate retains graph/eager, sampling and all 64
@@ -266,14 +272,16 @@ additionally measures ordinary decode's re-prefill discrepancy: each prompt's sp
 worst emitted-logit deficit must not exceed its ordinary control, within the established
 0.5-logit BF16 grouping bound. This is not a bit-identical-trajectory or quality-score claim.
 The prefix gate checks checkpoint, append, partial-stop and exact-frontier replay, including
-an exact stop-vs-budget truncation control. Cold re-prefill can change BF16 grouping; its
+an exact stop-vs-budget truncation control. It also checks exact-hit single-output termination,
+subsequent replay/suffix restoration and B=2 mixed-sampling MTP checkpoint isolation.
+Cold re-prefill can change BF16 grouping; its
 first differing choice is checked separately against fresh target logits. DFlash does not
 use the MTP-only peer-egress diagnostic and is unavailable at TP4.
 
 ```bash
-NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
-NINFER_V100X2_SPEC=dflash \
-  ctest --test-dir build-v100 -R 'v100x2_(real|prefix_real)' --output-on-failure
+NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+NINFER_TEST_MTP_DRAFTS=4 \
+  ctest --test-dir build-v100-tp4 -R 'v100x2_(real|prefix_real)' --output-on-failure
 ```
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
@@ -317,7 +325,15 @@ The shared messages are in
 
 ### Experimental TP2 Vision status
 
-The TP2 Vision path is opt-in and not fully qualified on the local two V100-SXM2 16 GB cards.
+The TP2 Vision path is opt-in. On 2026-10-19, QUASAR v3 with default numerical profiles,
+INT8 group-64 KV, 4096 capacity, 1024 chunks, Graphs and optimized-head MTP4 passes
+`ninfer_qwen3_6_27b_prefix_real_test`, including image lifetime, same/changed/appended media,
+stop/resume, exact-frontier reuse and the visual-prefix bridge. Select the artifact with
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`, TP2 with `NINFER_TEST_TP2=1`, and four drafts with
+`NINFER_TEST_MTP_DRAFTS=4`. Real image/video CLI and Vision ON/OFF HTTP checks also pass.
+These are integration checks, not a scored visual-quality evaluation.
+
+The earlier official-NVFP4 qualification is a separate unresolved result:
 With the official Qwen3.8-27B NVFP4 artifact, INT8 group-64 KV, 4096 capacity, 1024 prefill chunks
 and optimized-head MTP3, `ninfer_qwen3_6_27b_vision_tp2_real_test` repeatedly fails its visual-prefix
 bridge greedy-output comparison at the first output token. Earlier cross-chunk image lifetime,
@@ -325,9 +341,9 @@ same/changed/appended-media reuse and stop/resume checks complete before this fa
 
 The differing candidates are not an exact BF16 tie, but this does not by itself establish a state
 bug or a model-quality regression. The cause remains unresolved; no numerical criterion has been
-relaxed and the failing test is retained. The recommended experimental Vision server uses
-`--no-prefix-reuse` to avoid this cache path, not as evidence that the complete Vision route has
-passed qualification.
+relaxed and the failing test is retained. The supplied Vision presets start with `--no-prefix-reuse`. The older official result does not
+negate the QUASAR integration result above, and the QUASAR result does not qualify the official
+artifact or prove all chunkings and numerical profiles equivalent.
 
 ## What belongs here
 

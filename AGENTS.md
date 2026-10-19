@@ -114,10 +114,15 @@ measurements of this target. The supported identities are
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
 `qwen3.6-35b-a3b/groupwise-int`.
 The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
-SM70 TP2 Text/None/MTP/DFlash and experimental PP2 Text/None/MTP. It registers the published QUASAR v3 container identity, preserves its
+SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2 and both experimental decode profiles. It registers the published QUASAR v3 container identity, preserves its
 256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
 controls and optional W8/BF16 DFlash2 package. The 27B draft window remains at most seven.
 This artifact's QAT/conversion quality is not established by inference smoke tests.
+Text/None/MTP with complete GPU KV additionally retains exact per-rank GDN and tail-hidden
+checkpoints in at most 2 GiB host RAM per Program, divided among configured lanes. Shorter or
+edited shared prefixes restore the longest matching saved frontier and recompute its remaining
+suffix; reported cached tokens exclude that recomputation. This does not admit arbitrary
+substring reuse, KV sharing/fan-out, or partial-state reuse for Vision/DFlash/RAM-KV.
 The explicitly requested remote extension targets four NVLink-connected V100-SXM2 16 GB cards,
 single-request TP4 Text/MTP on Qwen3.8-27B NVFP4 and native block-128 FP8. Native FP8 preserves
 source E4M3 codes and BF16 block multipliers without requantization and requires TP4 on SM70.
@@ -144,6 +149,15 @@ Text/None/MTP with complete INT8 group-64 KV, without Vision or RAM-KV. It retai
 causally visible key but changes split partitioning, softmax association and PV accumulation;
 it is default-off and not bit-equivalent to ordinary attention. The 104-question local GPQA
 comparison is behavioral evidence, not a full 198-question evaluation or proof of losslessness.
+
+The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP2
+Text/None/MTP. It selects packed NVFP4 parents with FP32 scale-after-K-reduction and
+shape-specific packed MTP W8 reductions. The normal profile retains per-group FP16 scaling
+with the same exact weight layout, fusion and communication optimizations. Both paths keep
+original codes/scales/divisors and one resident copy. The fast profile can change logits and
+draft acceptance. Together with long attention the final 85K/MTP4 measurements are
+198.105/198.097 committed wall tok/s. The user stopped further performance candidates;
+200 was not achieved. No current-combination GPQA result is available.
 
 The explicit RAM-KV experiment is optional SM70 27B TP1/TP2/PP2 single-request Text/None/MTP.
 It stores original packed KV in a bounded RAM archive and uses KVMem-inspired Q/K cosine

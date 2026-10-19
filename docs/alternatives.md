@@ -1,11 +1,12 @@
 # Alternative models and experimental Vision
 
-QUASAR is the recommended text-only model. This page retains Q4_K_M conversion and the opt-in official-NVFP4 Vision route. These profiles have their own numerical and memory constraints.
+QUASAR is the recommended Text and optional TP2 image/video model. This page retains Q4_K_M conversion and the QUASAR Vision startup route. These profiles have their own numerical and memory constraints.
 
-TP2 Vision is experimental and disabled by default. The visual-prefix bridge test fails on
-the local host because cached and cold prefill produce different greedy continuations; the
-cause remains unresolved. Use cold requests with `--no-prefix-reuse` below. QUASAR rejects
-Vision, and TP4 Vision / DFlash plus Vision are unsupported.
+TP2 Vision is opt-in. QUASAR passes the existing TP2/MTP4 prefix integration test at 4096
+capacity, including the visual-prefix bridge, changed/appended media and stop/resume. The
+older official-NVFP4 profile has a separately unresolved cached/cold greedy difference.
+The launch profile below uses cold requests with `--no-prefix-reuse`; users may enable
+QUASAR prefix reuse manually. TP4 Vision and DFlash plus Vision are unsupported.
 
 For the alternative Q4_K_M profile, convert the local LM Studio source once (Python 3.11 with NumPy):
 
@@ -32,18 +33,19 @@ host CPU affinity; benchmark CPU use should remain below the operator's 85% ceil
 
 ### Experimental TP2 Vision
 
-Use the official NVFP4 artifact, not QUASAR or GGUF-derived Q4_K_M. Start with a small text/KV
-capacity and visual-token budget on the two 16 GB cards; the command below is not a measured
-maximum-capacity profile. `--vision-max-tokens` bounds merged visual tokens, while the complete
+Use the QUASAR v3 artifact; GGUF-derived Q4_K_M cannot enable Vision. The profile below
+uses 98K text capacity and 4096 visual tokens, sufficient for the bundled five-second video.
+A chart image also passes at 180K capacity with 1024 visual tokens; these are capacity
+configurations, not measurements of an equally occupied prompt. `--vision-max-tokens` bounds merged visual tokens, while the complete
 text-plus-media prompt must also fit `--max-context`.
 
 ```bash
 env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
+  build-v100/apps/ninfer-serve /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 8080 --tp 2 --devices 0,1 --max-concurrency 1 \
-  --max-context 4096 --kv-capacity 4096 --kv-dtype int8 --prefill-chunk 1024 \
-  --spec mtp --draft-tokens 3 --lm-head-draft \
-  --vision --vision-max-tokens 1024 --no-prefix-reuse --default-max-tokens 512 --no-thinking
+  --max-context 98304 --kv-capacity 98304 --kv-dtype int8 --prefill-chunk 1024 \
+  --spec mtp --draft-tokens 4 --lm-head-draft \
+  --vision --vision-max-tokens 4096 --no-prefix-reuse --default-max-tokens 512 --no-thinking
 ```
 
 This disables Engine prefix reuse for all requests on this server, including text. It does not

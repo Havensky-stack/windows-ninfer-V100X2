@@ -117,6 +117,9 @@ void validate_draft_ids(const artifact::Binder& binder, artifact::ObjectHandle h
 
 ArtifactLoadPlan bind_artifact(artifact::Binder& binder, qwen3_6::StartupFeatures features,
                                bool expert_storage) {
+    if (features.volta_fast_decode) {
+        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2 Text/None/MTP");
+    }
     ArtifactLoadPlan load_plan;
     BindingPlan& out    = load_plan.bindings;
     out.frontend        = qwen3_6::bind_frontend_resources(binder);

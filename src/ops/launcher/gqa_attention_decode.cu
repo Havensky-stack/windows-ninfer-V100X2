@@ -174,7 +174,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v_scale = cache.v_scale_pages;
 
 #ifdef NINFER_VOLTA_BUILD
-    if constexpr (Geometry::QHeads == 12 && TokenTile == 6) {
+    if constexpr (Geometry::QHeads == 12 && (TokenTile == 5 || TokenTile == 6)) {
         if (volta_long_attention && implementation_window > 16390) {
             const __nv_bfloat16* new_k = nullptr;
             const __nv_bfloat16* new_v = nullptr;
@@ -225,9 +225,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
         };
         if constexpr (Geometry::QHeads == 12 && TokenTile == 5) {
-            if (volta_long_attention && implementation_window > 16390) {
-                launch_volta.template operator()<8, true>();
-            } else if (implementation_window > 16390) {
+            if (implementation_window > 16390) {
                 launch_volta.template operator()<8>();
             } else {
                 launch_volta.template operator()<4>();

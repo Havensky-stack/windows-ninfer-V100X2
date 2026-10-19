@@ -40,12 +40,17 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
 
     if (weight.layout == QuantLayout::VoltaQpnPrepacked && kIntermediate == 8704 &&
         k == 5120 && t >= 4 && t <= 6) {
-        nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4PairedSwiGluOutput, half, true>
-            <<<kIntermediate / 32, 512, 0, stream>>>(
-                static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), x_fp16,
-                kIntermediate, k, t, inverse_weight_divisor,
-                Nvfp4PairedSwiGluOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate});
+        auto launch = [&]<bool Fp32Scale>() {
+            nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4PairedSwiGluOutput, half,
+                                            true, false, false, Fp32Scale>
+                <<<kIntermediate / 32, 512, 0, stream>>>(
+                    static_cast<const std::uint8_t*>(weight.qdata),
+                    static_cast<const std::uint8_t*>(weight.scales), x_fp16,
+                    kIntermediate, k, t, inverse_weight_divisor,
+                    Nvfp4PairedSwiGluOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate});
+        };
+        if (weight.volta_fp32_scale) { launch.template operator()<true>(); }
+        else { launch.template operator()<false>(); }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

@@ -137,6 +137,7 @@ std::string usage_text(const char* argv0) {
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
            "--volta-long-attention selects experimental complete-history SM70 TP2 INT8 attention; floating-point output may differ.\n"
+           "--volta-fast-decode selects experimental QUASAR TP2 Text NVFP4 FP32 epilogues and packed MTP W8; output may differ.\n"
            "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"
            "It changes long-history attention. Default archive budget: 32000000000 bytes; not a process RSS cap.\n"
            "--vision-max-tokens N bounds merged visual tokens per prompt (1..32768, default 32768),\n"
@@ -209,6 +210,8 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(value(arg));
             kv_capacity_explicit = true;
+        } else if (arg == "--volta-fast-decode") {
+            options.volta_fast_decode = true;
         } else if (arg == "--volta-long-attention") {
             options.volta_long_attention = true;
         } else if (arg == "--ram-kv-window") {

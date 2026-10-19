@@ -113,6 +113,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestorePrefixCheckpoint:
+        return "restore_prefix_checkpoint";
     }
     return "unknown";
 }
@@ -488,6 +490,7 @@ std::string format_server_start_json(
           {"ram_kv_archive_bytes", memory.ram_kv_archive_bytes},
           {"ram_kv_budget_bytes", options.ram_kv.budget_bytes},
           {"volta_long_attention", options.volta_long_attention},
+          {"volta_fast_decode", options.volta_fast_decode},
           {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
           {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
           {"max_concurrency", options.max_concurrency},
@@ -611,6 +614,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                         static_cast<double>(report.decode_rounds);
     }
     record["interval_seconds"] = report.interval_seconds;
+    record["speculative"] = Json{{"drafted_tokens", report.speculative_drafted_tokens},
+                                  {"accepted_tokens", report.speculative_accepted_tokens}};
     record["tokens"]           = Json{{"computed_prefill", report.computed_prefill_tokens},
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =

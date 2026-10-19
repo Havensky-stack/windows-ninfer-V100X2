@@ -1056,8 +1056,22 @@ private:
 
     void run_decode_round(const RoundMembership& membership) {
         const std::span<const std::uint32_t> lanes = membership.lane_span();
+        std::array<std::array<std::uint64_t, 2>, kMaximumConcurrency> previous_speculative{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const auto& stats = instance_.program->speculative_stats_lane(lanes[row]);
+            previous_speculative[row] = {stats.drafted_tokens, stats.accepted_tokens};
+        }
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
+        // These are verification counters, not output-publication counters. Include
+        // work already performed even if a stop or cancellation truncates the round.
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const auto& current = instance_.program->speculative_stats_lane(lanes[row]);
+            cumulative_stats_.speculative_drafted_tokens +=
+                current.drafted_tokens - previous_speculative[row][0];
+            cumulative_stats_.speculative_accepted_tokens +=
+                current.accepted_tokens - previous_speculative[row][1];
+        }
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {

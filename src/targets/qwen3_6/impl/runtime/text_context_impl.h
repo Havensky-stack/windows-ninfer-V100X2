@@ -25,6 +25,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/position.h"
+#include "ninfer/ops/proposal_argmax.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
@@ -1463,14 +1464,10 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
                         Tensor prev_token     = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                         Tensor next_token     = io_.mtp->draft_tokens.slice(0, i, 1);
-                        Tensor next_hidden    = work_.alloc(DType::BF16, {kCfg.hidden, 1});
                         const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                         const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
-                                            ar_envelope, next_hidden, logits, next_token);
-                        CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
-                                                   io_.mtp->ar_hidden.bytes(),
-                                                   cudaMemcpyDeviceToDevice, s));
+                                            ar_envelope, io_.mtp->ar_hidden, logits, next_token);
                         ops::increment_i32_scalar(ar_position, s);
                     }
                 } else {
@@ -1700,7 +1697,9 @@ const Tensor& TextContext::rank_linear_state_slots(int rank) const {
 }
 
 void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecutionDevices>& w, std::array<Tensor, kMaximumExecutionDevices>& x,
-                               int fidx, Phase ph, const std::array<Tensor, kMaximumExecutionDevices>& staging) {
+                               int fidx, Phase ph, const std::array<Tensor, kMaximumExecutionDevices>& staging,
+                              const ops::ReplicatedRmsNorm* norm,
+                              const std::array<Tensor, kMaximumExecutionDevices>* normalized_input) {
     const ExecutionContext& execution = ec();
     const int T                       = x[0].ne[1];
     if (active_gqa_envelope_ == nullptr) {
@@ -1721,7 +1720,7 @@ void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecu
         const auto projection =
             workspace_recipe::text_attention_projection<TextConfig>(*ws[r], T,
                                                                     ec().device_count);
-        h[r]         = projection.hidden;
+        h[r]         = normalized_input ? (*normalized_input)[r] : projection.hidden;
         q[r]         = projection.query.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
         gate[r]      = projection.gate.view({kCfg.head_dim, (kCfg.n_q / ec().device_count), T});
         k[r]         = projection.key.view({kCfg.head_dim, (kCfg.n_kv / ec().device_count), T});
@@ -1731,7 +1730,7 @@ void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecu
         k_flat[r]    = k[r].view({(kCfg.kv_size / ec().device_count), T});
         v_flat[r]    = v[r].view({(kCfg.kv_size / ec().device_count), T});
     }
-    for_each_rank(execution, [&](int rank) {
+    if (normalized_input == nullptr) for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
     });
@@ -1797,11 +1796,13 @@ void TextContext::attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecu
 
     Variant::attention_output_projection(active(rank_map([&](int rank) { return a[rank].view({kCfg.q_size / ec().device_count, T}); })),
                                          active(rank_map([&](int rank) { return *w[rank]->o_proj; })), active(x), active(staging), ph, active(ws), execution,
-                                         *tp_[0].events);
+                                         *tp_[0].events, norm);
 }
 
 void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecutionDevices>& w, std::array<Tensor, kMaximumExecutionDevices>& x,
-                              int gidx, Phase ph, const std::array<Tensor, kMaximumExecutionDevices>& staging) {
+                              int gidx, Phase ph, const std::array<Tensor, kMaximumExecutionDevices>& staging,
+                              const ops::ReplicatedRmsNorm* norm,
+                              const std::array<Tensor, kMaximumExecutionDevices>* normalized_input) {
     const ExecutionContext& execution       = ec();
     const int T                             = x[0].ne[1];
     const std::array<WorkspaceArena*, kMaximumExecutionDevices> ws = workspaces();
@@ -1816,7 +1817,7 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
     for (std::size_t r = 0; r < ec().device_count; ++r) {
         const auto control = workspace_recipe::gdn_control<TextConfig>(*ws[r], T,
                                                                       ec().device_count);
-        h[r]               = control.hidden;
+        h[r]               = normalized_input ? (*normalized_input)[r] : control.hidden;
         g[r]               = control.g;
         beta[r]            = control.beta;
         const auto projection =
@@ -1829,7 +1830,7 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
     // The tp1 leaf fuses this RMSNorm into the gating GEMM. There is no split form of the fused
     // kernel and no need for one: the norm is replicated elementwise work over the full-width
     // residual, so it runs per rank and the gating GEMM is the column-parallel leaf.
-    for_each_rank(execution, [&](int rank) {
+    if (normalized_input == nullptr) for_each_rank(execution, [&](int rank) {
         const auto r = static_cast<std::size_t>(rank);
         ops::rmsnorm(x[r], *w[r]->input_norm, kCfg.rms_eps, true, h[r], stream_for(rank));
     });
@@ -1970,25 +1971,27 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
 
     Variant::gdn_output_projection(
         active(rank_map([&](int rank) { return on[rank].view({kCfg.value_dim / ec().device_count, T}); })),
-        active(rank_map([&](int rank) { return *w[rank]->out_proj; })), active(x), active(staging), ph, active(ws), execution, *tp_[0].events);
+        active(rank_map([&](int rank) { return *w[rank]->out_proj; })), active(x), active(staging), ph, active(ws), execution, *tp_[0].events, norm);
 }
 
 void TextContext::mlp_tail_tp2(
     const std::array<const Tensor*, kMaximumExecutionDevices>& norm,
     const std::array<const MlpW*, kMaximumExecutionDevices>& mlp,
     std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
-    const std::array<Tensor, kMaximumExecutionDevices>& staging) {
+    const std::array<Tensor, kMaximumExecutionDevices>& staging,
+    const std::array<Tensor, kMaximumExecutionDevices>* normalized,
+    const ops::ReplicatedRmsNorm* next_input_norm) {
     const auto work = workspaces();
-    const auto hidden = rank_map([&](int rank) {
+    const auto hidden = normalized != nullptr ? *normalized : rank_map([&](int rank) {
         return workspace_recipe::post_mixer_hidden<TextConfig>(*work[rank], x[rank].ne[1]);
     });
-    for_each_rank(ec(), [&](int rank) {
+    if (normalized == nullptr) for_each_rank(ec(), [&](int rank) {
         Tensor output = hidden[rank];
         ops::rmsnorm(x[rank], *norm[rank], kCfg.rms_eps, true, output, stream_for(rank));
     });
     Variant::post_mixer(active(hidden),
                        active(rank_map([&](int rank) { return mlp[rank]->payload; })),
-                       active(x), active(staging), phase, active(work), ec(), *tp_[0].events);
+                       active(x), active(staging), phase, active(work), ec(), *tp_[0].events, next_input_norm);
 }
 
 void TextContext::run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
@@ -1996,44 +1999,74 @@ void TextContext::run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x
                                 DFlashFeatureSink* sink) {
     if (sink != nullptr) { sink->begin(x[0]); }
     const bool prefill = phase == Phase::Prefill;
+    auto input_norm_scopes = workspace_scopes();
+    const bool handoff_norm = x[0].ne[1] <= 8;
+    const auto prepared_input = rank_map([&](int rank) {
+        return handoff_norm ? workspace_recipe::post_mixer_hidden<TextConfig>(*workspaces()[rank], x[rank].ne[1]) : Tensor{};
+    });
     for (int layer = 0; layer < kCfg.n_layers; ++layer) {
+        auto layer_scopes = workspace_scopes();
+        const bool normalized_mixer_output = x[0].ne[1] <= 8;
+        const auto normalized = rank_map([&](int rank) {
+            return normalized_mixer_output
+                ? workspace_recipe::post_mixer_hidden<TextConfig>(*workspaces()[rank], x[rank].ne[1])
+                : Tensor{};
+        });
+        const auto next_weights = rank_map([&](int rank) -> Tensor {
+            if (layer + 1 >= kCfg.n_layers || !handoff_norm) return {};
+            if (ModelConfig::is_full(layer + 1)) {
+                const auto index = ModelConfig::full_idx(layer + 1);
+                return *(rank == 0 ? full_[index].input_norm : full_peer_[rank - 1][index].input_norm);
+            }
+            const auto index = ModelConfig::gdn_idx(layer + 1);
+            return *(rank == 0 ? gdn_[index].input_norm : gdn_peer_[rank - 1][index].input_norm);
+        });
+        const ops::ReplicatedRmsNorm next_norm{active(next_weights), active(prepared_input), kCfg.rms_eps, true};
+        const auto* next_input_norm = handoff_norm && layer + 1 < kCfg.n_layers ? &next_norm : nullptr;
+        const auto* input = handoff_norm && layer > 0 ? &prepared_input : nullptr;
         if (ModelConfig::is_full(layer)) {
             const int index = ModelConfig::full_idx(layer);
             const auto weights = rank_map([&](int rank) -> const FullLayerW* {
                 return rank == 0 ? &full_[index] : &full_peer_[rank - 1][index];
             });
+            const auto norm_weights = rank_map([&](int rank) { return *weights[rank]->post_attn_norm; });
+            const ops::ReplicatedRmsNorm norm{active(norm_weights), active(normalized), kCfg.rms_eps, true};
+            const auto* norm_output = normalized_mixer_output ? &norm : nullptr;
             nvtx::ScopedRange layer_range(
                 prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull,
                 nvtx::Category::Attention, layer);
             {
                 auto scopes = workspace_scopes();
-                attn_mix_tp2(weights, x, index, phase, staging);
+                attn_mix_tp2(weights, x, index, phase, staging, norm_output, input);
             }
             {
                 auto scopes = workspace_scopes();
                 mlp_tail_tp2(
                     rank_map([&](int rank) { return weights[rank]->post_attn_norm; }),
                     rank_map([&](int rank) -> const MlpW* { return &weights[rank]->mlp; }),
-                    x, phase, staging);
+                    x, phase, staging, normalized_mixer_output ? &normalized : nullptr, next_input_norm);
             }
         } else {
             const int index = ModelConfig::gdn_idx(layer);
             const auto weights = rank_map([&](int rank) -> const GdnLayerW* {
                 return rank == 0 ? &gdn_[index] : &gdn_peer_[rank - 1][index];
             });
+            const auto norm_weights = rank_map([&](int rank) { return *weights[rank]->post_attn_norm; });
+            const ops::ReplicatedRmsNorm norm{active(norm_weights), active(normalized), kCfg.rms_eps, true};
+            const auto* norm_output = normalized_mixer_output ? &norm : nullptr;
             nvtx::ScopedRange layer_range(
                 prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn,
                 nvtx::Category::Gdn, layer);
             {
                 auto scopes = workspace_scopes();
-                gdn_mix_tp2(weights, x, index, phase, staging);
+                gdn_mix_tp2(weights, x, index, phase, staging, norm_output, input);
             }
             {
                 auto scopes = workspace_scopes();
                 mlp_tail_tp2(
                     rank_map([&](int rank) { return weights[rank]->post_attn_norm; }),
                     rank_map([&](int rank) -> const MlpW* { return &weights[rank]->mlp; }),
-                    x, phase, staging);
+                    x, phase, staging, normalized_mixer_output ? &normalized : nullptr, next_input_norm);
             }
         }
         if (sink != nullptr) { sink->capture_layer(layer, x[0], stream_for(0)); }
@@ -2086,7 +2119,7 @@ void TextContext::head_argmax_tp(
     const std::array<Tensor, kMaximumExecutionDevices>& hidden,
     const std::array<Weight, kMaximumExecutionDevices>& heads,
     std::int32_t valid_rows,
-    const std::array<Tensor, kMaximumExecutionDevices>& target_tokens) {
+    const std::array<Tensor, kMaximumExecutionDevices>& target_tokens, bool proposal) {
     const int columns = hidden[0].ne[1];
     const int rows = heads[0].n;
     const auto work = workspaces();
@@ -2102,21 +2135,29 @@ void TextContext::head_argmax_tp(
     const auto indices = rank_map([&](int rank) {
         return work[rank]->alloc(DType::I32, {1, columns});
     });
-    ops::linear_column_parallel(active(hidden), active(heads), active(shards), ec());
-    for_each_rank(ec(), [&](int rank) {
-        const int valid = std::min(rows, valid_rows - rank * rows);
-        if (valid <= 0) { throw std::logic_error("vocabulary shard does not cover token domain"); }
-        Tensor value = values[rank].view({columns}), index = indices[rank].view({columns});
-        ops::argmax_with_value(shards[rank], value, index, valid, stream_for(rank));
-    });
+    if (proposal) {
+        for_each_rank(ec(), [&](int rank) {
+            Tensor scratch = shards[rank];
+            Tensor value = values[rank].view({columns});
+            Tensor index = indices[rank].view({columns});
+            ops::proposal_argmax(hidden[rank], heads[rank], scratch, value, index, *work[rank],
+                                 std::min(rows, valid_rows - rank * rows), ec().dev[rank]->sm(),
+                                 stream_for(rank));
+        });
+    } else {
+        ops::linear_column_parallel(active(hidden), active(heads), active(shards), ec());
+        for_each_rank(ec(), [&](int rank) {
+            const int valid = std::min(rows, valid_rows - rank * rows);
+            if (valid <= 0) { throw std::logic_error("vocabulary shard does not cover token domain"); }
+            Tensor value = values[rank].view({columns});
+            Tensor index = indices[rank].view({columns});
+            ops::argmax_with_value(shards[rank], value, index, valid, stream_for(rank));
+        });
+    }
     Tensor gathered_values = work_.alloc(DType::FP32, {ec().device_count, columns});
     Tensor gathered_indices = work_.alloc(DType::I32, {ec().device_count, columns});
-    ops::gather_columns_rank0(gathered_values, active(values), ec(), *tp_[0].events);
-    ops::gather_columns_rank0(gathered_indices, active(indices), ec(), *tp_[0].events);
-    Tensor result = target_tokens[0];
-    ops::merge_argmax_shards(gathered_values, gathered_indices, result, rows, ctx_.stream);
-    ops::broadcast_rank0(result, std::span(target_tokens).subspan(1, ec().device_count - 1),
-                         ec(), *tp_[0].events);
+    ops::allreduce_argmax(active(values), active(indices), active(target_tokens),
+                          gathered_values, gathered_indices, rows, ec(), *tp_[0].events);
 }
 
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
@@ -2382,20 +2423,13 @@ PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
                     auto ar_scopes = workspace_scopes();
                     Tensor prev_token = io_.mtp->draft_tokens.slice(0, i - 1, 1);
                     Tensor next_token = io_.mtp->draft_tokens.slice(0, i, 1);
-                    std::array<Tensor, kMaximumExecutionDevices> next_hidden;
-                    for (std::size_t r = 0; r < ec().device_count; ++r) {
-                        next_hidden[r] = ws[r]->alloc(DType::BF16, {kCfg.hidden, 1});
-                    }
                     const auto ar_visible = static_cast<std::uint32_t>(base_i + T + i);
                     const ops::GqaExecutionEnvelope ar_envelope{ar_visible, ar_visible};
                     mtp_forward_ar_step(prev_token, ar_hidden, ar_position, ar_envelope,
-                                        next_hidden, mtp_logits, next_token);
+                                        ar_hidden, mtp_logits, next_token);
                     for_each_rank(execution, [&](int rank) {
                         const auto r   = static_cast<std::size_t>(rank);
                         cudaStream_t s = stream_for(rank);
-                        CUDA_CHECK(cudaMemcpyAsync(ar_hidden[r].data, next_hidden[r].data,
-                                                   ar_hidden[r].bytes(), cudaMemcpyDeviceToDevice,
-                                                   s));
                         ops::increment_i32_scalar(const_cast<Tensor&>(ar_position[r]), s);
                     });
                 }
@@ -2535,9 +2569,7 @@ void TextContext::mtp_forward_stem_tp2(
     // Draft tokens live on rank 0, so broadcast them before any embedding reader can launch.
     ops::broadcast_rank0(flat_ids, std::span(rank_ids).subspan(1, ec().device_count - 1),
                          ec(), *tp_[0].events);
-    const auto inputs = rank_map([&](int rank) {
-        return work[rank]->alloc(DType::BF16, {input_rows, columns});
-    });
+    std::array<Tensor, kMaximumExecutionDevices> inputs{};
     const auto weights = rank_map([&](int rank) { return *mtp_weights_for(rank).fc; });
     for_each_rank(ec(), [&](int rank) {
         const auto stream = stream_for(rank);
@@ -2559,21 +2591,43 @@ void TextContext::mtp_forward_stem_tp2(
                          *mtp_weights_for(rank).pre_fc_norm_hidden,
                          kCfg.rms_eps, true, normalized, stream);
         }
-        const int offset = (rank % embedding_ranks) * input_rows;
-        const auto* source = static_cast<const std::uint16_t*>(normalized.data) + offset;
-        CUDA_CHECK(cudaMemcpy2DAsync(inputs[rank].data, input_rows * sizeof(std::uint16_t),
-                                     source, kCfg.hidden * sizeof(std::uint16_t),
-                                     input_rows * sizeof(std::uint16_t), columns,
-                                     cudaMemcpyDeviceToDevice, stream));
+        if (input_rows == kCfg.hidden) {
+            // The complete normalized plane is already contiguous and remains live
+            // through FC. TP4 still materializes each strided half-width slice.
+            inputs[rank] = normalized;
+        } else {
+            inputs[rank] = work[rank]->alloc(DType::BF16, {input_rows, columns});
+            const int offset = (rank % embedding_ranks) * input_rows;
+            const auto* source = static_cast<const std::uint16_t*>(normalized.data) + offset;
+            CUDA_CHECK(cudaMemcpy2DAsync(inputs[rank].data, input_rows * sizeof(std::uint16_t),
+                                         source, kCfg.hidden * sizeof(std::uint16_t),
+                                         input_rows * sizeof(std::uint16_t), columns,
+                                         cudaMemcpyDeviceToDevice, stream));
+        }
         x[rank] = roots[rank].residual;
         ah[rank] = roots[rank].attention_hidden;
     });
-    ops::linear_row_parallel(active(inputs), active(weights), active(x), active(staging),
-                             ec(), *tp_[0].events);
-    for_each_rank(ec(), [&](int rank) {
-        ops::rmsnorm(x[rank], *mtp_weights_for(rank).input_norm, kCfg.rms_eps, true,
-                     ah[rank], stream_for(rank));
-    });
+    if (ec().device_count == 2) {
+        // Each shard keeps its represented BF16 partial in the existing staging plane.
+        // The collective retains the BF16 sum before evaluating the input norm.
+        const auto partials = rank_map([&](int rank) {
+            return staging[rank].view({kCfg.hidden, columns});
+        });
+        for_each_rank(ec(), [&](int rank) {
+            Tensor partial = partials[rank];
+            ops::linear(inputs[rank], weights[rank], partial, stream_for(rank));
+        });
+        const auto norms = rank_map([&](int rank) { return *mtp_weights_for(rank).input_norm; });
+        const ops::ReplicatedRmsNorm norm{active(norms), active(ah), kCfg.rms_eps, true};
+        ops::allreduce_sum_rmsnorm_to(active(partials), active(x), norm, ec(), *tp_[0].events);
+    } else {
+        ops::linear_row_parallel(active(inputs), active(weights), active(x), active(staging),
+                                 ec(), *tp_[0].events);
+        for_each_rank(ec(), [&](int rank) {
+            ops::rmsnorm(x[rank], *mtp_weights_for(rank).input_norm, kCfg.rms_eps, true,
+                         ah[rank], stream_for(rank));
+        });
+    }
 }
 
 void TextContext::mtp_forward_tail_tp2(std::array<Tensor, kMaximumExecutionDevices>& x, const std::array<Tensor, kMaximumExecutionDevices>& ah,
@@ -2736,7 +2790,7 @@ void TextContext::proposal_argmax_tp2(
     const auto destinations = rank_map([&](int rank) {
         return rank == 0 ? tokens : work[rank]->alloc(DType::I32, {columns});
     });
-    head_argmax_tp(hidden, heads, total, destinations);
+    head_argmax_tp(hidden, heads, total, destinations, true);
     if (proposal_head_ != nullptr) {
         ops::proposal_remap_token_ids(tokens, proposal_head_ids_, total, ctx_.stream);
     }

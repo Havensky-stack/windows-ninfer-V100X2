@@ -73,6 +73,8 @@ struct Weight {
     std::int64_t scale_nb[4]   = {0, 0, 0, 0};
     float weight_scale_divisor = 0.0F;
     float input_scale_divisor  = 0.0F;
+    // Private SM70 NVFP4 execution profile; stored codes/scales/divisors stay unchanged.
+    bool volta_fp32_scale = false;
 };
 
 } // namespace ninfer

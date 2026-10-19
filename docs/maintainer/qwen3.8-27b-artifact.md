@@ -153,19 +153,27 @@ On SM70, all resident NVFP4 Text parents are permuted once during loading into t
 Volta QPN fragment layout, without changing code/scale values or retaining another weight copy.
 Attention and GDN input projections use direct-output QPN for narrow token extents; wide calls
 decode once into transient FP16 weights for CUTLASS and distribute the BF16 parent result.
+The default packed route retains per-group FP16 scaling. The default-off
+`--volta-fast-decode` profile applies the global divisor after FP32 K reduction and enables
+shape-specific packed MTP W8 arithmetic; it is QUASAR SM70 TP2 Text/None/MTP only.
 The `.ninfer` file remains unchanged. These implementation profiles require operator-oracle
 and whole-model evidence; exact packing preservation alone is not a quality claim.
 
 SM70 W8 vocabulary output heads also use an in-place load-time permutation. Codes are ordered
 as `[N/32 tile][K/8 slice][QPN lane][8 code bytes]` and the unchanged FP16 scales as
-`[N/32 tile][K/32 group][QPN lane]`. Token embedding and non-vocabulary W8 matrices retain
-RowSplit storage. One/two-column output calls transpose packed tiles into shared memory and
+`[N/32 tile][K/32 group][QPN lane]`. Token embedding retains RowSplit storage. Non-vocabulary W8 matrices also retain RowSplit
+except the five MTP projections selected by the experimental fast-decode profile. One/two-column output calls transpose packed tiles into shared memory and
 retain the original FP32 SIMT accumulation association; three through eight-column calls retain the
 four-partition QPN association, and wider calls decode the same packed planes into the Volta
 MMA staging tiles. No second resident weight copy or request-time repacking is added.
 
-The trial admits SM70 TP2 Text/None/MTP/DFlash and experimental TP1/PP2 Text/None/MTP.
-Standalone TP1, TP4 and Vision are rejected. PP2 uses the same registered artifact and
+The trial admits SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP,
+and experimental TP1/PP2 Text/None/MTP. Standalone TP1 and TP4 are rejected. Vision excludes
+DFlash, PP2 and both experimental decode switches. Its 333 stored Vision objects (295,711,648
+bytes) are uploaded only to the primary device when enabled; Text-only loading validates
+them without allocating GPU storage. The same published v3 file supports both startup modes;
+no second download or conversion is required. Vision weights come from the converter's official
+Qwen source, not a separately QAT-trained QUASAR vision tower. PP2 uses the same registered artifact and
 complete immutable parents: layers 0..31 reside on the second device, layers 32..63
 and output/MTP on the primary; token embedding is replicated. No TP shard repacking
 or new quantization is performed. See the [runtime ownership contract](concurrent-inference-architecture.md#121-single-request-pp2-experiment).

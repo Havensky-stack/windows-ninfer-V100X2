@@ -72,6 +72,7 @@ struct BenchOptions {
     std::uint32_t pipeline_chunks   = 8;
     RamKvOptions ram_kv;
     bool volta_long_attention = false;
+    bool volta_fast_decode = false;
     std::vector<int> devices;
     bool use_cuda_graph            = true;
     bool profile_measured          = false;
@@ -130,6 +131,7 @@ struct BenchEnvironment {
     ProposalHead proposal_head                     = ProposalHead::Full;
     bool use_cuda_graph                            = true;
     bool volta_long_attention                      = false;
+    bool volta_fast_decode = false;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
     int repetitions                                = 0;

@@ -95,9 +95,9 @@ int run_case(std::int32_t physical_rows, std::int32_t valid_rows, std::int32_t t
     return failures;
 }
 
-int run_shard_case(std::int32_t tokens, std::int32_t ranks) {
-    constexpr std::int32_t physical_rows = 248320;
-    constexpr std::int32_t valid_rows = 248077;
+int run_shard_case(std::int32_t tokens, std::int32_t ranks, bool proposal = false) {
+    const std::int32_t physical_rows = proposal ? 131072 : 248320;
+    const std::int32_t valid_rows = proposal ? 131072 : 248077;
     const std::int32_t shard_rows = physical_rows / ranks;
     auto logits = make_logits(physical_rows, tokens, valid_rows);
     for (std::int32_t t = 0; t < tokens; ++t) {
@@ -209,6 +209,9 @@ int main() {
         for (const int tokens : {1, 4, 8, 32, 63, 64, 65}) {
             failures += run_shard_case(tokens, ranks);
         }
+    }
+    for (const int tokens : {1, 4, 5, 8, 64, 65}) {
+        failures += run_shard_case(tokens, 2, true);
     }
     std::cout << (failures ? "FAIL" : "OK") << " argmax\n";
     return failures ? 1 : 0;

@@ -30,6 +30,7 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_single_qpn_volta_partial
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
     using G = Gqa27Tp2Geometry;
     constexpr int D = kGqaHeadDim, Bc = 32, Stride = D + 8, PStride = Bc + 8;
+    constexpr int Vector = 16;
     constexpr float Log2E = 1.4426950408889634074f;
     constexpr unsigned Mask = 0xffffffffu;
     __shared__ __align__(16) half qs[8][Stride];
@@ -128,20 +129,31 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_single_qpn_volta_partial
     float accum[8] = {};
     float maximum = -CUDART_INF_F, denominator = 0.0f;
     for (int tile = first_tile; tile < end; tile += Bc) {
-        for (int chunk = tid; chunk < Bc * (D / 8); chunk += 256) {
-            const int key = tile + chunk / (D / 8);
-            const int dim = (chunk % (D / 8)) * 8;
+        for (int chunk = tid; chunk < Bc * (D / Vector); chunk += 256) {
+            const int key = tile + chunk / (D / Vector);
+            const int dim = (chunk % (D / Vector)) * Vector;
             const int local = key - tile;
             if (key >= begin && key < end) {
                 const int page = pages[(key >> kPagedKVPageShift) - first_page];
                 const int offset = key & kPagedKVPageMask;
                 const auto code = gqa_kv_quant_code_index<G>(page, head, dim, offset);
                 const auto group = gqa_kv_quant_scale_index<G>(page, head, dim / 64, offset);
-                store_vec(&ks[local][dim], gqa_kv_dequant_i8x8_f16_from(keys + code, key_scales[group]));
-                store_vec(&vs[local][dim], gqa_kv_dequant_i8x8_f16_from(values + code, value_scales[group]));
+                const half kscale = key_scales[group], vscale = value_scales[group];
+#pragma unroll
+                for(int c=0;c<Vector;c+=16) {
+                    const uint4 kr = __ldcs(reinterpret_cast<const uint4*>(keys+code+c));
+                    const uint4 vr = __ldcs(reinterpret_cast<const uint4*>(values+code+c));
+                    store_vec(&ks[local][dim+c],gqa_kv_dequant_i8x8_f16(make_int2(kr.x,kr.y),kscale));
+                    store_vec(&ks[local][dim+c+8],gqa_kv_dequant_i8x8_f16(make_int2(kr.z,kr.w),kscale));
+                    store_vec(&vs[local][dim+c],gqa_kv_dequant_i8x8_f16(make_int2(vr.x,vr.y),vscale));
+                    store_vec(&vs[local][dim+c+8],gqa_kv_dequant_i8x8_f16(make_int2(vr.z,vr.w),vscale));
+                }
             } else {
-                store_vec(&ks[local][dim], make_int4(0, 0, 0, 0));
-                store_vec(&vs[local][dim], make_int4(0, 0, 0, 0));
+#pragma unroll
+                for(int c=0;c<Vector;c+=8) {
+                    store_vec(&ks[local][dim+c],make_int4(0,0,0,0));
+                    store_vec(&vs[local][dim+c],make_int4(0,0,0,0));
+                }
             }
         }
         __syncthreads();

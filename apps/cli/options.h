@@ -40,6 +40,7 @@ struct Options {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     RamKvOptions ram_kv;
     bool volta_long_attention = false;
+    bool volta_fast_decode = false;
     SpeculativeOptions speculative;
     bool enable_vision  = false;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;

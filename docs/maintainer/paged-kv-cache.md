@@ -29,7 +29,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 
 - request preemption、swap 或跨 GPU storage；默认完整注意力路径不 offload，显式 RAM-KV 实验见 §15；
 - active requests 之间共享可写 prefix、page reference counting 或 copy-on-write branching；
-- arbitrary longest-common-prefix reuse；
+- 在每个任意 token 边界零重算的 longest-common-prefix reuse（有界完整状态检查点见 §10）；
 - 用一个 universal raw-byte allocator 在 serving 期间动态重分不同 KV layouts 的显存；
 - 为 bounded cyclic KV 或 operator transient K/V 强行提供同一种 paging；
 - 在 serving 期间改变 pool layout 或 page size；
@@ -752,7 +752,8 @@ Cancellation 在第一个观察到它的 GPU boundary release bundle；不修改
 Qwen3.6 retained sequence 包含：
 
 - current resume frontier；
-- 一份有效时的 typed rewrite checkpoint，其 kind 为 `TurnClosure` 或 `ResponseReplay`。
+- 一份有效时的 typed rewrite checkpoint，其 kind 为 `TurnClosure` 或 `ResponseReplay`；
+- 普通 Text/None/MTP 的有界 RAM prefix checkpoints（Vision、DFlash、稀疏 RAM-KV 不启用）。
 
 每个 checkpoint 都必须同时描述：
 
@@ -771,15 +772,40 @@ KV allocation。Incoming prompt 的复用路径为：
   finalization；
 - prompt 匹配已保存 rewrite checkpoint 并在其后有新 suffix 时，claim bundle、truncate 到 checkpoint
   frontier、恢复 checkpoint，再 prefill suffix；
-- common prefix 结束在没有完整 checkpoint 的任意其他位置时，cache miss。
+- 较短输入或后半段被修改时，选择完整 identity 匹配的最远 RAM prefix checkpoint，
+  恢复后只 prefill 剩余 suffix；没有任何完整匹配 checkpoint 时才是 cache miss。
 
 `TurnClosure` / `ResponseReplay` 只记录快照的捕获用途，不改变 payload 的数学内容和 page ownership。
 只要完整 prefix identity 匹配，runtime 可以跨当前 desired kind 恢复已有快照，并按实际快照 kind 报告
 restore path。新 desired frontier 已落在 selected reuse frontier 之前且没有对应快照时，不回退 page
 allocation 来强制重算；本次保留既有快照并延迟新 capture。
 
-最后一种情况不是 page-size limitation。缺少的是对应 Linear Attention/backend continuation state，而不是
-KV page。
+RAM checkpoint 是所有 compute ranks 的原始 convolution / FP32 recurrent bytes 加 primary rank 的
+normalized tail hidden，不是另一份 KV。每 Program 的 image payload 上限为 2 GiB，按
+`max_concurrency` 均分；预算不足容纳一份完整 image 的 lane 不启用此扩展。复用开启且至少可容纳
+两份 image 时，先在 `min(64, max(1, prompt_tokens/2))` 保存早期检查点，再回到原有 chunk grid。
+后续 interval 按 prompt 长度与 image 容量计算，并向上取整到完整 prefill wave，只在跨越 interval
+的实际 chunk 末端及最终 prompt frontier 捕获，不复制每个小 chunk。追加历史达到预算后回收
+最冗余的内部 image，可容纳两份时保留首个和最新端点；不逐 token 保存整个历史。Transfer 同步完成后
+image 才可见，不增加显存。捕获和 suffix 前的恢复计入 prefill 时间；MTP exact hit 的延迟恢复计入
+首次 decode 时间，不计入首 token 延迟。
+
+Claim 时仍校验 token/type/position/media identity，并把 Main/MTP KV truncate 到所选 frontier。
+Suffix prefill 前恢复每个 rank 的 GDN 分片。MTP exact hit 的首 token 仅从已保存 tail hidden 采样；
+Sequence 可继续独占持有该 frontier 的完整 RAM image，用显式 deferred frontier 标记 GPU GDN slot
+尚不可读。首次 decode 或后续 suffix prefill 消费状态前原样恢复；首 token 即 terminal 时保留完整
+image，不必先上传 GDN。重选 GPU rewrite checkpoint、导入另一 RAM image、full reset 或 eviction
+会替换/清除该标记，不能把旧 GPU slot 当作所选 frontier。MTP bridge/proposal 在首 token 发布后、
+首次 decode 前物化，仍使用同一 bridge 公式。切换分支时丢弃
+所选 frontier 之后的 images 的有效标记，避免旧分支状态被新 ledger 误认。Full reset 使旧
+frontiers 全部失效，但复用有界 host buffers，避免每次无关请求重新分配/清零大量 RAM。
+取消、retained eviction 和关闭 prefix reuse 的 cold request 释放 images。
+只报告 checkpoint frontier 为 cached tokens，其后即便 token 相同也按
+实际重算计费。这是完整状态恢复，不是稀疏注意力；额外 prefill 分块可能改变浮点结合顺序，
+不能据此声称与不同分块的 cold run bit-equivalent。
+
+没有对应完整状态时不能直接截断到 common prefix；限制来自 Linear Attention/backend continuation
+state，而不是 KV page size。
 
 ### 10.2 Non-page-aligned frontier
 
@@ -798,7 +824,7 @@ Ownership transfer 后可以从 logical position 1000 继续。无需把 frontie
 一个 retained bundle 同时只能被一个 active request claim。所谓 pin 是 retained entry 持有各 pool
 allocations，使相应 IDs 不属于各自 free sets；不需要 page refcount 或特殊 allocator role。
 
-选择 rewrite checkpoint 时，claim transaction 保留包含 checkpoint frontier 的最后一个部分 page，并把其后的完整
+选择 rewrite 或 RAM prefix checkpoint 时，claim transaction 保留包含 checkpoint frontier 的最后一个部分 page，并把其后的完整
 pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuation state 一起切换到该 checkpoint。
 该过程不复制 retained KV payload。
 
@@ -924,7 +950,7 @@ fixed unit；new admission 可以 claim 或先驱逐 retained entry，不能降�
 | retained frontier 非 page-aligned | 原 offset 精确复用，不向 page boundary 取整 |
 | prompt 正好结束在已保存 rewrite checkpoint | exclusive claim 后恢复完整 checkpoint，从 checkpoint hidden 完成 finalization |
 | 命中已保存 rewrite checkpoint 且有 suffix | exclusive claim 后 truncate pages、恢复完整 checkpoint，再 prefill suffix |
-| 只有更短 token prefix match，但该位置没有 checkpoint | cache miss |
+| 更短 token prefix match | 恢复其内最远完整 checkpoint 并重算尾段；无任何 checkpoint 则 miss |
 | retained occupancy 阻塞 admission | Prefix Cache eviction 完整 entry 后重试 atomic admission |
 | retained eviction 后，request set 满足 main contract 但 backend reservation 失败 | startup sizing 或 accounting invariant violation；不是正常等待条件 |
 | request cancellation | in-flight unit 完成后的 boundary release bundle |

@@ -123,6 +123,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     constexpr int Groups        = D / kGqaKvQuantGroup; // quant groups per key row
     constexpr bool InlineQK = Geometry::QHeads == 12 && TokenTile == 5 &&
                               SharedSoftmax && !Fp32Pv;
+    constexpr bool PrefetchKv = Geometry::QHeads == 12 && TokenTile == 5 && WarpsPerCta == 8;
+    constexpr int KvChunks = Bc * (D / 8) / Threads;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;
 
@@ -361,6 +363,36 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
         float m_lo = -CUDART_INF_F, m_hi = -CUDART_INF_F;
         float l_lo = 0.0f, l_hi = 0.0f;
 
+        // Keep the next tile's packed bytes in registers while the current QK/softmax/PV
+        // runs. The qualified five-query TP2 route keeps the same split, QK, softmax
+        // and PV order; other widths retain their measured staging schedule.
+        int2 next_k[PrefetchKv ? KvChunks : 1], next_v[PrefetchKv ? KvChunks : 1];
+        half next_ks[PrefetchKv ? KvChunks : 1], next_vs[PrefetchKv ? KvChunks : 1];
+        auto prefetch_kv = [&](int tile) {
+#pragma unroll
+            for (int c = 0; c < KvChunks; ++c) {
+                const int chunk = tid + c * Threads;
+                const int key_l = chunk / (D / 8);
+                const int d = (chunk % (D / 8)) * 8;
+                const int key = tile + key_l;
+                next_k[c] = make_int2(0, 0);
+                next_v[c] = make_int2(0, 0);
+                next_ks[c] = __float2half(0.0f);
+                next_vs[c] = __float2half(0.0f);
+                if (key >= split_start && key < split_end) {
+                    const int page = physical_pages_s[(key >> kPagedKVPageShift) - first_page];
+                    const int offset = key & kPagedKVPageMask;
+                    const auto code = gqa_kv_quant_code_index<Geometry>(page, kv_head, d, offset);
+                    const auto group = gqa_kv_quant_scale_index<Geometry>(
+                        page, kv_head, d / kGqaKvQuantGroup, offset);
+                    next_k[c] = load_vec<int2>(cache_k_i8 + code);
+                    next_v[c] = load_vec<int2>(cache_v_i8 + code);
+                    next_ks[c] = cache_k_scale[group];
+                    next_vs[c] = cache_v_scale[group];
+                }
+            }
+        };
+        if constexpr (PrefetchKv) { prefetch_kv(first_tile); }
 
         for (int kb = 0; kb < key_blocks; ++kb) {
             const int k0 = first_tile + kb * Bc;
@@ -374,28 +406,44 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
             // and the store. Every key in range is read from the cache, including this tile's
             // own new tokens -- the append block above has already written and __syncthreads()'d
             // them, so there is no need for the bf16 kernel's separate "from_new" source.
-            for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
-                const int key_l = chunk / (D / 8);
-                const int d     = (chunk - key_l * (D / 8)) * 8;
-                const int key   = k0 + key_l;
-                half* k_dst     = &k_s[key_l * SmemStride + d];
-                half* v_dst     = &v_s[key_l * SmemStride + d];
-                if (key >= split_start && key < split_end) {
-                    const int page_offset = key & kPagedKVPageMask;
-                    const std::int64_t code_off =
-                        gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
-                    const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
-                        physical_page, kv_head, d / kGqaKvQuantGroup, page_offset);
-                    const __half ks = cache_k_scale[scale_off];
-                    const __half vs = cache_v_scale[scale_off];
-                    store_vec(k_dst, gqa_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
-                    store_vec(v_dst, gqa_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
-                } else {
-                    store_vec(k_dst, make_int4(0, 0, 0, 0));
-                    store_vec(v_dst, make_int4(0, 0, 0, 0));
+            if constexpr (PrefetchKv) {
+#pragma unroll
+                for (int c = 0; c < KvChunks; ++c) {
+                    const int chunk = tid + c * Threads;
+                    const int key_l = chunk / (D / 8);
+                    const int d = (chunk % (D / 8)) * 8;
+                    store_vec(&k_s[key_l * SmemStride + d],
+                              gqa_kv_dequant_i8x8_f16(next_k[c], next_ks[c]));
+                    store_vec(&v_s[key_l * SmemStride + d],
+                              gqa_kv_dequant_i8x8_f16(next_v[c], next_vs[c]));
+                }
+            } else {
+                for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+                    const int key_l = chunk / (D / 8);
+                    const int d     = (chunk - key_l * (D / 8)) * 8;
+                    const int key   = k0 + key_l;
+                    half* k_dst     = &k_s[key_l * SmemStride + d];
+                    half* v_dst     = &v_s[key_l * SmemStride + d];
+                    if (key >= split_start && key < split_end) {
+                        const int page_offset = key & kPagedKVPageMask;
+                        const std::int64_t code_off =
+                            gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d, page_offset);
+                        const std::int64_t scale_off = gqa_kv_quant_scale_index<Geometry>(
+                            physical_page, kv_head, d / kGqaKvQuantGroup, page_offset);
+                        const __half ks = cache_k_scale[scale_off];
+                        const __half vs = cache_v_scale[scale_off];
+                        store_vec(k_dst, gqa_kv_dequant_i8x8_f16_from(&cache_k_i8[code_off], ks));
+                        store_vec(v_dst, gqa_kv_dequant_i8x8_f16_from(&cache_v_i8[code_off], vs));
+                    } else {
+                        store_vec(k_dst, make_int4(0, 0, 0, 0));
+                        store_vec(v_dst, make_int4(0, 0, 0, 0));
+                    }
                 }
             }
             __syncthreads();
+            if constexpr (PrefetchKv) {
+                if (kb + 1 < key_blocks) { prefetch_kv(k0 + Bc); }
+            }
 
             // The default five-query softmax consumes both groups on warp 0. Interleave
             // their unchanged contractions there, avoiding the shared-score handoff.

@@ -39,6 +39,9 @@ int main() {
     failures += check(parse({"ninfer-serve", "model.ninfer", "--volta-long-attention"}).volta_long_attention &&
                           !defaults.volta_long_attention,
                       "server Volta long attention must be explicit and disabled by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--volta-fast-decode"}).volta_fast_decode &&
+                          !defaults.volta_fast_decode,
+                      "experimental fast decode must be explicit and disabled by default");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");

@@ -67,6 +67,8 @@ add_library(ninfer_ops STATIC
   ops/common/allreduce.cu
   ops/launcher/allreduce.cu
   ops/launcher/add_bias.cu
+  ops/proposal_argmax/q4_sm70.cu
+  ops/proposal_argmax/proposal_argmax.cpp
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu

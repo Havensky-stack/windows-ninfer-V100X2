@@ -60,6 +60,7 @@ int main() {
     options.speculative.draft_tokens       = 3;
     options.speculative.proposal_head      = ninfer::ProposalHead::Optimized;
     options.enable_vision                  = false;
+    options.volta_fast_decode              = true;
     options.allow_prefix_reuse             = false;
     options.preserve_thinking              = true;
     options.sampling_overrides.temperature = 0.6F;
@@ -132,6 +133,8 @@ int main() {
                       "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
+    failures += check(server.at("engine").at("volta_fast_decode") == true,
+                      "experimental numerical profile missing from server log");
     // Tensor-parallel identity. Every other engine/memory field is rank 0's, so
     // `tp`/`devices` are what let a reader attribute the record to a dual-device run.
     failures += check(server.at("engine").at("tp") == 2, "tensor-parallel width missing");
@@ -325,6 +328,11 @@ int main() {
     failures += check(response_restore.at("result").at("prefix_reuse_path") ==
                           "restore_response_checkpoint",
                       "response checkpoint reuse path missing");
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestorePrefixCheckpoint;
+    failures += check(Json::parse(format_request_done_json("serve-test", 3002, context, outcome))
+                          .at("result").at("prefix_reuse_path") == "restore_prefix_checkpoint",
+                      "partial prefix checkpoint reuse path missing");
+    outcome.metrics.prefix_reuse_path = ninfer::PrefixReusePath::RestoreResponseCheckpoint;
     failures += check(done.at("timings_seconds").at("decode").get<double>() ==
                           outcome.metrics.decode_seconds,
                       "decode time lost precision");
@@ -364,6 +372,8 @@ int main() {
     throughput.committed_decode_tokens         = 40;
     throughput.decode_rounds                   = 10;
     throughput.decode_row_rounds               = 18;
+    throughput.speculative_drafted_tokens       = 30;
+    throughput.speculative_accepted_tokens      = 23;
     throughput.scheduler.running_requests      = 2;
     throughput.scheduler.prefilling_requests   = 1;
     throughput.scheduler.decode_ready_requests = 1;
@@ -381,6 +391,9 @@ int main() {
                       "throughput token deltas mismatch");
     failures += check(throughput_json.at("decode_batch").at("average_size") == 1.8,
                       "throughput batch average mismatch");
+    failures += check(throughput_json.at("speculative").at("drafted_tokens") == 30 &&
+                          throughput_json.at("speculative").at("accepted_tokens") == 23,
+                      "real-time speculative token deltas mismatch");
 
     const std::string console_prefix =
         format_console_log_prefix(std::chrono::system_clock::time_point{}, ConsoleLogLevel::Info);

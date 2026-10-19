@@ -245,6 +245,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.ram_kv                   = options_.ram_kv;
     engine_options.volta_long_attention     = options_.volta_long_attention;
+    engine_options.volta_fast_decode     = options_.volta_fast_decode;
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;

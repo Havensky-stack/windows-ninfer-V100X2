@@ -123,6 +123,38 @@ void verify(const char* path) {
         require(plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,
                 "QUASAR DFlash projections lost their W8 format");
     }
+    for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp}) {
+        Binder binder(reader, 2);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+            {.vision = true, .speculative = backend}, 2);
+        int vision_objects = 0;
+        for (const auto& placement : plan.materialization.device_objects) {
+            if (object_name(binder.descriptor(placement.object)).starts_with("vision/")) {
+                require(placement.device == 0, "Vision must live only on the primary TP2 device");
+                ++vision_objects;
+            }
+        }
+        require(vision_objects > 0 && !plan.bindings.features.volta_fast_decode,
+                "Vision must upload its payload and keep experimental Text kernels disabled");
+    }
+    {
+        Binder binder(reader, 2);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+            {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::Mtp}, 2);
+        require(plan.bindings.features.volta_fast_decode, "experimental profile was not selected");
+    }
+    for (int mode = 0; mode < 3; ++mode) {
+        Binder binder(reader, 2);
+        bool rejected = false;
+        try {
+            (void)bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+                {.vision = true, .volta_fast_decode = mode == 0,
+                 .speculative = mode == 1 ? ninfer::SpeculativeBackend::DFlash
+                                          : ninfer::SpeculativeBackend::Mtp},
+                mode == 2 ? 1 : 2, mode == 2 ? 2 : 1);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "unsupported experimental/Vision/DFlash/PP2 combination admitted");
+    }
 }
 } // namespace
 
@@ -132,7 +164,7 @@ int main() {
     try {
         verify(path);
         std::cout << "OK QUASAR exact packed ranges, 256 scale pairs, TP2 None/MTP/DFlash placement "
-                     "and zero GPU Vision objects\n";
+                     "zero Text GPU Vision objects, TP2 Vision placement and experimental admission\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

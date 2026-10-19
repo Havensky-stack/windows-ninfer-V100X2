@@ -10,21 +10,28 @@ NInfer PyQt control console
 Usage:
   ninfer-gui.sh [--repo PATH] [--binary PATH] [--artifact PATH]
 
-The launcher selects .venv-gui/bin/python when present, otherwise python3.
+The launcher prefers PYTHON, then .venv-gui, then an installed Python with Qt.
 The Python interpreter must provide PyQt6 or PyQt5.
 EOF
     exit 0
 fi
+has_qt() {
+    command -v "$1" >/dev/null 2>&1 && "$1" -c \
+        'import importlib.util; raise SystemExit(0 if importlib.util.find_spec("PyQt6") or importlib.util.find_spec("PyQt5") else 1)' \
+        >/dev/null 2>&1
+}
 if [[ -n "${PYTHON:-}" ]]; then
     gui_python=${PYTHON}
-elif [[ -x "${repo_dir}/.venv-gui/bin/python" ]]; then
-    gui_python="${repo_dir}/.venv-gui/bin/python"
 else
-    gui_python=python3
+    gui_python=''
+    for candidate in "${repo_dir}/.venv-gui/bin/python" python3 python3.13 python3.12 python3.11 python3.10; do
+        if has_qt "${candidate}"; then
+            gui_python=${candidate}
+            break
+        fi
+    done
 fi
-if ! command -v "${gui_python}" >/dev/null 2>&1 || ! "${gui_python}" -c \
-    'import importlib.util; raise SystemExit(0 if importlib.util.find_spec("PyQt6") or importlib.util.find_spec("PyQt5") else 1)' \
-    >/dev/null 2>&1; then
+if [[ -z "${gui_python}" ]] || ! has_qt "${gui_python}"; then
     echo "未找到 PyQt6/PyQt5（当前解释器：${gui_python}）。请按 docs/gui.md 安装，或设置 PYTHON。" >&2
     exit 1
 fi

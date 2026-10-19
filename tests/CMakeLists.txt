@@ -340,6 +340,7 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
+  proposal_argmax
   gdn_gating
   gdn_gating_proj
   rope
@@ -394,6 +395,9 @@ ninfer_add_op_test(ninfer_gdn_projections_split_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_nvfp4_input_sm70_test
   SOURCES ops/test_nvfp4_input_sm70.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_nvfp4_row_add_sm70_test
+  SOURCES ops/test_nvfp4_row_add_sm70.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_output_head_split_test
   SOURCES ops/test_output_head_split.cpp

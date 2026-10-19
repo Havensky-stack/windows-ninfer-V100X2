@@ -313,6 +313,7 @@ int main(int argc, char** argv) {
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.ram_kv         = cli.ram_kv;
         engine_options.volta_long_attention = cli.volta_long_attention;
+        engine_options.volta_fast_decode = cli.volta_fast_decode;
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.vision_max_tokens = cli.vision_max_tokens;

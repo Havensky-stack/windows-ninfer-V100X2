@@ -91,6 +91,17 @@ def require_usage(usage: Any, prompt_key: str, completion_key: str) -> tuple[int
     return prompt, completion
 
 
+def require_openai_usage(usage: Any) -> tuple[int, int]:
+    prompt, completion = require_usage(usage, "prompt_tokens", "completion_tokens")
+    if usage.get("total_tokens") != prompt + completion:
+        raise ContractError("OpenAI total_tokens does not equal prompt + completion")
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else None
+    if type(cached) is not int or not 0 <= cached <= prompt:
+        raise ContractError("OpenAI cached-token usage is missing or outside the input range")
+    return prompt, completion
+
+
 def openai_nonstream(base_url: str, model: str, messages: list[dict[str, Any]], *, max_tokens: int,
                      stop: list[str] | None = None) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -111,10 +122,7 @@ def openai_nonstream(base_url: str, model: str, messages: list[dict[str, Any]], 
         raise ContractError("OpenAI response is missing assistant content")
     if choice.get("finish_reason") not in {"stop", "length", "tool_calls"}:
         raise ContractError(f"invalid OpenAI finish_reason: {choice.get('finish_reason')!r}")
-    prompt, completion = require_usage(response.get("usage"), "prompt_tokens", "completion_tokens")
-    usage = response["usage"]
-    if usage.get("total_tokens") != prompt + completion:
-        raise ContractError("OpenAI total_tokens does not equal prompt + completion")
+    require_openai_usage(response.get("usage"))
     return response
 
 
@@ -188,9 +196,7 @@ def parse_openai_stream(response: Response) -> tuple[str, str, str, dict[str, An
             finish_reason = reason
     if not saw_role or not saw_done or finish_reason is None or usage is None:
         raise ContractError("OpenAI stream did not complete its role/finish/usage/[DONE] contract")
-    prompt, completion = require_usage(usage, "prompt_tokens", "completion_tokens")
-    if usage.get("total_tokens") != prompt + completion:
-        raise ContractError("OpenAI streamed total_tokens does not equal prompt + completion")
+    require_openai_usage(usage)
     return "".join(content), "".join(reasoning), finish_reason, usage
 
 
@@ -371,7 +377,9 @@ def exercise(base_url: str, model: str, *, text_only: bool = False) -> dict[str,
         raise ContractError("streamed reasoning differs from the non-streaming greedy response")
     if stream_finish != nonstream["choices"][0]["finish_reason"]:
         raise ContractError("streamed and non-streaming finish reasons differ")
-    if stream_usage != nonstream["usage"]:
+    # Repeating the input can legitimately reuse a prefix on only the second request.
+    if any(stream_usage[key] != nonstream["usage"][key]
+           for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
         raise ContractError("streamed and non-streaming usage differs")
 
     responses_input = "Reply with a single short word."
@@ -502,11 +510,16 @@ def exercise(base_url: str, model: str, *, text_only: bool = False) -> dict[str,
     blocks = anthropic.get("content")
     if not isinstance(blocks, list) or not blocks:
         raise ContractError("Anthropic response content is empty")
-    anthropic_input_tokens, _ = require_usage(
-        anthropic.get("usage"), "input_tokens", "output_tokens"
-    )
-    if anthropic_input_tokens != input_tokens:
-        raise ContractError("Anthropic usage input_tokens differs from count_tokens")
+    usage = anthropic.get("usage")
+    if not isinstance(usage, dict):
+        raise ContractError("Anthropic response usage is missing")
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens",
+                "output_tokens"):
+        if type(usage.get(key)) is not int or usage[key] < 0:
+            raise ContractError(f"invalid Anthropic {key}")
+    if sum(usage[key] for key in ("input_tokens", "cache_read_input_tokens",
+                                  "cache_creation_input_tokens")) != input_tokens:
+        raise ContractError("Anthropic uncached + cached input differs from count_tokens")
 
     return {
         "format": "ninfer_serve_contract_v2",

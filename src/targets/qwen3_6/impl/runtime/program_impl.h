@@ -679,12 +679,26 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                         capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
             : 0U;
     request.lifecycle = Lifecycle::Empty;
+    request.exact_hit.reset();
+    if (request_plan.prepare_mtp && base == prompt_tokens) {
+        request.exact_hit = RequestControl::ExactHitContinuation{
+            .bridge_rope = prompt_rope_position(prompt, prompt_tokens - 1),
+            .proposal_extent = initial_mtp_extent};
+    }
     sequence.retained = false;
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
+            sequence.deferred_prefix_state.reset();
             sequence.kv.reset();
             ordered_reset(sequence);
             sequence.ledger.clear();
+            if (request_plan.capture_prefix_checkpoints) {
+                // Invalidate the old history but recycle its bounded host storage.
+                // Unrelated conversations must not repeatedly fault/zero gigabytes.
+                for (auto& checkpoint : sequence.prefix_checkpoints) { checkpoint.frontier = 0; }
+            } else {
+                sequence.prefix_checkpoints.clear();
+            }
             sequence.text_kv_valid = 0;
             sequence.mtp_kv_valid  = 0;
             reserve_sequence_kv(sequence, request_plan.text_kv_page_entitlement,
@@ -695,6 +709,9 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             }
             if (sequence.text_kv_valid < base) {
                 throw std::logic_error("resident Text KV is shorter than the append frontier");
+            }
+            if (sequence.deferred_prefix_state && !request.exact_hit) {
+                restore_prefix_checkpoint(sequence, *sequence.deferred_prefix_state);
             }
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
@@ -711,7 +728,25 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
                                            request_plan.backend_kv_page_entitlement);
             sequence.text_kv_valid = base;
             sequence.ledger.resize(base);
+        } else if (request_plan.reuse == ReusePath::RestorePrefixCheckpoint) {
+            if (!sequence.kv || sequence.text_kv_valid < base) {
+                throw std::logic_error("resident prefix checkpoint has no complete KV allocation");
+            }
+            sequence.text_kv_valid = base;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                const std::uint32_t mtp_base = base - 1;
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
+                    throw std::logic_error("prefix-checkpoint MTP KV is shorter than the bridge frontier");
+                }
+                sequence.mtp_kv_valid = mtp_base;
+            }
+            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                           request_plan.backend_kv_page_entitlement);
+            restore_prefix_checkpoint(sequence, base, !request.exact_hit.has_value());
+            sequence.ledger.resize(base);
         } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
+            sequence.deferred_prefix_state.reset();
             if (!sequence.kv || sequence.text_kv_valid < base) {
                 throw std::logic_error("resident rewrite checkpoint has no complete KV allocation");
             }
@@ -750,6 +785,16 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             sequence.ledger.resize(base);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
+        }
+
+        // KV after the selected frontier will be overwritten by the new suffix. Images
+        // of that old branch must not be matched against the replacement token ledger.
+        for (auto& checkpoint : sequence.prefix_checkpoints) {
+            if (checkpoint.frontier > base) { checkpoint.frontier = 0; }
+        }
+        if (sequence.rewrite_checkpoint.valid && sequence.rewrite_checkpoint.frontier > base &&
+            request_plan.rewrite_checkpoint_action == RewriteCheckpointAction::DeferCapture) {
+            sequence.rewrite_checkpoint = {};
         }
 
         trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -847,6 +892,7 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .initial_mtp_extent         = initial_mtp_extent,
             .elapsed_seconds            = 0.0,
             .prepare_mtp                = request_plan.prepare_mtp,
+            .capture_prefix_checkpoints = request_plan.capture_prefix_checkpoints,
             .reuse                      = request_plan.reuse,
             .mtp_bridge                 = request_plan.mtp_bridge,
         };
@@ -1115,12 +1161,95 @@ GenerationTimings ProgramImplCore::generation_timings_lane(std::uint32_t lane) c
     return lane < max_concurrency ? requests[lane].timings : GenerationTimings{};
 }
 
-SpeculativeStats ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
-    return lane < max_concurrency ? requests[lane].speculative_stats : SpeculativeStats{};
+const SpeculativeStats& ProgramImplCore::speculative_stats_lane(std::uint32_t lane) const noexcept {
+    static const SpeculativeStats empty;
+    return lane < max_concurrency ? requests[lane].speculative_stats : empty;
+}
+
+std::size_t ProgramImplCore::prefix_checkpoint_bytes() const {
+    std::size_t bytes = decoder->linear_attention.slot_bytes() + sequences[0].tail_hidden.bytes();
+    for (const auto& peer : peers) { bytes += peer->decoder->linear_attention.slot_bytes(); }
+    return bytes;
+}
+
+void ProgramImplCore::save_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                             const Tensor& hidden) {
+    const std::size_t bytes = prefix_checkpoint_bytes();
+    const std::size_t limit = kPrefixCheckpointBudget / max_concurrency / bytes;
+    if (limit == 0) { return; }
+    auto& checkpoints = sequence.prefix_checkpoints;
+    if (!checkpoints.empty() && checkpoints.back().frontier == frontier) { return; }
+    PrefixCheckpoint checkpoint;
+    checkpoint.frontier = frontier;
+    const auto unused = std::find_if(checkpoints.begin(), checkpoints.end(),
+                                     [](const auto& entry) { return entry.frontier == 0; });
+    if (unused != checkpoints.end()) {
+        checkpoint.image = std::move(unused->image);
+        checkpoints.erase(unused);
+    } else if (checkpoints.size() >= limit) {
+        // Keep the first image and spread the remaining images over the history.
+        // Recycle the most redundant interior image, including the incoming endpoint.
+        std::size_t victim = 0;
+        if (limit > 1) {
+            victim = 1;
+            std::uint32_t closest = std::numeric_limits<std::uint32_t>::max();
+            for (std::size_t i = 1; i < checkpoints.size(); ++i) {
+                const auto right = i + 1 < checkpoints.size() ? checkpoints[i + 1].frontier : frontier;
+                const auto span = right - checkpoints[i - 1].frontier;
+                if (span < closest) { closest = span; victim = i; }
+            }
+        }
+        checkpoint.image = std::move(checkpoints[victim].image);
+        checkpoints.erase(checkpoints.begin() + static_cast<std::ptrdiff_t>(victim));
+    }
+    if (!checkpoint.image) { checkpoint.image = std::make_unique_for_overwrite<std::byte[]>(bytes); }
+    std::size_t offset = 0;
+    const auto capture = [&](LinearAttentionStatePool& pool, DeviceContext& ctx) {
+        const ScopedDevice scope(ctx.device);
+        const auto size = pool.slot_bytes();
+        pool.export_slot(LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                         std::span(checkpoint.image.get(), bytes).subspan(offset, size), ctx.stream);
+        offset += size;
+    };
+    capture(decoder->linear_attention, device);
+    for (auto& peer : peers) { capture(peer->decoder->linear_attention, peer->device); }
+    CUDA_CHECK(cudaMemcpyAsync(checkpoint.image.get() + offset, hidden.data, hidden.bytes(),
+                               cudaMemcpyDeviceToHost, device.stream));
+    device.synchronize();
+    checkpoints.push_back(std::move(checkpoint));
+}
+
+void ProgramImplCore::restore_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                                bool restore_linear_state) {
+    const auto found = std::find_if(sequence.prefix_checkpoints.begin(), sequence.prefix_checkpoints.end(),
+                                    [frontier](const auto& entry) { return entry.frontier == frontier; });
+    if (found == sequence.prefix_checkpoints.end() || !found->image) {
+        throw std::logic_error("planned prefix state image is unavailable");
+    }
+    std::size_t offset = 0;
+    const auto restore = [&](LinearAttentionStatePool& pool, DeviceContext& ctx) {
+        const ScopedDevice scope(ctx.device);
+        const auto size = pool.slot_bytes();
+        if (restore_linear_state) {
+            pool.import_slot(LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+                std::span<const std::byte>(found->image.get(), prefix_checkpoint_bytes())
+                    .subspan(offset, size), ctx.stream);
+        }
+        offset += size;
+    };
+    restore(decoder->linear_attention, device);
+    for (auto& peer : peers) { restore(peer->decoder->linear_attention, peer->device); }
+    CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, found->image.get() + offset,
+                               sequence.tail_hidden.bytes(), cudaMemcpyHostToDevice, device.stream));
+    device.synchronize();
+    sequence.tail_hidden_valid = true;
+    sequence.deferred_prefix_state = restore_linear_state ? std::nullopt
+                                                          : std::optional(frontier);
 }
 
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
+    request.exact_hit.reset();
     sequence.kv.reset();
     request.lifecycle           = Lifecycle::Empty;
     sequence.execution_frontier = 0;
@@ -1134,6 +1263,8 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.tail_hidden_valid       = false;
     sequence.retained                = false;
     sequence.rewrite_checkpoint      = {};
+    sequence.prefix_checkpoints.clear();
+    sequence.deferred_prefix_state.reset();
     request.pending                  = {};
 }
 
@@ -2366,8 +2497,28 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         }
 
         if (staged.cursor < staged.prompt_tokens) {
-            const std::uint32_t nominal =
-                std::min(prefill_chunk * pipeline_chunks, staged.prompt_tokens - staged.cursor);
+            const std::uint32_t quantum = prefill_chunk * pipeline_chunks;
+            std::uint32_t nominal =
+                std::min(quantum, staged.prompt_tokens - staged.cursor);
+            std::uint32_t early_frontier = 0;
+            std::uint64_t checkpoint_interval = 0;
+            if (staged.capture_prefix_checkpoints) {
+                const auto images = kPrefixCheckpointBudget / max_concurrency / prefix_checkpoint_bytes();
+                const auto segments = std::max<std::size_t>(1, images - 1);
+                const auto span = (staged.prompt_tokens + segments - 1) / segments;
+                checkpoint_interval = ((span + quantum - 1) / quantum) * quantum;
+                if (images > 1) {
+                    // One early state covers short common prefixes. Subsequent captures
+                    // are spaced to the RAM budget, not every GPU prefill chunk.
+                    early_frontier = std::min(64U, std::max(1U, staged.prompt_tokens / 2));
+                    if (staged.cursor < early_frontier) {
+                        nominal = std::min(nominal, early_frontier - staged.cursor);
+                    } else if (staged.cursor == early_frontier) {
+                        // Rejoin the original chunk grid after the early split.
+                        nominal = std::min(nominal, quantum - staged.cursor % quantum);
+                    }
+                }
+            }
             const bool final_candidate = staged.cursor + nominal == staged.prompt_tokens;
             mark_workspace_usage(staged.prepare_mtp ? workspace_plan.mtp_prefill
                                                     : workspace_plan.text_prefill);
@@ -2424,6 +2575,13 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             if (speculative_backend == SpeculativeBackend::DFlash) {
                 sequence.dflash_context_frontier = staged.cursor;
             }
+            if (staged.capture_prefix_checkpoints &&
+                (staged.cursor == early_frontier || staged.cursor == staged.prompt_tokens ||
+                 staged.cursor / checkpoint_interval !=
+                     (staged.cursor - result.processed_tokens) / checkpoint_interval)) {
+                save_prefix_checkpoint(sequence, staged.cursor,
+                    prefill_hidden.slice(1, static_cast<std::int32_t>(result.tail_column), 1));
+            }
 
             if (!result.finalized) {
                 if (staged.cursor == staged.prompt_tokens) {
@@ -2450,17 +2608,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
             if (staged.prepare_mtp) {
-                if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
+                if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit || !request.exact_hit) {
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
                 }
-                mark_workspace_usage(workspace_plan.mtp_prefill);
-                const auto bridge_rope =
-                    prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
-                schedule::mtp_bridge_and_propose(
-                    schedule_state, io.token, sequence.tail_hidden,
-                    checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
-                    bridge_rope, staged.initial_mtp_extent != 0);
-                sequence.mtp_kv_valid = staged.prompt_tokens;
+                // The anchor is published before preparing its speculative continuation.
+                // finish_exact_hit uses the lane ledger, not this shared io.token buffer.
                 staged.mtp_bridge     = MtpBridgeMode::None;
             }
         }
@@ -2473,7 +2625,7 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         // counter lane is then never read).
         publish_peer_token_counts(sequence);
         std::array<TokenId, qwen3_6::kMtpDecodeMaximumDrafts> initial_drafts{};
-        if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
+        if (staged.prepare_mtp && !request.exact_hit && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
                                        staged.initial_mtp_extent * sizeof(TokenId),
                                        cudaMemcpyDeviceToHost, device.stream));
@@ -2501,11 +2653,11 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
         sequence.prefix_identity.append_generated(1, sequence.rope_delta);
         sequence.text_kv_valid = prompt_tokens;
         if (staged.prepare_mtp) {
-            if (sequence.mtp_kv_valid != prompt_tokens) {
+            if (sequence.mtp_kv_valid != prompt_tokens - (request.exact_hit ? 1U : 0U)) {
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
             }
-            sequence.mtp_draft_count = staged.initial_mtp_extent;
-            std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
+            sequence.mtp_draft_count = request.exact_hit ? 0U : staged.initial_mtp_extent;
+            std::copy_n(initial_drafts.begin(), sequence.mtp_draft_count,
                         sequence.mtp_drafts.begin());
         } else if (speculative_backend == SpeculativeBackend::DFlash &&
                    sequence.dflash_context_frontier != prompt_tokens) {
@@ -2671,6 +2823,63 @@ ProgramImplCore::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     }
 }
 
+void ProgramImplCore::finish_exact_hit(SequenceState& sequence, RequestControl& request,
+                                       bool decode) {
+    if (!request.exact_hit) { return; }
+    const auto continuation = *request.exact_hit;
+    const std::uint32_t frontier = sequence.execution_frontier;
+    if (decode) {
+        if (sequence.deferred_prefix_state) {
+            restore_prefix_checkpoint(sequence, *sequence.deferred_prefix_state);
+        }
+        mark_workspace_usage(workspace_plan.mtp_prefill);
+        const auto extent = continuation.proposal_extent;
+        materialize_sequence_kv(sequence, frontier,
+            std::min(capacity, frontier + (extent == 0 ? 0U : extent - 1U)));
+        set_device_i32(io.text_kv_table_row, sequence.kv->text.bound_row());
+        set_device_i32(io.backend_kv_table_row, sequence.kv->backend->bound_row());
+        set_device_i32(io.rope_delta, sequence.rope_delta);
+        for (auto& peer : peers) {
+            const ScopedDevice scope(peer->device.device);
+            set_peer_i32(peer->io.text_kv_table_row,
+                sequence.kv->text_peers[peer->rank - 1]->bound_row(), peer->device);
+            set_peer_i32(peer->io.backend_kv_table_row,
+                sequence.kv->backend_peers[peer->rank - 1]->bound_row(), peer->device);
+            set_peer_i32(peer->io.rope_delta, sequence.rope_delta, peer->device);
+        }
+        schedule::PrefillContext context{
+            {device, model, work, decoder->linear_attention,
+             replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
+             proposal_head, rope_frequency, peer_views(), pipeline_view(),
+             pipeline_upload ? static_cast<TokenId*>(pipeline_upload->data()) : nullptr,
+             volta_long_attention},
+            text_kv_view(sequence), mtp_kv_view(sequence), mtp_kv_views_peer(sequence),
+            decoder->text_kv, decoder->mtp_cache(), nullptr, frontier,
+            static_cast<const ops::SamplingConfig*>(
+                sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
+            &sequence.rewrite_checkpoint_hidden,
+            LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+            extent, nullptr, sequence.rope_delta};
+        Tensor anchor = io.mtp->target_input_ids.slice(0, 0, 1);
+        const TokenId token = sequence.ledger.back();
+        CUDA_CHECK(cudaMemcpyAsync(anchor.data, &token, sizeof(token), cudaMemcpyHostToDevice,
+                                   device.stream));
+        schedule::mtp_bridge_and_propose(context, anchor, sequence.tail_hidden,
+            checked_i32(frontier - 1, "deferred MTP bridge position"),
+            continuation.bridge_rope, extent != 0);
+        if (extent != 0) {
+            CUDA_CHECK(cudaMemcpyAsync(sequence.mtp_drafts.data(), io.mtp->draft_tokens.data,
+                extent * sizeof(TokenId), cudaMemcpyDeviceToHost, device.stream));
+        }
+        for (auto& peer : peers) { peer->device.synchronize(); }
+        device.synchronize();
+        sequence.mtp_kv_valid = frontier;
+        sequence.mtp_draft_count = extent;
+    }
+    request.exact_hit.reset();
+}
+
 runtime::BatchedGeneratedRound
 ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                   std::span<const runtime::RoundBudget> budgets) {
@@ -2697,7 +2906,7 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv || !sequence.kv->backend ||
             sequence.kv->text.bound_row() < 0 || sequence.kv->backend->bound_row() < 0 ||
             sequence.execution_frontier >= capacity ||
-            sequence.mtp_kv_valid != sequence.execution_frontier ||
+            sequence.mtp_kv_valid + (request.exact_hit ? 1U : 0U) != sequence.execution_frontier ||
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
@@ -2709,6 +2918,9 @@ ProgramImplCore::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
     const auto started = Clock::now();
     try {
+        for (const std::uint32_t lane : lanes) {
+            finish_exact_hit(sequences[lane], requests[lane], true);
+        }
         const bool greedy_target = std::all_of(
             lanes.begin(), lanes.end(), [&](std::uint32_t lane) {
                 return !(requests[lane].sampling_host.temperature > 0.0F);
@@ -3060,6 +3272,9 @@ void ProgramImplCore::resolve_non_speculative_pending(SequenceState& sequence,
     }
     trim_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
     if (terminal) {
+        // A complete owned RAM checkpoint remains a valid committed GDN frontier.
+        // Neither its import nor MTP proposals are needed for a terminal anchor.
+        finish_exact_hit(sequence, request, false);
         sequence.mtp_draft_count = 0;
         release_sequence_growth_entitlement(sequence);
         unbind_sequence_kv(sequence);

@@ -292,7 +292,8 @@ __global__ __launch_bounds__(
 // the nibble order chosen so the shift decoder's structural (i,i+4) pairs become adjacent K.
 // This is v100-skinny's QPN2 main loop: no activation PRMTs and one scale byte per group.
 template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation,
-          bool PairedProjection = false>
+          bool PairedProjection = false, bool Streaming = false, bool ColumnOutput = false,
+          bool Fp32Scale = true>
 __global__ __launch_bounds__(
     SPLITK * 32 * (PairedProjection ? 2 : 1),
     (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / (SPLITK * (PairedProjection ? 2 : 1)) < 1
@@ -320,6 +321,8 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         (static_cast<std::int64_t>(blockIdx.x) + projection * (n / 32)) * groups * 32 + lane;
     const half2 rebias   = __float2half2_rn(16384.0f);
     const half2 divisor2 = __float2half2_rn(inverse_weight_divisor * 256.0f);
+    const float epilogue_scale = Fp32Scale ? 256.0f * inverse_weight_divisor : 1.0f;
+
 
     float c[kTiles][NACC][8];
 #pragma unroll
@@ -331,16 +334,35 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         }
     }
 
-    // Paired TP2 gate/up overlaps four unchanged groups; MMA and K reduction
+    // Paired TP2 gate/up overlaps eight groups; MMA and K reduction
     // associations stay intact. The unpaired route retains two-group scheduling.
-#pragma unroll (PairedProjection ? 4 : 2)
+#pragma unroll (PairedProjection ? 8 : 2)
     for (int group = g0; group < gend; ++group) {
         const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
-        const uint2 q2 = __ldg(reinterpret_cast<const uint2*>(codes + packed_index * 8));
-        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scales[packed_index]), divisor2);
+        const auto* code_pointer = reinterpret_cast<const uint2*>(codes + packed_index * 8);
+        const uint2 q2 = Streaming ? __ldcs(code_pointer) : __ldg(code_pointer);
+        const std::uint8_t scale_byte = Streaming ? __ldcs(scales + packed_index)
+                                                  : scales[packed_index];
+        const half2 sc2 = __hmul2(nvfp4_decode_e4m3_scale(scale_byte),
+                                Fp32Scale ? rebias : divisor2);
         half2 b[8];
-        nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
-        nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
+        const auto decode_scaled = [](std::uint32_t word, half2* out) {
+            const std::uint32_t bits[4] = {
+                ((word << 12) & 0x80008000U) | ((word << 9) & 0x0E000E00U),
+                ((word << 8) & 0x80008000U) | ((word << 5) & 0x0E000E00U),
+                ((word << 4) & 0x80008000U) | ((word << 1) & 0x0E000E00U),
+                (word & 0x80008000U) | ((word >> 3) & 0x0E000E00U)};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { out[j] = *reinterpret_cast<const half2*>(&bits[j]); }
+        };
+        if constexpr (Fp32Scale) {
+            decode_scaled(q2.x, b);
+            decode_scaled(q2.y, b + 4);
+        } else {
+            // Normal profile retains the represented per-group FP16 scaling boundaries.
+            nvfp4_decode_e2m1_quad(q2.x, rebias, *reinterpret_cast<half2(*)[4]>(&b[0]));
+            nvfp4_decode_e2m1_quad(q2.y, rebias, *reinterpret_cast<half2(*)[4]>(&b[4]));
+        }
 #pragma unroll
         for (int j = 0; j < 8; ++j) { b[j] = __hmul2(b[j], sc2); }
         const unsigned* B = reinterpret_cast<const unsigned*>(b);
@@ -403,24 +425,46 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
     }
     __syncthreads();
 
-    constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
-    for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * kProjectionGroups * 32) {
-        const int row  = e / S::kColsPerCta;
-        const int col  = e % S::kColsPerCta;
-        const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
-        if (row < t && ocol < n) {
-            float value = 0.0f;
+    if constexpr (ColumnOutput) {
+        static_assert(!PairedProjection);
+        // One lane owns all token projections for a channel. The existing shared
+        // tile makes the complete depthwise convolution available at this boundary.
+        for (int col = static_cast<int>(threadIdx.x); col < S::kColsPerCta;
+             col += SPLITK * 32) {
+            const int output_row = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
+            float projected[kTiles * S::kRowsPerTile];
 #pragma unroll
-            for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
-            if constexpr (PairedProjection) {
-                // Separate warp groups preserve each projection's accumulator/register
-                // schedule and FP32 K reduction. The caller owns the paired epilogue.
-                float up = 0.0f;
+            for (int token = 0; token < kTiles * S::kRowsPerTile; ++token) {
+                float value = 0.0F;
 #pragma unroll
-                for (int w = 0; w < SPLITK; ++w) { up += cs[w + SPLITK][e]; }
-                output.store(ocol, row, value, up);
-            } else {
-                output.store(ocol, row, value);
+                for (int w = 0; w < SPLITK; ++w) {
+                    value += cs[w][token * S::kColsPerCta + col];
+                }
+                projected[token] = value * epilogue_scale;
+            }
+            output.store(output_row, projected);
+        }
+    } else {
+        constexpr int kOut = kTiles * S::kRowsPerTile * S::kColsPerCta;
+        for (int e = static_cast<int>(threadIdx.x); e < kOut; e += SPLITK * kProjectionGroups * 32) {
+            const int row  = e / S::kColsPerCta;
+            const int col  = e % S::kColsPerCta;
+            const int ocol = static_cast<int>(blockIdx.x) * S::kColsPerCta + col;
+            if (row < t && ocol < n) {
+                float value = 0.0f;
+#pragma unroll
+                for (int w = 0; w < SPLITK; ++w) { value += cs[w][e]; }
+                if constexpr (PairedProjection) {
+                    // Separate warp groups preserve each projection's accumulator/register
+                    // schedule and FP32 K reduction. The caller owns the paired epilogue.
+                    float up = 0.0f;
+#pragma unroll
+                    for (int w = 0; w < SPLITK; ++w) { up += cs[w + SPLITK][e]; }
+                    output.store(ocol, row, value * epilogue_scale,
+                                 up * epilogue_scale);
+                } else {
+                    output.store(ocol, row, value * epilogue_scale);
+                }
             }
         }
     }
@@ -447,11 +491,26 @@ template <int kTiles, int SPLITK, int NACC, class Activation, class OutputPolicy
 void launch_nvfp4_qpn_schedule(bool prepacked, dim3 grid, const std::uint8_t* codes,
                                const std::uint8_t* scales, const Activation* x, int n, int k,
                                int t, float inverse_weight_divisor, OutputPolicy output,
-                               cudaStream_t stream) {
+                               bool fp32_scale, cudaStream_t stream) {
     if (prepacked) {
-        nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC>
-            <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
-                                               inverse_weight_divisor, output);
+        auto launch = [&]<bool Fp32Scale>() {
+            if constexpr (kTiles == 1 && SPLITK == 8) {
+                if ((k == 5120 && (n == 7168 || n == 8192)) ||
+                    (n == 5120 && k == 3072)) {
+                    nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC, OutputPolicy,
+                                                    Activation, false, true, false, Fp32Scale>
+                        <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
+                                                           inverse_weight_divisor, output);
+                    return;
+                }
+            }
+            nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC, OutputPolicy,
+                                            Activation, false, false, false, Fp32Scale>
+                <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
+                                                   inverse_weight_divisor, output);
+        };
+        if (fp32_scale) { launch.template operator()<true>(); }
+        else { launch.template operator()<false>(); }
     } else {
         nvfp4_volta_qpn_gemm_kernel<kTiles, SPLITK, NACC>
             <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
@@ -478,24 +537,24 @@ void launch_nvfp4_volta_qpn_with_activation(const Tensor& x, const Weight& w,
     if (t <= S::kRowsPerTile) {
         if (gate_up || split_half || tp2_down) {
             launch_nvfp4_qpn_schedule<1, 16, 2>(prepacked, grid, codes, scales, xd, n, k, t,
-                                                inverse_weight_divisor, output, stream);
+                                                inverse_weight_divisor, output, w.volta_fp32_scale, stream);
         } else {
             launch_nvfp4_qpn_schedule<1, 8, 2>(prepacked, grid, codes, scales, xd, n, k, t,
-                                               inverse_weight_divisor, output, stream);
+                                               inverse_weight_divisor, output, w.volta_fp32_scale, stream);
         }
     } else if (t <= 2 * S::kRowsPerTile) {
         if (split_half) {
             // NACC1 and NACC2 tied exactly at T=16 (233.8us both); NACC1 for the smaller register
             // footprint.
             launch_nvfp4_qpn_schedule<2, 16, 1>(prepacked, grid, codes, scales, xd, n, k, t,
-                                                inverse_weight_divisor, output, stream);
+                                                inverse_weight_divisor, output, w.volta_fp32_scale, stream);
         } else {
             launch_nvfp4_qpn_schedule<2, 8, 1>(prepacked, grid, codes, scales, xd, n, k, t,
-                                               inverse_weight_divisor, output, stream);
+                                               inverse_weight_divisor, output, w.volta_fp32_scale, stream);
         }
     } else {
         launch_nvfp4_qpn_schedule<4, 8, 1>(prepacked, grid, codes, scales, xd, n, k, t,
-                                           inverse_weight_divisor, output, stream);
+                                           inverse_weight_divisor, output, w.volta_fp32_scale, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

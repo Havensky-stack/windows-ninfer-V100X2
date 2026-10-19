@@ -252,7 +252,8 @@ admission；二者是 server-side phases，不需要扩展成更多 model-execut
 Intermediate prefill chunks 只推进 prompt state。Finalization unit 执行 target output selection并建立 decode
 anchor；如果立即命中 terminal condition，请求不进入 decode batch。Retained current frontier 正好覆盖完整
 prompt 时可以跳过 suffix prefill，但仍通过同一 finalization unit 从 retained tail state 产生下一 anchor，并在
-MTP 下完成 exact-hit bridge/proposal。命中已保存 rewrite checkpoint 时则从该 checkpoint prefill 新 suffix。
+MTP 下把 exact-hit bridge/proposal 的输入保存在该 request 的 lane control，发布首 token 后，
+在首次 decode 消费前完成 bridge/proposal。命中已保存 rewrite checkpoint 时则从该 checkpoint prefill 新 suffix。
 单独的 KV match 不足以进入 `DECODE_READY`。
 
 ### 4.2 Slot
@@ -721,7 +722,8 @@ block-table 和 allocator 的 contract 属于 Paged KV Context Store，不在本
 Retained prefix 是从已结束 request 中分离出来的、单一 owner 的 SequenceState。它留在原 physical lane，
 但该 lane 的 control slot 对 scheduler 是 free。Retained state 只发布 target 已保存完整 continuation state
 的 checkpoints。当前 Qwen3.6 retained state 可以发布 current resume frontier，以及一份有效时的 typed
-rewrite checkpoint。后者按捕获时的用途标记为 `TurnClosure` 或 `ResponseReplay`；两种 kind 互斥复用同一
+rewrite checkpoint，以及普通 Text/None/MTP 的有界 RAM prefix checkpoints（完整 GPU KV，
+不含 Vision/DFlash/RAM-KV）。Typed checkpoint 按捕获时的用途标记为 `TurnClosure` 或 `ResponseReplay`；两种 kind 互斥复用同一
 份物理 payload，并额外保存对应的 recurrent、hidden、speculative-backend 和 position state，不复制 KV
 payload。
 
@@ -740,17 +742,23 @@ Admission 在同一 lane 成功时消费 retained entry，并把 SequenceState o
   finalization unit 产生下一 anchor；
 - incoming prompt 匹配已保存 rewrite checkpoint 并在其后有新 suffix 时，在 atomic admission transaction
   提交后把 growing allocations truncate 到 checkpoint frontier、恢复完整 checkpoint，再 prefill suffix；
-- common prefix 结束在没有 checkpoint 的任意其他位置时视为 cache miss。
+- common prefix 内存在 RAM prefix checkpoint 时，恢复其中最远的完整状态并重算剩余 suffix；
+- 没有任何完整匹配 checkpoint 时视为 cache miss。
 
-Rewrite-checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
-本身不是 checkpoint；当前架构不支持 arbitrary longest-common-prefix reuse。
+Checkpoint restore 保留包含 checkpoint 的部分尾页，释放其后的完整 pages。KV page 或 token prefix match
+本身不是 checkpoint；不保证每个公共 token 都有零重算状态。RAM image 预算、捕获、分支失效和
+MTP bridge 规则见 [Paged KV §10](paged-kv-cache.md#10-prefix-reuse)。
 
 27B TP2/TP4 的 suffix、exact-hit 和 MTP bridge 采用同一套 reuse plan。Rank 0 独占 retained target hidden
 和 rewrite-checkpoint hidden 的权威副本；恢复时通过有序跨卡传输把选中的 hidden 暂存到各 peer 已有的
 prefill buffer，不为每个 lane 增加 peer hidden ledger。各 rank 分别捕获、恢复自身的 GDN shard。
-Exact hit 经 vocabulary-sharded output head 和 logit gather 完成采样；MTP bridge 再按对应 TP 宽度的 MTP
-schedule 恢复 draft continuation。后续 prefill 覆盖 staging buffer 前须完成所有 ranks 的 bridge，decode hot path
-不增加每轮 hidden 镜像。
+Exact hit 经 vocabulary-sharded output head 和 logit gather 完成采样，并立即发布首 token。MTP bridge
+按对应 TP 宽度的 MTP schedule 在首次 decode 前恢复 draft continuation；输入使用该 lane 的 tail hidden、
+committed ledger anchor、保存的三轴 bridge RoPE 和 proposal extent，不引用全局 prefill token/hidden scratch。
+每个 lane 的 pending bridge 在进入 batched verify 前各自完成，并计入 decode 时间；terminal anchor 不生成
+无用草稿。RAM exact hit 可只上传 tail hidden，完整 GDN image 仍由该 Sequence 独占持有，在首次 decode 或
+suffix prefill 前原样恢复各 rank 的状态。单 token terminal 后也保留该完整 image，后续 request 可继续使用；
+这不允许不完整快照复用。GPU rewrite checkpoint 的恢复不变，decode hot path 不增加每轮 hidden 镜像。
 
 Checkpoint kind 不是 reuse compatibility bit。Planner 总是先按 token、position、media identity 和完整
 continuation state 尝试 current frontier，再尝试已有 rewrite checkpoint；即使本次

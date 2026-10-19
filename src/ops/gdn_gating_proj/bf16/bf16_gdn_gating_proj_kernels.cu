@@ -194,6 +194,46 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
     }
 }
 
+// A head/token CTA retains the split-10 warp dot products and their final
+// ascending FP32 sum, so the one-launch route preserves the represented controls.
+__global__ void bf16_gdn_gating_proj_tp2_exact_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
+    const __nv_bfloat16* __restrict__ b_weight, const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias, float* __restrict__ g, float* __restrict__ beta) {
+    const int token = static_cast<int>(blockIdx.y), head = static_cast<int>(blockIdx.x);
+    const int tid = static_cast<int>(threadIdx.x), lane = tid & 31, split = tid >> 5;
+    float a = 0.0F, b = 0.0F;
+#pragma unroll
+    for (int vec = lane; vec < 64; vec += 32) {
+        const int k = split * 512 + vec * 8;
+        const uint4 xv = load_vec<uint4>(x + token * kK + k);
+        const uint4 av = load_vec<uint4>(a_weight + head * kK + k);
+        const uint4 bv = load_vec<uint4>(b_weight + head * kK + k);
+        const unsigned* xp = reinterpret_cast<const unsigned*>(&xv);
+        const unsigned* ap = reinterpret_cast<const unsigned*>(&av);
+        const unsigned* bp = reinterpret_cast<const unsigned*>(&bv);
+#pragma unroll
+        for (int pair = 0; pair < 4; ++pair) {
+            const auto xf = bf16x2_bits_to_float2(xp[pair]);
+            const auto af = bf16x2_bits_to_float2(ap[pair]);
+            const auto bf = bf16x2_bits_to_float2(bp[pair]);
+            a = fmaf(af.x, xf.x, a); a = fmaf(af.y, xf.y, a);
+            b = fmaf(bf.x, xf.x, b); b = fmaf(bf.y, xf.y, b);
+        }
+    }
+    a = warp_reduce_sum(a); b = warp_reduce_sum(b);
+    __shared__ float partial[2][10];
+    if (lane == 0) { partial[0][split] = a; partial[1][split] = b; }
+    __syncthreads();
+    if (tid == 0) {
+        a = 0.0F; b = 0.0F;
+#pragma unroll
+        for (int s = 0; s < 10; ++s) { a += partial[0][s]; b += partial[1][s]; }
+        g[token * kShardN + head] = -expf(A_log[head]) * softplus(a + dt_bias[head]);
+        beta[token * kShardN + head] = sigmoid(b);
+    }
+}
+
 template <int ColsPerTile>
 __global__ void bf16_gdn_gating_proj_35_simt_kernel(const __nv_bfloat16* __restrict__ x,
                                                     const __nv_bfloat16* __restrict__ a_weight,
@@ -485,6 +525,21 @@ void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight,
                                     const Tensor& dt_bias, void* workspace,
                                     std::size_t workspace_bytes, Tensor& g, Tensor& beta,
                                     cudaStream_t stream) {
+#ifdef NINFER_VOLTA_BUILD
+    if (a_weight.n == kShardN && x.ne[1] >= 2 && x.ne[1] <= kSmallTMax) {
+        require_shard_shape(a_weight, "a_weight");
+        require_shard_shape(b_weight, "b_weight");
+        bf16_gdn_gating_proj_tp2_exact_kernel
+            <<<dim3(kShardN, x.ne[1]), 320, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const __nv_bfloat16*>(a_weight.qdata),
+                static_cast<const __nv_bfloat16*>(b_weight.qdata),
+                static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+                static_cast<float*>(g.data), static_cast<float*>(beta.data));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#endif
     if (x.ne[1] == 1) {
         bf16_gdn_gating_proj_gemv_shard_launch(x, a_weight, b_weight, A_log, dt_bias, g, beta,
                                                stream);

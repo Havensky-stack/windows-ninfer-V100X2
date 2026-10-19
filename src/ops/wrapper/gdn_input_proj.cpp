@@ -7,8 +7,8 @@
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
-#include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
+#include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_kernels.h"
 #include "ops/gdn_input_proj/w8/w8_gdn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -1820,6 +1820,17 @@ void gdn_input_proj_conv_record_column_parallel(
         WorkspaceArena& arena = *workspace[slot];
         auto scope            = arena.scope();
         Tensor record_flat = flatten_columns(record_dst[slot], conv_weight[slot].ne[0], geometry[slot]);
+#ifdef NINFER_VOLTA_BUILD
+        if (ec.dev[rank]->sm() == 70 && w.qtype == QType::NVFP4 &&
+            w.layout == QuantLayout::VoltaQpnPrepacked && w.n == 8192 && w.k == 5120 &&
+            geometry[slot].batch == 1 && geometry[slot].width <= 8) {
+            auto input = flatten_columns(x[slot], 5120, geometry[slot]);
+            detail::nvfp4_gdn_input_sm70_record_launch(input, w, conv_weight[slot],
+                conv_states[slot], valid_columns[slot], initial_state_slots[slot], record_flat,
+                q_dst[slot], k_dst[slot], v_dst[slot], z_dst[slot], arena, stream);
+            return;
+        }
+#endif
         compose_shard_conv(x[slot], record_flat, z_dst[slot], geometry[slot],
                            [&](const Tensor& x_flat, Tensor& out, Tensor& z_flat) {
                                project_fused_shard(x_flat, w, out, z_flat, policy, &arena, stream);

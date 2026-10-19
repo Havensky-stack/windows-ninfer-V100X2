@@ -65,10 +65,11 @@ exclusive. The default speculative and Vision settings produce the smallest resi
 default `32768`) and startup Vision reservations; the prepared text-plus-media prompt still must
 fit `--max-context`. On memory-constrained GPUs a smaller visual budget allows a larger text
 context without promising to process images or videos beyond that separate budget.
-TP2 Vision is experimental on the two 16 GB V100 profile. Its visual-prefix bridge integration
-test currently fails on that host; see [test status](../tests/README.md#experimental-tp2-vision-status).
-CLI processes do not share Engine prefix state. For a persistent Vision server, the recommended
-profile uses the server option `--no-prefix-reuse` to avoid the unqualified multimodal cache path.
+QUASAR TP2/MTP4 passes the existing Vision/prefix integration test at 4096 capacity, including
+the visual-prefix bridge. The older official-NVFP4 cached/cold discrepancy remains separate;
+see [test status](../tests/README.md#experimental-tp2-vision-status). CLI processes do not share
+Engine prefix state. The supplied Vision server preset starts with `--no-prefix-reuse`; QUASAR
+users may enable prefix reuse manually.
 
 ## Structured messages
 
@@ -185,6 +186,7 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/PP1, one active request, INT8 KV, Text/None/MTP only; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-fast-decode` | experimental QUASAR SM70 TP2 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -249,7 +251,7 @@ Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6
 `qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
 `--tp 2` at startup. `--spec mtp` and optional Qwen3.8 DFlash2 support `--tp 2`, including
 compatible-prefix reuse in a resident Engine. Experimental `--vision` is also available at TP2
-for artifacts with execution-qualified Vision weights; QUASAR and GGUF-derived Q4_K_M reject it.
+for artifacts with execution-qualified Vision weights; QUASAR NVFP4 admits TP2 None/MTP; GGUF-derived Q4_K_M rejects it.
 Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.

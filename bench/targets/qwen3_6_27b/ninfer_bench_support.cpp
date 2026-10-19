@@ -314,6 +314,7 @@ std::string usage_text(std::string_view program) {
         << "  --pp <1|2>                  pipeline degree; PP2 requires TP1 SM70 NVFP4/QUASAR\n"
         << "  --pipeline-chunks <1..8>    PP prefill wave; 1 is serial (default: 8)\n"
         << "  --ram-kv-window <tokens>   Optional approximate Q/K retrieval GPU window\n"
+        << "  --volta-fast-decode       Experimental QUASAR TP2 Text FP32 epilogues / packed MTP W8\n"
         << "  --volta-long-attention    Experimental complete-history SM70 TP2 INT8 attention\n"
         << "  --devices <id,...>          one CUDA device per rank; required for parallel execution\n"
         << "  --no-cuda-graph             use eager decode\n"
@@ -406,6 +407,8 @@ BenchOptions parse_args(int argc, char** argv) {
         } else if (arg == "--pipeline-chunks") {
             options.pipeline_chunks = parse_positive(value("--pipeline-chunks"), "pipeline-chunks");
             if (options.pipeline_chunks > 8) { throw std::invalid_argument("--pipeline-chunks must be 1..8"); }
+        } else if (arg == "--volta-fast-decode") {
+            options.volta_fast_decode = true;
         } else if (arg == "--volta-long-attention") {
             options.volta_long_attention = true;
         } else if (arg == "--ram-kv-window") {
@@ -702,6 +705,7 @@ std::string format_table(const BenchEnvironment& env, const std::vector<TestResu
         << " draft_k=" << env.mtp_draft_tokens
         << " proposal_head=" << proposal_head_name(env.proposal_head)
         << " volta_long_attention=" << env.volta_long_attention
+        << " volta_fast_decode=" << env.volta_fast_decode
         << " decode_path=" << decode_path_name(env.use_cuda_graph, env.speculative_backend,
                                                 env.mtp_draft_tokens)
         << " graph_prime="
@@ -834,6 +838,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
         << "    \"max_context\": " << env.max_context << ",\n"
         << "    \"prefill_chunk\": " << env.prefill_chunk << ",\n"
         << "    \"volta_long_attention\": " << (env.volta_long_attention ? "true" : "false") << ",\n"
+        << "    \"volta_fast_decode\": " << (env.volta_fast_decode ? "true" : "false") << ",\n"
         << "    \"kv_cache\": \"" << kv_cache_name(env.kv_cache) << "\",\n"
         << "    \"speculative_backend\": \""
         << speculative_backend_name(env.speculative_backend) << "\",\n"
@@ -916,7 +921,7 @@ std::string format_json(const BenchEnvironment& env, const std::string& command,
 std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult>& results) {
     std::ostringstream out;
     out << "label,kind,n_prompt,n_gen,target,weights_id,tp,pp,pipeline_chunks,devices,max_context,prefill_chunk,speculative_backend,mtp_draft_tokens,"
-           "proposal_head,decode_path,volta_long_attention,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
+           "proposal_head,decode_path,volta_long_attention,volta_fast_decode,kv_cache,kv_payload_bytes,load_host_to_device_bytes,"
            "weights_capacity_bytes,sequence_capacity_bytes,workspace_capacity_bytes,"
            "request_transient_capacity_bytes,cuda_graph_allowance_bytes,"
            "workspace_peak_bytes,workspace_allocator_peak_bytes,"
@@ -944,6 +949,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
             << proposal_head_name(env.proposal_head) << ','
             << decode_path_name(env.use_cuda_graph, env.speculative_backend, env.mtp_draft_tokens) << ','
             << (env.volta_long_attention ? "true" : "false") << ','
+            << (env.volta_fast_decode ? "true" : "false") << ','
             << kv_cache_name(env.kv_cache) << ',' << env.memory.kv_payload_bytes << ','
             << env.load.host_to_device_bytes << ',' << env.memory.weights.capacity_bytes << ','
             << env.memory.sequence.capacity_bytes << ',' << env.memory.workspace.capacity_bytes

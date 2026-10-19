@@ -19,8 +19,14 @@
 // exact UVA D2D route in either case. The collectives never allocate or copy through an explicit
 // host buffer, and callers need no peer-access branch; enable_peer_access() only reports whether
 // direct peer access was qualified.
-// Small qualified SM70 allreduces may read the peer operand directly in a sum kernel, writing
-// only their own staging. Both reads retire before either original operand is overwritten.
+// Qualified aligned SM70 TP2 reductions through 80 KiB use a two-epoch packet push.
+// Each rank keeps its own contribution in registers and publishes a remote copy into a
+// startup-owned mailbox; it never reads the peer's input allocation. After every lane arrives,
+// it adds in FP32 and rounds once to BF16. Empty slots use a reserved NaN payload, preserving
+// all finite input bits. Two epochs prevent reuse until the peer consumes the older packet.
+// Source/output lifetime is local-stream ordered; mailbox lifetime is part of PeerEvents.
+// Other small qualified SM70 payloads use direct peer reads into rank-local staging. Both
+// reads retire before either original operand is overwritten.
 //
 // The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
 // stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
@@ -30,7 +36,7 @@
 // inputs_ready before reading and every other rank's pull_done before overwriting
 // a source. Both routes retain the operands until all reads retire; TP4 sums in
 // global rank order so replicated residuals remain bit-identical across ranks.
-// ORDERING. Every transfer is a PULL: rank r reads the peer's source into storage that rank r
+// ORDERING for the DMA/direct-read routes. Every transfer is a PULL: rank r reads the peer's source into storage that rank r
 // alone owns, on rank r's own stream. Nothing a rank owns is ever written by the peer's stream, so
 // the classic push hazard -- the peer overwriting a staging buffer that this rank has not finished
 // reading yet -- cannot exist. Each rank issues two event records and two event waits:
@@ -82,6 +88,7 @@
 // device's own stream, or lets subsequent stream-ordered work depend on it, as usual.
 
 #include "core/device.h" // DeviceContext, ExecutionContext
+#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaEvent_t
@@ -91,6 +98,15 @@
 #include <span>
 
 namespace ninfer::ops {
+
+// The RMSNorm consumer of a replicated BF16 collective output. Every span has
+// one entry per rank; weights are BF16 [D] and outputs are disjoint BF16 [D,T].
+struct ReplicatedRmsNorm {
+    std::span<const Tensor> weight;
+    std::span<const Tensor> output;
+    float eps;
+    bool unit_offset;
+};
 
 // Qualifies the actual cross-device copy route at startup. On Linux, first resolve both CUDA
 // devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ prevent
@@ -111,8 +127,9 @@ namespace ninfer::ops {
 // TP4 qualifies every directed device pair and requires a complete direct-peer mesh.
 bool enable_peer_access(const ExecutionContext& ec);
 
-// The reusable cross-device ordering events: two per device, created on that device with timing
-// disabled.
+// The reusable cross-device transport: two ordering events per device, created with timing
+// disabled, plus fixed SM70 TP2 packet mailboxes/epochs when direct P2P was qualified. All
+// resources are allocated explicitly at startup and owned by this stream domain.
 //
 //   inputs_ready(r) - recorded on rank r's stream once the inputs rank r contributes are complete;
 //                     the peer waits on it before reading them.
@@ -146,6 +163,13 @@ public:
     [[nodiscard]] bool direct_peer_access() const noexcept { return direct_peer_access_; }
     [[nodiscard]] int ranks() const noexcept { return ranks_; }
 
+    // Fixed startup-owned SM70 TP2 transport storage. No collective allocates.
+    [[nodiscard]] void* packet_storage(int rank) const noexcept {
+        return packets_[static_cast<std::size_t>(rank)].p;
+    }
+    static constexpr std::size_t kPacketMaxBytes = 81920;
+    static constexpr std::size_t kPacketBlocks = kPacketMaxBytes / (16 * 64);
+
     // False for a moved-from instance.
     [[nodiscard]] bool live() const noexcept {
         if (ranks_ != 2 && ranks_ != 4) { return false; }
@@ -158,6 +182,7 @@ public:
 private:
     std::array<cudaEvent_t, kMaximumExecutionDevices> inputs_ready_{};
     std::array<cudaEvent_t, kMaximumExecutionDevices> pull_done_{};
+    std::array<DeviceBuffer, 2> packets_{};
     bool direct_peer_access_ = false;
     int ranks_ = 0;
 };
@@ -179,7 +204,7 @@ private:
  * The oracle evaluates `ideal` in FP64 from the represented BF16 inputs; the observable BF16
  * output is that value rounded once to BF16 storage. Both DMA/local-combine and direct-peer
  * sum routes use FP32 accumulation and one round-to-nearest-even on
- * store. The Op holds no persistent state and allocates nothing.
+ * store. There is no per-call allocation; PeerEvents owns the protocol storage.
  *
  * Requires `ec.device_count` in {2,4} and live events for the same rank count. Consecutive calls need no
  * host synchronization between them.
@@ -192,6 +217,26 @@ private:
 // the same association, including the direct-P2P route.
 void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> staging,
                    const ExecutionContext& ec, const PeerEvents& events);
+
+// TP2 out-of-place sum, with the same FP64 oracle and one BF16 output rounding.
+// Both input/output spans contain two equally shaped contiguous BF16 tensors on their ranks.
+// Inputs and outputs are disjoint; inputs remain unchanged. No per-call workspace or allocation.
+// On return both streams are ordered after all source reads, including the DMA fallback,
+// so callers may immediately reuse input storage without host synchronization.
+void allreduce_sum_to(std::span<const Tensor> input, std::span<const Tensor> output,
+                      const ExecutionContext& ec, const PeerEvents& events);
+
+// TP2 sum followed by RMSNorm of the represented BF16 sum. The sum is an
+// observable output and therefore a rounding boundary. Its exact oracle is the
+// FP64 sum rounded once to BF16; the norm oracle evaluates the complete RMSNorm
+// formula in FP64 from that represented sum and the BF16 weights. Input planes
+// remain unchanged and retire on both streams before source reuse is allowed.
+// No per-call allocation. Qualified SM70 D5120/T1..8 uses one fused kernel;
+// other profiles compose the same two Ops.
+void allreduce_sum_rmsnorm_to(std::span<const Tensor> input,
+                              std::span<const Tensor> output,
+                              const ReplicatedRmsNorm& norm,
+                              const ExecutionContext& ec, const PeerEvents& events);
 
 /**
  * Row gather, exact (no arithmetic). The gathered axis is `ne[1]`, so each rank
@@ -229,6 +274,17 @@ void allgather_rows(std::span<const Tensor> destination, std::span<const Tensor>
  */
 void gather_columns_rank0(const Tensor& destination, std::span<const Tensor> part,
                           const ExecutionContext& ec, const PeerEvents& events);
+
+// Merge one FP32 score and local I32 index [1,T] per rank into replicated I32 [T].
+// The largest score wins; ties select the lowest global index (rank * shard_rows
+// + local index). Inputs must be non-NaN; +/-infinity and signed zero are valid.
+// Gather scratch is FP32/I32 [R,T] on rank zero. No input/output may overlap.
+// Sources and destinations retire on all participating streams before reuse.
+// Direct TP2 peer access fuses merge and publication; other domains use UVA DMA.
+void allreduce_argmax(std::span<const Tensor> values, std::span<const Tensor> indices,
+                       std::span<const Tensor> output, Tensor& gathered_values,
+                       Tensor& gathered_indices, std::int32_t shard_rows,
+                       const ExecutionContext& ec, const PeerEvents& events);
 
 // Exact relocation from rank 0 to each other active rank. Destinations are indexed by
 // rank minus one and contain ec.device_count - 1 entries. All tensors have the same contiguous

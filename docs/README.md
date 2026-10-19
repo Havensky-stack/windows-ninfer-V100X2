@@ -19,6 +19,7 @@ comparison, CUDA 12.8 build and API launch. Other hardware and experiments have 
 | [RAM-KV / PP2 experiments](experiments.md) | approximate retrieval and layer-pipeline measurements |
 | [Alternative models / Vision](alternatives.md) | Q4_K_M conversion and opt-in official-NVFP4 Vision |
 | [V100 implementation](v100-implementation.md) | kernel, transport and verification details |
+| [V100 decode research / 项目调研](v100-decode-survey.md) | public V100 projects, kernel sources, and prioritized candidates for further decode optimization |
 | [Source-checkpoint quality](model-quality.md) | public QUASAR quality comparisons and limitations |
 | [Inherited upstream performance](performance-upstream.md) | other hardware/models, concurrent decode and extended context |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |
@@ -29,7 +30,7 @@ The executable `--help` output is the exact source for command-line option spell
 
 | Model | Weights | Download | Versioned model card source |
 |---|---|---|---|
-| Qwen3.8-27B (recommended text profile) | `quasar-nvfp4` | [QUASAR v3](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/v3) | [source quality](model-quality.md); Text/MTP/DFlash, no Vision |
+| Qwen3.8-27B (recommended Text/Vision profile) | `quasar-nvfp4` | [QUASAR v3](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer/tree/v3) | [source quality](model-quality.md); Text/MTP/DFlash; optional TP2 Vision with None/MTP |
 | Qwen3.6-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | [published model card](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) |
 | Qwen3.6-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | [published model card](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) |
 | Qwen3.8-27B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | [model card](../model-cards/Qwen3.8-27B-NInfer/README.md) |

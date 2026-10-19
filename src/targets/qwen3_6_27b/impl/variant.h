@@ -151,7 +151,8 @@ struct Variant {
                                             std::span<const Tensor> staging,
                                             qwen3_6::TextPhase phase,
                                             std::span<WorkspaceArena* const> workspace,
-                                            const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                            const ExecutionContext& ec, const ops::PeerEvents& ev,
+                                      const ops::ReplicatedRmsNorm* norm = nullptr);
     static void gdn_input_projection(std::span<const Tensor> hidden,
                                      std::span<const GdnProjectionWeights* const> w,
                                      std::span<const Tensor> qkv,
@@ -182,7 +183,8 @@ struct Variant {
                                       std::span<const Tensor> staging,
                                       qwen3_6::TextPhase phase,
                                       std::span<WorkspaceArena* const> workspace,
-                                      const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                      const ExecutionContext& ec, const ops::PeerEvents& ev,
+                                      const ops::ReplicatedRmsNorm* norm = nullptr);
     // MTP split leaves. `mtp_attention_projection` is column-parallel over the packed
     // [14336, 5120] parent (shard [7168, 5120], whose row order is q | k | gate | v at the
     // per-rank section widths) and then splits each rank's own packed block in place;
@@ -227,7 +229,8 @@ struct Variant {
                            std::span<const Tensor> residual,
                            std::span<const Tensor> staging, qwen3_6::TextPhase phase,
                            std::span<WorkspaceArena* const> workspace,
-                           const ExecutionContext& ec, const ops::PeerEvents& ev);
+                           const ExecutionContext& ec, const ops::PeerEvents& ev,
+                           const ops::ReplicatedRmsNorm* norm = nullptr);
 
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);

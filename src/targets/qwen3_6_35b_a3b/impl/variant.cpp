@@ -346,7 +346,8 @@ void Variant::attention_output_projection(std::span<const Tensor>,
                                           std::span<const Tensor>,
                                           std::span<const Tensor>, qwen3_6::TextPhase,
                                           std::span<WorkspaceArena* const>,
-                                          const ExecutionContext&, const ops::PeerEvents&) {
+                                          const ExecutionContext&, const ops::PeerEvents&,
+                                    const ops::ReplicatedRmsNorm*) {
     reject_tensor_parallel("attention_output_projection");
 }
 
@@ -370,7 +371,8 @@ void Variant::gdn_input_projection_snapshot(
 void Variant::gdn_output_projection(std::span<const Tensor>, std::span<const Weight>,
                                     std::span<const Tensor>, std::span<const Tensor>,
                                     qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
-                                    const ExecutionContext&, const ops::PeerEvents&) {
+                                    const ExecutionContext&, const ops::PeerEvents&,
+                                    const ops::ReplicatedRmsNorm*) {
     reject_tensor_parallel("gdn_output_projection");
 }
 
@@ -386,7 +388,8 @@ void Variant::post_mixer(std::span<const Tensor>,
                          std::span<const PostMixerWeights* const>,
                          std::span<const Tensor>, std::span<const Tensor>,
                          qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
-                         const ExecutionContext&, const ops::PeerEvents&) {
+                         const ExecutionContext&, const ops::PeerEvents&,
+                         const ops::ReplicatedRmsNorm* norm) {
     reject_tensor_parallel("post_mixer");
 }
 

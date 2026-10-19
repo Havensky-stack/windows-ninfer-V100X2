@@ -104,9 +104,54 @@ __global__ __launch_bounds__(256, 4) void w8_qpn_simt_kernel(
     }
 }
 
-// Four K partitions retain the original QPN MMA/reduction association. The packed
-// planes make each eight-code load contiguous across all 32 output lanes.
-__global__ __launch_bounds__(128, 8) void w8_qpn_prepacked_kernel(
+// Each lane owns one represented row; warps divide the original FP32 dot product.
+// This avoids the shared transpose needed by the legacy vocabulary GEMV layout.
+// The MTP-only profile changes reduction association, not the decoded W8 values.
+template <int Split>
+__global__ __launch_bounds__(Split * 32) void w8_qpn_mtp_gemv_kernel(
+    const std::uint8_t* __restrict__ codes, const std::uint16_t* __restrict__ scales,
+    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out, int n, int k) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row = blockIdx.x * 32 + ((lane >> 2) & 3) * 8 + (lane & 3) +
+                    ((lane & 16) ? 4 : 0);
+    const int groups = k / 32;
+    const int first = warp * (groups / Split);
+    const int end = warp == Split - 1 ? groups : first + groups / Split;
+    float accumulator = 0.0F;
+    for (int group = first; group < end; ++group) {
+        const auto scale_index = (static_cast<std::int64_t>(blockIdx.x) * groups + group) * 32 + lane;
+        const float scale = __half2float(__ushort_as_half(scales[scale_index]));
+#pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            const uint2 code = __ldg(reinterpret_cast<const uint2*>(codes) +
+                (static_cast<std::int64_t>(blockIdx.x) * (k / 8) + group * 4 + sub) * 32 + lane);
+            const uint4 raw = *reinterpret_cast<const uint4*>(x + group * 32 + sub * 8);
+            const auto* activation = reinterpret_cast<const __nv_bfloat16*>(&raw);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const auto word = j < 4 ? code.x : code.y;
+                const float weight = static_cast<float>(
+                    static_cast<std::int8_t>(word >> ((j & 3) * 8))) * scale;
+                accumulator = fmaf(weight, __bfloat162float(activation[j]), accumulator);
+            }
+        }
+    }
+    __shared__ float sums[Split][32];
+    sums[warp][lane] = accumulator;
+    __syncthreads();
+    if (warp == 0 && row < n) {
+        float sum = 0.0F;
+#pragma unroll
+        for (int part = 0; part < Split; ++part) { sum += sums[part][lane]; }
+        out[row] = __float2bfloat16(sum);
+    }
+}
+
+// Vocabulary heads retain four K partitions and their original association. MTP
+// projections use shape-specific splits. Every eight-code load is coalesced.
+template <int Split = 4>
+__global__ __launch_bounds__(Split * 32, 32 / Split) void w8_qpn_prepacked_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint16_t* __restrict__ scales,
     const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out,
     int n, int k, int t, int out_ld) {
@@ -115,10 +160,10 @@ __global__ __launch_bounds__(128, 8) void w8_qpn_prepacked_kernel(
     const int qp = (lane >> 2) & 3;
     const int r = (lane & 3) + ((lane & 16) ? 4 : 0);
     const int groups = k / 32;
-    const int first = warp * (groups / 4);
-    const int end = warp == 3 ? groups : first + groups / 4;
+    const int first = warp * (groups / Split);
+    const int end = warp == Split - 1 ? groups : first + groups / Split;
     const std::int64_t scale_base = static_cast<std::int64_t>(blockIdx.x) * groups * 32 + lane;
-    __shared__ float sums[4][256];
+    __shared__ float sums[Split][256];
     float c[8] = {};
     const half2 bias = __half2half2(__ushort_as_half(0x6480));
 #pragma unroll 4
@@ -132,8 +177,8 @@ __global__ __launch_bounds__(128, 8) void w8_qpn_prepacked_kernel(
             half2 b[4], a[4];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
-                const unsigned word = words[j / 2] >> ((j & 1) * 16);
-                const unsigned bits = (word & 255U) | ((word & 0xff00U) << 8) | 0x64006400U;
+                const unsigned bits = __byte_perm(
+                    words[j / 2], 0x64646464U, (j & 1) ? 0x4342U : 0x4140U);
                 b[j] = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&bits), bias), scale);
             }
             if (r < t) {
@@ -162,13 +207,13 @@ __global__ __launch_bounds__(128, 8) void w8_qpn_prepacked_kernel(
         sums[warp][row * 32 + qp * 8 + col] = c[i];
     }
     __syncthreads();
-    for (int index = threadIdx.x; index < 256; index += 128) {
+    for (int index = threadIdx.x; index < 256; index += Split * 32) {
         const int row = index / 32;
         const int col = blockIdx.x * 32 + index % 32;
         if (row < t && col < n) {
             float sum = 0.0f;
 #pragma unroll
-            for (int w = 0; w < 4; ++w) { sum += sums[w][index]; }
+            for (int w = 0; w < Split; ++w) { sum += sums[w][index]; }
             out[static_cast<std::int64_t>(row) * out_ld + col] = __float2bfloat16(sum);
         }
     }
@@ -179,9 +224,11 @@ __global__ __launch_bounds__(128, 8) void w8_qpn_prepacked_kernel(
 void w8_prepack_qpn_sm70(Weight& weight, cudaStream_t stream) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.n <= 0 ||
-        weight.k != 5120 || (weight.n != 248320 && weight.n != 124160 && weight.n != 62080) ||
+        !((weight.k == 5120 && (weight.n == 248320 || weight.n == 124160 ||
+             weight.n == 62080 || weight.n == 5120 || weight.n == 7168 || weight.n == 17408)) ||
+          (weight.n == 5120 && (weight.k == 3072 || weight.k == 8704))) ||
         weight.padded_shape[0] != weight.n || weight.padded_shape[1] != weight.k) {
-        throw std::invalid_argument("W8 QPN prepack requires a registered row-split vocabulary head");
+        throw std::invalid_argument("W8 QPN prepack requires a registered row-split vocabulary or TP2 MTP projection");
     }
     const auto code_bytes = static_cast<std::size_t>(weight.n) * weight.k;
     const auto scale_bytes = code_bytes / 32 * sizeof(std::uint16_t);
@@ -209,14 +256,26 @@ void launch_w8_prepacked_sm70(const Tensor& x, const Weight& weight, Tensor& out
     const auto* scales = static_cast<const std::uint16_t*>(weight.scales);
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     auto* output = static_cast<__nv_bfloat16*>(out.data);
-    if (t == 1) {
+    const bool mtp = weight.n <= 17408;
+    if (t == 1 && mtp) {
+        w8_qpn_mtp_gemv_kernel<16><<<weight.n / 32, 512, 0, stream>>>(
+            codes, scales, input, output, weight.n, weight.k);
+    } else if (t >= 3 && t <= 8 && mtp) {
+        if (weight.n == 5120) {
+            w8_qpn_prepacked_kernel<16><<<weight.n / 32, 512, 0, stream>>>(
+                codes, scales, input, output, weight.n, weight.k, t, out_ld);
+        } else {
+            w8_qpn_prepacked_kernel<8><<<weight.n / 32, 256, 0, stream>>>(
+                codes, scales, input, output, weight.n, weight.k, t, out_ld);
+        }
+    } else if (t == 1) {
         w8_qpn_simt_kernel<1><<<weight.n / 32, 256, 0, stream>>>(
             codes, scales, input, output, weight.n, weight.k, t, out_ld);
     } else if (t == 2) {
         w8_qpn_simt_kernel<2><<<weight.n / 32, 256, 0, stream>>>(
             codes, scales, input, output, weight.n, weight.k, t, out_ld);
     } else if (t <= 8) {
-        w8_qpn_prepacked_kernel<<<weight.n / 32, 128, 0, stream>>>(
+        w8_qpn_prepacked_kernel<4><<<weight.n / 32, 128, 0, stream>>>(
             codes, scales, input, output, weight.n, weight.k, t, out_ld);
     } else {
         launch_w8_volta_mma(x, weight, out, stream);

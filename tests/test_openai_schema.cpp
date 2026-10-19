@@ -4,6 +4,7 @@
 // consumed by external OpenAI clients.
 
 #include "serve/openai_schema.h"
+#include "serve/generation_service.h"
 #include "serve/request.h"
 #include "serve/translate.h"
 
@@ -686,6 +687,32 @@ int test_tool_chunk_serialization() {
     return failures;
 }
 
+int test_cache_usage_serialization() {
+    int failures = 0;
+    for (const int cached : {0, 37, 100}) {
+        GenerationOutcome outcome;
+        outcome.prompt_tokens = 100;
+        outcome.completion_tokens = 9;
+        outcome.metrics.prefix_cache_hit_tokens = cached;
+        const CompletionUsage usage = outcome.usage();
+        const Json expected = {{"prompt_tokens", 100}, {"completion_tokens", 9},
+                               {"total_tokens", 109},
+                               {"prompt_tokens_details", Json{{"cached_tokens", cached}}}};
+        const Json response = Json::parse(make_chat_completion_response(
+            "id-cache", "m", 1, "answer", "", "stop", usage));
+        failures += check(response.at("usage") == expected,
+                          "chat usage must report actual reuse without subtracting input tokens");
+        const std::vector<ToolCall> calls = {ToolCall{"call_1", "lookup", "{}"}};
+        const Json tool = Json::parse(make_chat_completion_tool_response(
+            "id-cache", "m", 1, "", "", calls, usage));
+        failures += check(tool.at("usage") == expected, "tool response cached-token usage");
+        const Json chunk = parse_sse(make_chat_chunk_usage("id-cache", "m", 1, usage));
+        failures += check(chunk.at("usage") == expected && chunk.at("choices").empty(),
+                          "streaming usage must match non-streaming cached-token usage");
+    }
+    return failures;
+}
+
 int test_models_and_error() {
     int failures    = 0;
     const Json list = Json::parse(make_models_list("qwen3.6-27b", 1));
@@ -742,6 +769,7 @@ int main() {
     failures += test_tool_response_serialization();
     failures += test_chunk_serialization();
     failures += test_tool_chunk_serialization();
+    failures += test_cache_usage_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();
     if (failures == 0) { std::cout << "ok\n"; }

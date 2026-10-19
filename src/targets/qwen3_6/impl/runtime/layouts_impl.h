@@ -325,6 +325,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        auto norm_scope = layout.scope();
+        if (plan.tp > 1 && first <= 8) {
+            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, 8));
+            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, 8));
+        }
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);

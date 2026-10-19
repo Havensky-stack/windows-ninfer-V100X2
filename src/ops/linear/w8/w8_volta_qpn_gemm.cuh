@@ -146,11 +146,10 @@ __global__ __launch_bounds__(W8VoltaQpnSchedule::kThreads, 8) void w8_volta_qpn_
 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const std::uint32_t src = (j < 2) ? w0 : w1;
-                    const int shift         = (j & 1) * 16;
-                    std::uint32_t bits =
-                        (((src >> shift) & 0xffu) | (((src >> shift) & 0xff00u) << 8)) |
-                        0x64006400u;
-                    b[j] = __hmul2(__hsub2(*reinterpret_cast<half2*>(&bits), bias), sc2);
+                    // Place adjacent biased code bytes in the two FP16 mantissas.
+                    const std::uint32_t bits = __byte_perm(
+                        src, 0x64646464U, (j & 1) ? 0x4342U : 0x4140U);
+                    b[j] = __hmul2(__hsub2(*reinterpret_cast<const half2*>(&bits), bias), sc2);
                 }
                 const unsigned* B = reinterpret_cast<const unsigned*>(b);
                 const int kbase   = g * kGroupK + u * 8;

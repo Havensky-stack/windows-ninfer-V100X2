@@ -173,7 +173,8 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    // Borrowed worker-owned counters; valid until the next mutation of this lane.
+    [[nodiscard]] const SpeculativeStats& speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;

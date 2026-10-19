@@ -37,6 +37,12 @@ inline ninfer::SpeculativeOptions profile(ninfer::ProposalHead default_mtp_head)
     if (backend == nullptr || std::strcmp(backend, "mtp") == 0) {
         result.backend = ninfer::SpeculativeBackend::Mtp;
         result.draft_tokens = 3;
+        if (const char* drafts = std::getenv("NINFER_TEST_MTP_DRAFTS")) {
+            result.draft_tokens = std::stoul(drafts);
+            if (result.draft_tokens == 0 || result.draft_tokens > 7) {
+                throw std::runtime_error("NINFER_TEST_MTP_DRAFTS must be in 1..7");
+            }
+        }
         result.proposal_head = default_mtp_head;
     } else if (std::strcmp(backend, "dflash") == 0) {
         result.backend = ninfer::SpeculativeBackend::DFlash;

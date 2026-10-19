@@ -18,10 +18,39 @@
   history token, the same KV format and the same partial-output precision. The INT8 attention
   kernel also computes each QK score tile once and shares it across the four output-dimension
   warps, preserving their softmax and PV accumulation order.
+- **QUASAR MTP4 KV lookahead:** the default SM70 TP2 five-query, eight-warp verifier preloads the
+  next 16-key tile's packed INT8 K/V and FP16 scales into registers while computing the current
+  tile. Dequantization still consumes the original codes/scales, with the same split ranges,
+  QK contractions, softmax updates, PV arithmetic and BF16 partial outputs for each profile.
+  No extra workspace or shared-memory buffer is allocated. Four-query staging remains unchanged
+  after mixed measurements. The optional long profile now uses the QPN verifier described below.
+  The public GQA suite includes an 85K fragmented-page append/cached comparison against its
+  independent FP64 oracle, exact cache/scale checks and allocation/input guards. Local throughput
+  and the scope of exact comparisons are recorded in [performance.md](performance.md).
+- **TP2 NVFP4 row outputs:** narrow SM70 projections use the existing staging planes for
+  contributions and reduce directly into the residual destinations. The rank-0 epilogue preserves
+  BF16 projection rounding before residual addition; separate residual-add and reduction-copy
+  launches are removed. Direct P2P/DMA collectives, both real row-shard shapes, changed-input
+  Graph replay, independent FP64 and real-model MTP4 state checks pass. Subsequent packet push, norm handoff, exact GDN fusion and related changes reach
+  198.105 / 198.097 committed wall tok/s at 85K/MTP4 after the final packed-MTP W8 step.
+  The user ended the search below 200. See [performance.md](performance.md).
+- **Experimental numerical decode:** `--volta-fast-decode` explicitly enables packed NVFP4
+  parents with FP32 scale-after-reduction and packed MTP W8 GEMV/QPN arithmetic. It is
+  default-off and limited to QUASAR SM70 TP2 Text/None/MTP. The normal route retains
+  per-group FP16 scaling. Codes/scales remain unchanged; arithmetic and draft acceptance
+  may change. The ~198.1 tok/s result combines this switch with long attention.
 - **Optional long attention:** `--volta-long-attention` keeps complete INT8 KV history but
   retunes long TP2 partitions, online softmax and FP32 PV accumulation. It supports single-request
   Text/None/MTP on SM70, excludes DFlash/RAM-KV/Vision, and can change generated output.
-  It remains default-off; see the [local numerical and GPQA comparison](performance.md#quasar-v3-final-long-context-decode-evaluation).
+  Five-query verification uses four eight-row QK warps with distributed Q fragments and inline
+  32-key softmax, followed by eight dimension warps accumulating PV in FP32. The Q staging tile
+  is reused for K/V after its fragments become resident in registers. This changes the former
+  sixteen-key update/partition association; original INT8 codes/scales and complete history are
+  retained. The current combined 85K MTP4 whole-request result is
+  198.105 / 198.097 committed wall tok/s; no more candidate sweeps are planned. The latest FP32 proposal Op changes drafts, preserves all 513 measured target IDs, and passes renewed whole-model Graph/eager state qualification. Its current 25-point full-vocabulary comparison matches every argmax but
+  fails the near-lossless bounds. It remains default-off; see the
+  [current numerical and performance evidence](performance.md#quasar-v3-mtp4-five-query-qpn-verifier-2026-10-18).
+  The older GPQA comparison does not qualify this arithmetic profile.
 - **DFlash sliding-window attention:** the Volta path uses FP32 split numerators and a warp-per-row
   route once enough rows are in flight; direct tiny windows retain the CTA route. The supported
   local window is 2,048 or 4,096 positions, and the complete-history target KV is unchanged.

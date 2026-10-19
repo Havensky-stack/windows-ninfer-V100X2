@@ -53,7 +53,7 @@ omitted at startup.
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
 distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2.
 Experimental `--vision` is available at TP2 for artifacts with execution-qualified Vision weights;
-QUASAR and GGUF-derived Q4_K_M still reject it. Vision weights and encoding reside only on the primary
+QUASAR NVFP4 admits TP2 None/MTP; GGUF-derived Q4_K_M rejects it. Vision weights and encoding reside only on the primary
 rank; composed embeddings are copied to the peer before split text prefill, and both ranks use
 the same three-axis positions and per-request RoPE delta. Vision requests participate in the
 same compact concurrent decode batches as text requests. Vision requires additional startup
@@ -206,6 +206,27 @@ both OpenAI spellings are present they must carry the same boolean value. Unknow
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage.
+
+Chat Completions usage includes `prompt_tokens_details.cached_tokens`: the actual input tokens
+restored from the Engine's prefix cache, including resident-frontier and saved-checkpoint reuse.
+`prompt_tokens` still includes these tokens; neither completion nor speculative draft tokens count
+as cache hits. Cold requests and `--no-prefix-reuse` return zero. Non-streaming text and tool-call
+responses return this field in `usage`; streaming clients must request
+`"stream_options":{"include_usage":true}` and read it from the final usage chunk before `[DONE]`.
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 128,
+    "total_tokens": 1128,
+    "prompt_tokens_details": {"cached_tokens": 900}
+  }
+}
+```
+
+The token cache-hit rate for this request is `900 / 1000 = 90%`. It is not the fraction of requests
+with a hit. The Responses API reports the same reuse as `usage.input_tokens_details.cached_tokens`.
 
 ### Multimodal request
 
@@ -520,6 +541,13 @@ an effort with `thinking.type: "disabled"` is rejected as contradictory.
 
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
+Messages usage reports `cache_read_input_tokens` for actual prefix-cache reuse and `input_tokens`
+for the remaining uncached input. Their sum is the complete templated input-token count.
+`cache_creation_input_tokens` is zero: NInfer does not expose a separate cache-creation accounting
+category. For SSE, `message_start.usage.input_tokens` is provisional (the prepared full input);
+the terminal `message_delta.usage` contains authoritative cumulative input, cache-read and output
+counts. Replace the initial counts with these final values rather than adding them.
+
 `POST /v1/messages/count_tokens` uses the artifact's tokenizer, chat template, and media expansion
 without running GPU generation:
 
@@ -577,6 +605,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, concurrency 1, INT8 KV, Text/None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-fast-decode` | experimental QUASAR SM70 TP2 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -631,7 +660,7 @@ they do not infer request behavior from process-global counter deltas.
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
+| `throughput` | interval token deltas and rates, drafted/accepted draft deltas, scheduler occupancy, and decode-round batch statistics |
 
 At `--tp 2` every other `engine` and `memory` field in `server_start` is the primary rank's; `tp`
 and `devices` are what identify the record as a dual-device run and name the second GPU. Per-device
@@ -641,6 +670,9 @@ memory rows remain a console load-summary table rather than structured-log field
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
+`throughput.speculative` contains interval `drafted_tokens` and `accepted_tokens` deltas for
+live draft acceptance (`accepted / drafted`, undefined when drafted is zero). These count
+target-accepted drafts, excluding bonus tokens, not all committed output tokens.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
@@ -715,11 +747,26 @@ reports the reused token count as `cache=`.
 
 The prefix cache is process-local retained Engine state. Restarting the server clears it. With one
 active slot, serving an unrelated conversation can replace the retained entry; it is not a persistent
-cache of every conversation. Only the current resident frontier and a saved complete turn/response
-checkpoint are eligible reuse positions, rather than an arbitrary longest common token prefix.
+cache of every conversation. In addition to the current resident frontier and a saved complete
+turn/response checkpoint, reusable text requests with None/MTP speculation and complete GPU KV
+retain bounded RAM checkpoints of every rank's exact GDN state and the target tail hidden.
+Shorter prompts or edits to a later suffix restore the longest saved frontier within their common
+token/position prefix and recompute only the remaining suffix. Cache usage counts only tokens
+whose computation was actually skipped. There is no arbitrary substring reuse or guarantee that
+every common-prefix token has a saved recurrent state.
+
+These host images add at most 2 GiB per Program (divided among the configured lanes), without
+additional VRAM. Capture uses one early boundary (half the prompt, capped at 64 tokens), then
+budget-spaced actual prefill chunk ends and the final prompt boundary. The early split rejoins
+the ordinary chunk grid; not every small GPU chunk is copied to RAM. Under the budget, older
+redundant images are evicted, preserving a first and recent checkpoint when two images fit.
+Capture/restore transfer time is included
+in prefill timing. `--no-prefix-reuse` also skips these captures. Vision, DFlash and sparse RAM-KV
+keep the existing frontier/turn/response rules. See [prefix state ownership](maintainer/paged-kv-cache.md#10-prefix-reuse).
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
-`restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
+`restore_turn_checkpoint`, `restore_response_checkpoint`, and `restore_prefix_checkpoint`.
+Every restored checkpoint includes the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
 rewritten suffix; matching KV tokens alone never authorize a partial hit. With stable
 `preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current

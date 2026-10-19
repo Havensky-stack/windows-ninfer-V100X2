@@ -4,8 +4,9 @@
 
 Fast single-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**, CUDA 12.8 / SM70.
 The local cards use PCIe P2P through SXM2-to-PCIe adapters, **without NVLink**.
-**QUASAR NVFP4 v3 is the recommended text model**, with TP2, INT8 group-64 KV and CUDA Graphs.
-It loads zero Vision weights; image/video input is unsupported for this artifact.
+**QUASAR NVFP4 v3 is the recommended model**, with TP2, INT8 group-64 KV and CUDA Graphs.
+Text-only startup loads zero Vision weights. Optional TP2 image/video uses the same artifact;
+GUI/TUI provide a Vision ON/OFF switch, off by default.
 
 Maintainer's personal experience: “It feels in the same tier as FP8.”
 The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
@@ -49,6 +50,13 @@ All six answers stop naturally at 1190 published tokens and pass exact record/ar
 checks. DFlash can be slower on prose and other tasks.
 [Full QUASAR task matrix](docs/performance.md#quasar-v3-stop-aware-task-matrix).
 Short prefill interval peaks near 2500 tok/s are not the phase average for an 85K request.
+
+The final 2026-10-19 QUASAR MTP4 combination measured **198.105 / 198.097 committed wall tok/s**
+at 85000 actual prompt tokens and 180000 capacity, with complete INT8 KV, TP2, Graphs,
+chunk 2560 and optimized proposals. It requires both default-off `--volta-fast-decode` and
+`--volta-long-attention`. This is a different numerical profile from the historical rows above;
+its current-combination GPQA has not been run. The user ended the search below 200.
+[Current implementation, quality limits and final checks](docs/performance.md).
 
 ## llama.cpp / LM Studio comparison
 
@@ -99,8 +107,9 @@ bash tools/v100/ninfer-tui.sh
 
 Select a profile, edit paths/devices/context, inspect the command, and start the API.
 It shows live logs, health and Engine throughput; `s` stops its child server and `q` exits.
-The default is QUASAR MTP3 / 180K, with CUDA Graphs and prefix reuse enabled.
-The 143 tok/s profile is an explicit experimental MTP4 preset.
+The default is QUASAR MTP4 / 180K, with CUDA Graphs and prefix reuse enabled.
+The ~198.1 tok/s combination is an explicit experimental preset. GUI and TUI also expose a
+Vision ON/OFF switch and a 98K image/video preset using the same QUASAR file.
 [Launcher controls and options](docs/tui.md).
 
 Or start the API directly:
@@ -110,7 +119,7 @@ env LD_LIBRARY_PATH="$PWD/build/_deps/install/lib:/usr/local/cuda-12.8/lib64${LD
   build-v100/apps/ninfer-serve /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
   --host 127.0.0.1 --port 8080 --tp 2 --devices 0,1 --max-concurrency 1 \
   --max-context 180000 --kv-dtype int8 --prefill-chunk 2560 \
-  --spec mtp --draft-tokens 3 --lm-head-draft --default-max-tokens 65536 \
+  --spec mtp --draft-tokens 4 --lm-head-draft --default-max-tokens 65536 \
   --request-log-jsonl profiles/serve.jsonl --log-stats-interval-ms 1000 --no-thinking
 ```
 

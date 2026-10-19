@@ -126,6 +126,9 @@ int main() {
     check(parse_cli(with({"--volta-long-attention"})).volta_long_attention &&
               !parse_cli(base()).volta_long_attention,
           "Volta long attention must be explicit and disabled by default");
+    check(parse_cli(with({"--volta-fast-decode"})).volta_fast_decode &&
+              !parse_cli(base()).volta_fast_decode,
+          "experimental fast decode must be explicit and disabled by default");
     const auto pp2 = parse_cli(with({"--pp", "2", "--devices", "1,0", "--pipeline-chunks", "4"}));
     check(pp2.tp == 1 && pp2.pp == 2 && pp2.pipeline_chunks == 4 &&
               pp2.devices == std::vector<int>({1, 0}), "PP2 CLI geometry mismatch");

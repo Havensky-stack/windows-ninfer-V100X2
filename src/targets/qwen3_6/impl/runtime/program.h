@@ -69,6 +69,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    bool capture_prefix_checkpoints = false;
 };
 
 template <>
@@ -79,6 +80,7 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
     bool prepare_mtp = false;
+    bool capture_prefix_checkpoints = false;
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -123,6 +125,14 @@ struct RewriteCheckpoint {
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
 };
+
+struct PrefixCheckpoint {
+    std::uint32_t frontier = 0;
+    // All ranks' exact convolution/recurrent state followed by rank 0's tail hidden.
+    std::unique_ptr<std::byte[]> image;
+};
+
+inline constexpr std::size_t kPrefixCheckpointBudget = 2ULL * 1024 * 1024 * 1024;
 
 struct SequenceKVBundle {
     PagedKVAllocation text;
@@ -177,6 +187,10 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RewriteCheckpoint rewrite_checkpoint;
+    std::vector<PrefixCheckpoint> prefix_checkpoints;
+    // When set, the committed GDN state lives in this lane's complete owned RAM
+    // checkpoint at this frontier; the current GPU GDN slot is not readable yet.
+    std::optional<std::uint32_t> deferred_prefix_state;
     TokenSpan ram_query;
     std::uint32_t ram_rank_frontier = 0;
 };
@@ -190,6 +204,15 @@ struct RequestControl {
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
+    // Exact-hit output selection needs only the lane's saved tail hidden. Restore the
+    // recurrent state and rebuild MTP continuation when decode first consumes them.
+    // These inputs belong to this request/lane, never to shared prefill scratch.
+    struct ExactHitContinuation {
+        std::array<std::int32_t, 3> bridge_rope;
+        std::uint32_t proposal_extent = 0;
+    };
+    std::optional<ExactHitContinuation> exact_hit;
+
     struct Prefill {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
@@ -202,6 +225,7 @@ struct RequestControl {
         std::uint32_t initial_mtp_extent = 0;
         double elapsed_seconds           = 0.0;
         bool prepare_mtp                 = false;
+        bool capture_prefix_checkpoints  = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
     };
@@ -283,7 +307,7 @@ public:
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
     void evict_retained_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] const SpeculativeStats& speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -493,6 +517,11 @@ private:
     void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
     void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
+    [[nodiscard]] std::size_t prefix_checkpoint_bytes() const;
+    void save_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier, const Tensor& hidden);
+    void restore_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                   bool restore_linear_state = true);
+    void finish_exact_hit(SequenceState& sequence, RequestControl& request, bool decode);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

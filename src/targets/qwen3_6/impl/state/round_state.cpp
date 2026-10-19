@@ -161,8 +161,6 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                        "MTP decode alignment hidden");
         decode.ar_hidden = add_tensor(builder, DType::BF16, {layout.spec.hidden, batch},
                                       "MTP decode autoregressive hidden");
-        decode.next_hidden =
-            add_tensor(builder, DType::BF16, {layout.spec.hidden, batch}, "MTP decode next hidden");
         decode.ar_positions      = add_tensor(builder, DType::I32, {batch, ar_steps},
                                               "MTP decode autoregressive positions");
         decode.ar_rope_positions = add_tensor(builder, DType::I32, {batch, ar_steps},
@@ -275,7 +273,6 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     alignment_ids              = layout.alignment_ids.bind(backing);
     alignment_hidden           = layout.alignment_hidden.bind(backing);
     ar_hidden                  = layout.ar_hidden.bind(backing);
-    next_hidden                = layout.next_hidden.bind(backing);
     ar_positions               = layout.ar_positions.bind(backing);
     ar_rope_positions          = layout.ar_rope_positions.bind(backing);
     ar_valid_columns           = layout.ar_valid_columns.bind(backing);
