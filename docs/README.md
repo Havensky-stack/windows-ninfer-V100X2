@@ -12,7 +12,7 @@ comparison, CUDA 12.8 build and API launch. Other hardware and experiments have 
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, dual-GPU serving, and YaRN extended context |
 | [TUI / 终端启动器](tui.md) | SSH/local terminal API launch, explicit model/device selection, MTP/DFlash presets, live logs and owned-process stop |
 | [PyQt 控制台](gui.md) | 图形化启动/停止 API、TP/设备、上下文/KV、MTP/DFlash、缓存、并发和采样参数 |
-| [QUASAR performance](performance.md) | local 85K code, DFlash JSONL, task matrix, numerical limits and partial GPQA |
+| [QUASAR performance](performance.md) | local 85K code, concurrent throughput, DFlash JSONL, task matrix, numerical limits and partial GPQA |
 | [llama.cpp / LM Studio](llama-comparison.md) | historical same-Q4_K_M controls and comparison conditions |
 | [TP4 / NVLink](tp4.md) | separate four-V100 host, official NVFP4/native FP8, API and 1Cat controls |
 | [Other V100 measurements](performance-v100.md) | official NVFP4, Q4_K_M, transport and prefix-cache controls |

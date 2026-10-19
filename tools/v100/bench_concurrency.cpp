@@ -1,0 +1,117 @@
+// Fixed-token QUASAR/MTP4 request groups through the public Engine.
+#include "ninfer/engine.h"
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <thread>
+
+using Json = nlohmann::json;
+using Clock = std::chrono::steady_clock;
+int main(int argc, char** argv) {
+    try {
+        if (argc != 7) { throw std::invalid_argument("usage: bench ARTIFACT CORPUS INPUT_TOKENS CONCURRENCY OUTPUT_TOKENS REPORT.json"); }
+        const unsigned length = std::stoul(argv[3]), concurrency = std::stoul(argv[4]), output = std::stoul(argv[5]);
+        if (length < 1 || length > 85000 || concurrency < 1 || concurrency > 8 || output < 2) {
+            throw std::invalid_argument("invalid workload");
+        }
+        std::vector<ninfer::TokenId> ids;
+        std::ifstream corpus(argv[2]);
+        ninfer::TokenId token;
+        while (corpus >> token && ids.size() < length) { ids.push_back(token); }
+        if (ids.size() != length) { throw std::runtime_error("corpus too short"); }
+        ninfer::EngineOptions options;
+        options.artifact_path = argv[1]; options.tp = 2; options.devices = {0, 1};
+        options.max_context = 180000;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(180000);
+        options.prefill_chunk = 1024;
+        options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
+        options.max_concurrency = concurrency;
+        options.pending_timeout_ms = 1800000; // Eight cold 85K prefills can queue for minutes.
+        options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens = 4;
+        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+        options.volta_long_attention = true; options.volta_fast_decode = true;
+        options.prefix_cache_tokens = 0; // Cold independent requests; no historical RAM transfers.
+        ninfer::Engine engine(options);
+        const auto settled_stats = [&](std::uint64_t expected) {
+            const auto deadline = Clock::now() + std::chrono::seconds(5);
+            for (;;) {
+                const auto stats = engine.runtime_stats();
+                if (stats.running_requests == 0 && stats.committed_decode_tokens >= expected) {
+                    return stats;
+                }
+                if (Clock::now() >= deadline) { throw std::runtime_error("final decode counters did not settle"); }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        };
+        ninfer::RequestOptions request;
+        request.execution.allow_prefix_reuse = false;
+        request.execution.requested_output_tokens = output;
+        request.execution.sampling.temperature = 0.0F;
+        request.execution.sampling.presence_penalty = 0.0F;
+        request.execution.sampling.frequency_penalty = 0.0F;
+        request.stop.include_model_defaults = false;
+        // Warm the graph execution path outside the group measurement.
+        auto warm = request; warm.execution.requested_output_tokens = 32;
+        (void)engine.generate(engine.prepare_tokens({198, 220, 198, 220}), warm);
+        std::vector<ninfer::PreparedPrompt> prompts;
+        for (unsigned i = 0; i < concurrency; ++i) { prompts.push_back(engine.prepare_tokens(ids)); }
+        Json rows = Json::array(), samples = Json::array();
+        const auto before = settled_stats(31);
+        const auto started = Clock::now();
+        std::vector<ninfer::GenerationHandle> handles;
+        for (auto& prompt : prompts) { handles.push_back(engine.submit(std::move(prompt), request)); }
+        std::jthread sampler([&](std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                const auto stats = engine.runtime_stats();
+                samples.push_back({{"seconds", std::chrono::duration<double>(Clock::now() - started).count()},
+                    {"running", stats.running_requests}, {"prefilling", stats.prefilling_requests},
+                    {"decode_ready", stats.decode_ready_requests}, {"waiting", stats.waiting_requests}});
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        });
+        for (auto& handle : handles) {
+            const auto result = handle.wait();
+            if (result.generated_token_ids.size() != output) { throw std::runtime_error("incomplete output"); }
+            rows.push_back({{"prompt_tokens", result.prompt.prompt_tokens},
+                {"completion_tokens", result.generated_token_ids.size()}, {"cached_tokens", result.reused_prompt_tokens},
+                {"prefill_seconds", result.timings.prefill_seconds}, {"decode_seconds", result.timings.decode_seconds},
+                {"drafted", result.speculative.drafted_tokens}, {"accepted", result.speculative.accepted_tokens}});
+        }
+        const double makespan = std::chrono::duration<double>(Clock::now() - started).count();
+        sampler.request_stop(); sampler.join();
+        const auto after = settled_stats(before.committed_decode_tokens + std::uint64_t(concurrency) * (output - 1));
+        const auto committed = after.committed_decode_tokens - before.committed_decode_tokens;
+        const double decode_wall = after.decode_wall_seconds - before.decode_wall_seconds;
+        const auto rounds = after.decode_rounds - before.decode_rounds;
+        const auto row_rounds = after.decode_row_rounds - before.decode_row_rounds;
+        if (committed != std::uint64_t(concurrency) * (output - 1) || decode_wall <= 0 || rounds == 0) {
+            throw std::runtime_error("invalid committed-token timing counters");
+        }
+        unsigned peak_running = 0, peak_ready = 0;
+        for (const auto& sample : samples) {
+            peak_running = std::max(peak_running, sample.at("running").get<unsigned>());
+            peak_ready = std::max(peak_ready, sample.at("decode_ready").get<unsigned>());
+        }
+        Json report{{"artifact_type", "ninfer_v100_long_concurrency"}, {"input_tokens", length},
+            {"concurrency", concurrency}, {"output_tokens_per_request", output},
+            {"tp", 2}, {"mtp_drafts", 4}, {"graphs", true}, {"kv_capacity", 180000},
+            {"prefill_chunk", 1024}, {"long_attention", true}, {"fast_decode", true},
+            {"prefix_reuse", false}, {"committed_decode_tokens", committed},
+            {"decode_wall_seconds", decode_wall}, {"total_decode_tok_s", committed / decode_wall},
+            {"group_makespan_seconds", makespan}, {"group_output_tok_s", double(concurrency * output) / makespan},
+            {"decode_rounds", rounds}, {"mean_decode_batch", double(row_rounds) / rounds},
+            {"peak_running", peak_running}, {"peak_decode_ready", peak_ready},
+            {"requests", rows}, {"scheduler_samples", samples}};
+        const std::string temporary = std::string(argv[6]) + ".tmp";
+        { std::ofstream stream(temporary); stream << report.dump(2) << '\n'; if (!stream) { throw std::runtime_error("cannot write report"); } }
+        std::filesystem::rename(temporary, argv[6]);
+        report.erase("scheduler_samples"); report.erase("requests");
+        std::cout << report.dump() << std::endl;
+        return 0;
+    } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
+}

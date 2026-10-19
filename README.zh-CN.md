@@ -2,7 +2,7 @@
 
 [English](README.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [详细测评](docs/performance.md) · [HTTP API](docs/serving.md)
 
-**相比上代，同一 85K-token 代码任务的已提交 decode 吞吐从 143.46 提升至 198.10 tok/s，约提升 38.1%。**
+**相比 v0.1.0 前的上代解码实现，同一 85K-token 代码任务的已提交 decode 吞吐从 143.46 提升至 198.10 tok/s，约提升 38.1%。**
 两次测评均使用双 V100 16 GB、180K 容量、TP2/MTP4、INT8 KV、CUDA Graphs 和 greedy 采样。
 本代成绩同时开启实验长注意力与快速数值路径，输出可能变化，当前组合未跑 GPQA。
 [本代成绩](docs/performance.md#quasar-v3-mtp4-retained-decode-profile-2026-10-19) · [上代成绩](docs/performance.md#quasar-v3-final-long-context-decode-evaluation)。
@@ -15,6 +15,28 @@
 维护者个人实际体验是跟 FP8 一档的。作者公布的源模型 GPQA-D 为 90.91%，BF16 为
 91.41%；AIME'26 两者均为 100%。这些是外部源模型成绩，不是本机转换后的质量分数，
 也不代表数学无损。[公开来源、独立对比和限制](docs/model-quality.md)。
+
+## v0.1.1：并发、历史分枝缓存与 Responses
+
+实验长注意力现支持 **1–8 个活跃请求**，使用 TP2/MTP4。实际同时执行的请求数仍受共享
+KV 容量限制，超出后排队。2K / 16K / 85K 输入矩阵同时报告总解码吞吐与实际批大小。
+**已完成 10/12 组**；85K/4 并发时 GPU 0 掉总线（Xid 79），85K/4、8 并发缺测。
+本版不宣称相比 v0.1.0 有额外单请求提速。
+[测量结果和方法](docs/performance.md#experimental-long-context-concurrency-2026-10-20)。
+
+![并发总解码吞吐与实际批大小](docs/assets/quasar-concurrency.svg)
+
+前缀缓存现保留历史分枝和多棵对话树：`ABD → ABC → ABDE` 可以恢复保存过的 ABD 检查点。
+历史 KV 原始字节与完整 GDN/MTP 状态恢复到各请求独占的 GPU pages。
+GUI/TUI 可设置 `--prefix-cache-tokens`，默认推荐 **1,000,000 tokens**，超预算淘汰最旧分枝。
+QUASAR INT8 主 KV 加 MTP 在该预算下约占 **33.4 GiB 主机内存**，另有状态与临时所有权；
+归档状态另受 2 GiB 上限限制。设为 0 仅关闭历史保留，仍可复用当前 GPU 前缀。
+视觉、DFlash、稀疏 RAM-KV 不使用历史分枝。
+[缓存语义与限制](docs/maintainer/paged-kv-cache.md#104-historical-branches)。
+
+Responses 可用 `reasoning: {"effort": "high"}`，按当前 Qwen 模板映射；`none` 关闭思考。
+七档入参均通过实际端口的流式/非流式检查。[接口说明](docs/serving.md)。
+后续 Release 只提供源码，并记录更新日志及 85K 输入的性能变化。
 
 ## QUASAR NVFP4 最新测评 · 2026-10-19
 

@@ -147,7 +147,7 @@ GUI 是 API 启动器；图片/视频由客户端通过既有 OpenAI/Anthropic �
 
 - “NVFP4 / MTP 快速数值路径”：`--volta-fast-decode`，QUASAR / SM70 / TP2 / 纯文本 None/MTP；
   NVFP4 全局缩放移到 FP32 K 归约后，并启用 MTP W8 特定分区/归约。
-- “完整历史长注意力”：`--volta-long-attention`，SM70 27B / TP2 / INT8 KV / 并发1 / 纯文本 None/MTP；
+- “完整历史长注意力”：`--volta-long-attention`，SM70 27B / TP2 / INT8 KV / 实验性并发1–8 / 纯文本 None/MTP；
   保留每个历史 KV，但改变 softmax、PV 和归约顺序。
 
 组合在 85K 实际输入、180K 容量、MTP4、greedy、Graph 下测得 **198.105 / 198.097 committed tok/s**。
@@ -216,3 +216,13 @@ Responses 使用 `usage.input_tokens_details.cached_tokens`，Anthropic Messages
 跳过计算的 token，不把重算部分算进缓存。首次建立检查点需要分配和传输 RAM 数据，
 会增加 prefill 耗时；后续请求复用已有缓冲。DFlash、视觉和 RAM-KV 仍使用原有的
 完整 frontier / turn / response 检查点规则。
+
+历史分枝缓存的预算在“推理 → 历史缓存预算 / tokens”设置，随命名配置保存/加载。
+推荐默认 **1,000,000 tokens**；0 关闭历史分枝，仅保留当前 GPU 前缀。
+旧分枝在覆盖前把原始 KV、各 rank 的 GDN 和 tail hidden 保存到 RAM，
+因此 `ABD → ABC → ABDE` 可以回到 ABD 的完整检查点，不局限于上一个请求。
+多个对话树共用预算，按最早保存的分枝先淘汰；同一已恢复血统的完整不可变块只计一次。
+预算按 Main Text 的64-token页取整，不是进程内存上限：QUASAR TP2 INT8 KV 的1M预算，
+主 KV 加 MTP 最多约 **33.4 GiB RAM**，还需完整状态检查点及恢复时的临时余量。
+恢复到有完整状态的最近前缀，其后需要重算的 token 不算命中。Vision、DFlash 和稀疏 RAM-KV
+不使用此历史分枝缓存。[所有权与预算](maintainer/paged-kv-cache.md#104-historical-branches)。

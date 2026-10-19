@@ -116,3 +116,13 @@ prefill/decode phase averages, token counts, times and acceptance. Decode phase 
 the first output token produced by prefill. These phase values are separate from the one-second
 Engine throughput above. A new launch skips historical records already in the append-only log;
 its session counters reset on start/restart, and incomplete/error requests do not count as hits.
+
+`Historical prefix budget` sets `--prefix-cache-tokens` and is saved with preferences.
+The recommended default is **1,000,000 unique page-rounded Main Text tokens**; `0` keeps
+only current GPU-prefix reuse. Historical Text/None/MTP branches retain exact packed KV and
+complete GDN/tail state in RAM, evicting the oldest saved branch first. QUASAR TP2 INT8 KV
+needs up to about **33.4 GiB RAM** for 1M main+MTP tokens, plus bounded state images and
+transfer headroom. This is not a process RSS cap. Vision, DFlash and sparse RAM-KV are excluded.
+Long attention admits experimental startup-fixed concurrency **1–8**; all independent requests
+share the GPU KV pool, so configured concurrency does not guarantee that many long prompts
+can run simultaneously. See [concurrency measurements](performance.md#experimental-long-context-concurrency-2026-10-20).

@@ -253,7 +253,7 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
                           ? std::make_optional<PinnedHostBuffer>(2ULL * plan.prefill_chunk * plan.pipeline_chunks * sizeof(TokenId))
                           : std::nullopt),
       capacity(plan.capacity), kv_capacity(plan.kv_capacity),
-      max_concurrency(plan.max_concurrency), prefill_chunk(plan.prefill_chunk),
+      max_concurrency(plan.max_concurrency), prefix_cache_tokens(plan.prefix_cache_tokens), prefill_chunk(plan.prefill_chunk),
       draft_window(plan.draft_window), ram_kv(plan.ram_kv), volta_long_attention(plan.volta_long_attention),
       speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
@@ -618,6 +618,16 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
          transient.alignment < request_plan.summary.transient_alignment)) {
         throw std::invalid_argument("request transient region does not satisfy the plan");
     }
+    const auto started = Clock::now();
+    // Save the outgoing branch before any truncation or overwrite. A plan pins its
+    // selected archive across FIFO eviction and budget trimming.
+    if (sequence.retained && (request_plan.archived_prefix ||
+                              request_plan.reuse_base < sequence.execution_frontier)) {
+        archive_prefix(sequence);
+    }
+    if (request_plan.archived_prefix) {
+        restore_archived_prefix(sequence, *request_plan.archived_prefix, request_plan);
+    }
     if (request_plan.reuse != ReusePath::FullReset &&
         (!sequence.retained ||
          !qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
@@ -668,7 +678,6 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
         throw std::logic_error("planned rewrite checkpoint deferral is invalid");
     }
 
-    const auto started       = Clock::now();
     const std::uint32_t base = request_plan.reuse_base;
     const std::uint32_t initial_mtp_extent =
         speculative_backend == SpeculativeBackend::Mtp
@@ -686,6 +695,10 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             .proposal_extent = initial_mtp_extent};
     }
     sequence.retained = false;
+    sequence.archived_snapshot.reset();
+    sequence.history_enabled = request_plan.capture_prefix_checkpoints;
+    sequence.shared_prefix_tokens = std::min(sequence.shared_prefix_tokens, base);
+    if (base == 0) { sequence.prefix_chunks.clear(); }
     try {
         if (request_plan.reuse == ReusePath::FullReset) {
             sequence.deferred_prefix_state.reset();
@@ -1152,8 +1165,9 @@ bool ProgramImplCore::has_retained_lane(std::uint32_t lane) const noexcept {
     return lane < max_concurrency && sequences[lane].retained;
 }
 
-void ProgramImplCore::evict_retained_lane(std::uint32_t lane) noexcept {
+void ProgramImplCore::evict_retained_lane(std::uint32_t lane) {
     if (!has_retained_lane(lane)) { return; }
+    archive_prefix(sequences[lane]);
     clear_lane(sequences[lane], requests[lane]);
 }
 
@@ -1202,7 +1216,16 @@ void ProgramImplCore::save_prefix_checkpoint(SequenceState& sequence, std::uint3
         checkpoint.image = std::move(checkpoints[victim].image);
         checkpoints.erase(checkpoints.begin() + static_cast<std::ptrdiff_t>(victim));
     }
-    if (!checkpoint.image) { checkpoint.image = std::make_unique_for_overwrite<std::byte[]>(bytes); }
+    checkpoints.push_back(capture_prefix_checkpoint(sequence, frontier, hidden, std::move(checkpoint.image)));
+}
+
+PrefixCheckpoint ProgramImplCore::capture_prefix_checkpoint(SequenceState& sequence,
+    std::uint32_t frontier, const Tensor& hidden, std::shared_ptr<std::byte[]> image) {
+    const std::size_t bytes = prefix_checkpoint_bytes();
+    PrefixCheckpoint checkpoint{frontier, std::move(image)};
+    if (!checkpoint.image || checkpoint.image.use_count() != 1) {
+        checkpoint.image = std::shared_ptr<std::byte[]>(new std::byte[bytes]);
+    }
     std::size_t offset = 0;
     const auto capture = [&](LinearAttentionStatePool& pool, DeviceContext& ctx) {
         const ScopedDevice scope(ctx.device);
@@ -1216,7 +1239,7 @@ void ProgramImplCore::save_prefix_checkpoint(SequenceState& sequence, std::uint3
     CUDA_CHECK(cudaMemcpyAsync(checkpoint.image.get() + offset, hidden.data, hidden.bytes(),
                                cudaMemcpyDeviceToHost, device.stream));
     device.synchronize();
-    checkpoints.push_back(std::move(checkpoint));
+    return checkpoint;
 }
 
 void ProgramImplCore::restore_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
@@ -1247,6 +1270,182 @@ void ProgramImplCore::restore_prefix_checkpoint(SequenceState& sequence, std::ui
                                                           : std::optional(frontier);
 }
 
+namespace {
+std::uint32_t prefix_page_count(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0 : 1 + (tokens - 1) / kPagedKVPageSize;
+}
+}
+
+void ProgramImplCore::trim_prefix_history() {
+    // Account unique immutable KV chunks, not repeated shared prefixes or TP ranks.
+    const auto usage = [&] {
+        std::vector<const PrefixKVChunk*> chunks;
+        std::vector<const std::byte*> images;
+        std::uint64_t tokens = 0;
+        for (const auto& branch : prefix_history) {
+            for (const auto& chunk : branch->chunks) {
+                if (std::find(chunks.begin(), chunks.end(), chunk.get()) == chunks.end()) {
+                    chunks.push_back(chunk.get());
+                    tokens += std::uint64_t(chunk->pages) * kPagedKVPageSize;
+                }
+            }
+            for (const auto& checkpoint : branch->checkpoints) {
+                if (std::find(images.begin(), images.end(), checkpoint.image.get()) == images.end()) {
+                    images.push_back(checkpoint.image.get());
+                }
+            }
+        }
+        return std::pair(tokens, images.size() * prefix_checkpoint_bytes());
+    };
+    while (!prefix_history.empty()) {
+        const auto [tokens, state_bytes] = usage();
+        if (tokens <= prefix_cache_tokens && state_bytes <= kPrefixCheckpointBudget) { break; }
+        if (tokens <= prefix_cache_tokens) {
+            // Keep branch endpoints; interior frontiers are expendable under state pressure.
+            bool removed = false;
+            for (auto& branch : prefix_history) {
+                if (branch->checkpoints.size() > 1) {
+                    branch->checkpoints.erase(branch->checkpoints.begin());
+                    removed = true;
+                    break;
+                }
+            }
+            if (removed) { continue; }
+        }
+        prefix_history.erase(prefix_history.begin()); // FIFO oldest branch, including its private suffix.
+        for (auto& sequence : sequences) {
+            sequence.prefix_chunks.clear();
+            sequence.shared_prefix_tokens = 0;
+        }
+    }
+}
+
+void ProgramImplCore::archive_prefix(SequenceState& sequence) {
+    if (!sequence.archived_snapshot.expired()) { return; }
+    const std::uint32_t frontier = sequence.execution_frontier;
+    const auto pages = prefix_page_count(frontier);
+    if (prefix_cache_tokens == 0 || !sequence.retained || !sequence.history_enabled ||
+        !sequence.kv || frontier == 0 || sequence.text_kv_valid < frontier ||
+        std::uint64_t(pages) * kPagedKVPageSize > prefix_cache_tokens) { return; }
+    // Archive capture must not recycle the lane's checkpoints: an admission plan
+    // can already name one of them, even when the lane has room for only one image.
+    std::vector<PrefixCheckpoint> saved_checkpoints;
+    for (const auto& checkpoint : sequence.prefix_checkpoints) {
+        if (checkpoint.frontier != 0 && checkpoint.frontier <= frontier) {
+            saved_checkpoints.push_back(checkpoint);
+        }
+    }
+    if (std::none_of(saved_checkpoints.begin(), saved_checkpoints.end(),
+                    [frontier](const auto& checkpoint) { return checkpoint.frontier == frontier; })) {
+        if (sequence.deferred_prefix_state) {
+            restore_prefix_checkpoint(sequence, *sequence.deferred_prefix_state);
+        }
+        if (!sequence.tail_hidden_valid) { return; }
+        saved_checkpoints.push_back(capture_prefix_checkpoint(sequence, frontier, sequence.tail_hidden));
+    }
+    auto archive = std::make_shared<ArchivedPrefix>();
+    archive->frontier = frontier;
+    archive->mtp_valid = std::min(frontier, sequence.mtp_kv_valid);
+    archive->ledger.assign(sequence.ledger.begin(), sequence.ledger.begin() + frontier);
+    archive->identity = sequence.prefix_identity;
+    archive->checkpoints = std::move(saved_checkpoints);
+    std::sort(archive->checkpoints.begin(), archive->checkpoints.end(),
+              [](const auto& a, const auto& b) { return a.frontier < b.frontier; });
+    constexpr std::uint32_t chunk_pages = 64; // 4096 tokens, bounded tail recopy at a fork.
+    const auto backend_pages = prefix_page_count(archive->mtp_valid);
+    for (std::uint32_t first = 0; first < pages; first += chunk_pages) {
+        const std::uint32_t count = std::min(chunk_pages, pages - first);
+        const auto inherited = std::find_if(sequence.prefix_chunks.begin(), sequence.prefix_chunks.end(),
+            [&](const auto& chunk) {
+                return chunk->first_page == first && chunk->pages == count &&
+                       std::uint64_t(first + count) * kPagedKVPageSize <= sequence.shared_prefix_tokens;
+            });
+        if (inherited != sequence.prefix_chunks.end()) {
+            archive->chunks.push_back(*inherited);
+            continue;
+        }
+        auto chunk = std::make_shared<PrefixKVChunk>();
+        chunk->first_page = first;
+        chunk->pages = count;
+        chunk->backend_pages = first < backend_pages ? std::min(count, backend_pages - first) : 0;
+        const auto capture = [&](const PagedKVAllocation& text,
+                                  const std::optional<PagedKVAllocation>& backend,
+                                  DeviceContext& ctx, int rank) {
+            const ScopedDevice scope(ctx.device);
+            chunk->text[rank].resize(text.snapshot_bytes(count));
+            text.export_pages(first, count, chunk->text[rank], ctx.stream);
+            if (backend && chunk->backend_pages != 0) {
+                chunk->backend[rank].resize(backend->snapshot_bytes(chunk->backend_pages));
+                backend->export_pages(first, chunk->backend_pages, chunk->backend[rank], ctx.stream);
+            }
+        };
+        capture(sequence.kv->text, sequence.kv->backend, device, 0);
+        for (auto& peer : peers) {
+            capture(*sequence.kv->text_peers[peer->rank - 1],
+                    sequence.kv->backend_peers[peer->rank - 1], peer->device, peer->rank);
+        }
+        archive->chunks.push_back(std::move(chunk));
+    }
+    prefix_history.push_back(archive);
+    sequence.archived_snapshot = archive;
+    sequence.prefix_chunks = archive->chunks;
+    // The final partially valid page must never be shared with a newly written suffix.
+    sequence.shared_prefix_tokens = std::min(frontier, archive->mtp_valid == 0 ? frontier : archive->mtp_valid);
+    trim_prefix_history();
+}
+
+void ProgramImplCore::restore_archived_prefix(SequenceState& sequence, const ArchivedPrefix& archive,
+                                               const RequestPlanImpl& plan) {
+    const auto base = plan.reuse_base;
+    sequence.kv.reset();
+    reserve_sequence_kv(sequence, plan.text_kv_page_entitlement, plan.backend_kv_page_entitlement);
+    const auto mtp_base = speculative_backend == SpeculativeBackend::Mtp ? base - 1 : 0;
+    materialize_sequence_kv(sequence, base, mtp_base);
+    const auto pages = prefix_page_count(base);
+    const auto mtp_pages = prefix_page_count(mtp_base);
+    for (const auto& chunk : archive.chunks) {
+        if (chunk->first_page >= pages) { break; }
+        // Chunk images are plane/head-major; a partial range must be sliced per plane
+        // by the allocation transport rather than treating its byte image as a prefix.
+        // Import complete chunks, including the private page tail, then trim logically.
+        const auto restore = [&](PagedKVAllocation& text,
+                                  std::optional<PagedKVAllocation>& backend,
+                                  DeviceContext& ctx, int rank) {
+            const ScopedDevice scope(ctx.device);
+            const auto count = std::min(chunk->pages, pages - chunk->first_page);
+            text.import_page_prefix(chunk->first_page, count, chunk->pages, chunk->text[rank], ctx.stream);
+            if (backend && chunk->first_page < mtp_pages) {
+                const auto bcount = std::min(chunk->backend_pages, mtp_pages - chunk->first_page);
+                backend->import_page_prefix(chunk->first_page, bcount, chunk->backend_pages,
+                                             chunk->backend[rank], ctx.stream);
+            }
+        };
+        restore(sequence.kv->text, sequence.kv->backend, device, 0);
+        for (auto& peer : peers) {
+            restore(*sequence.kv->text_peers[peer->rank - 1],
+                    sequence.kv->backend_peers[peer->rank - 1], peer->device, peer->rank);
+        }
+    }
+    sequence.ledger = archive.ledger;
+    sequence.prefix_identity = archive.identity;
+    // The archive may have been captured with a larger per-lane state budget.
+    // Keep only the chosen frontier resident; other frontiers stay in history.
+    const auto checkpoint = std::find_if(archive.checkpoints.begin(), archive.checkpoints.end(),
+        [base](const auto& entry) { return entry.frontier == base; });
+    if (checkpoint == archive.checkpoints.end()) {
+        throw std::logic_error("archived prefix state image is unavailable");
+    }
+    sequence.prefix_checkpoints = {*checkpoint};
+    sequence.execution_frontier = base;
+    sequence.text_kv_valid = base;
+    sequence.mtp_kv_valid = mtp_base;
+    sequence.rewrite_checkpoint = {};
+    sequence.deferred_prefix_state.reset();
+    sequence.retained = true;
+    sequence.prefix_chunks = archive.chunks;
+    sequence.shared_prefix_tokens = mtp_base == 0 ? base : mtp_base;
+}
+
 void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& request) noexcept {
     request.prefill.reset();
     request.exact_hit.reset();
@@ -1264,6 +1463,10 @@ void ProgramImplCore::clear_lane(SequenceState& sequence, RequestControl& reques
     sequence.retained                = false;
     sequence.rewrite_checkpoint      = {};
     sequence.prefix_checkpoints.clear();
+    sequence.prefix_chunks.clear();
+    sequence.shared_prefix_tokens = 0;
+    sequence.history_enabled = false;
+    sequence.archived_snapshot.reset();
     sequence.deferred_prefix_state.reset();
     request.pending                  = {};
 }

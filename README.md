@@ -2,7 +2,7 @@
 
 [中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
 
-**Compared with the previous version, committed decode throughput on the same 85K-token
+**Compared with the decode implementation before v0.1.0, committed throughput on the same 85K-token
 code task increased from 143.46 to 198.10 tok/s — about 38.1% faster.** Both measurements
 use two V100 16 GB cards, 180K capacity, TP2/MTP4, INT8 KV, CUDA Graphs and greedy sampling.
 The current result enables both experimental long attention and fast decode; output can
@@ -19,6 +19,31 @@ Maintainer's personal experience: “It feels in the same tier as FP8.”
 The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
+
+## v0.1.1: concurrency, historical branches and Responses
+
+Experimental long attention now supports **1–8 active requests** with TP2/MTP4.
+The shared KV capacity still limits how many requests can execute together; excess requests
+queue. The 2K / 16K / 85K input throughput matrix reports both total committed decode and
+actual batch size. **10/12 cases completed**; GPU 0 fell off the PCIe bus (Xid 79) during
+85K/c4, leaving 85K/c4 and c8 unavailable. No additional single-request speedup over
+v0.1.0 is claimed. [Measurements and method](docs/performance.md#experimental-long-context-concurrency-2026-10-20).
+
+![Concurrent decode throughput and actual batch](docs/assets/quasar-concurrency.svg)
+
+Prefix reuse now retains historical branches and multiple conversation trees: `ABD → ABC → ABDE`
+can recover the saved ABD frontier. Exact host KV chunks and complete GDN/MTP state restore
+into private GPU pages. GUI/TUI expose `--prefix-cache-tokens`, default **1,000,000**; oldest
+branches are evicted on budget overflow. For QUASAR INT8 KV with MTP, that budget can use
+about **33.4 GiB host RAM**, plus state and temporary ownership. Archived state has a separate
+2 GiB cap. Zero disables historical retention while keeping current resident reuse.
+Vision, DFlash and sparse RAM-KV do not use historical branches.
+[Cache behavior and limits](docs/maintainer/paged-kv-cache.md#104-historical-branches).
+
+Responses accepts `reasoning: {"effort": "high"}` and maps it to the loaded Qwen template;
+`none` disables thinking. All seven accepted effort values pass stream and nonstream HTTP
+checks. [Protocol mapping](docs/serving.md).
+Releases provide source archives, update logs and an explicit 85K performance comparison.
 
 ## QUASAR measurements — 2026-10-19
 

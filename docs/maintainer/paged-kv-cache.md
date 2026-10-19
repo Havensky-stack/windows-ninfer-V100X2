@@ -53,8 +53,8 @@ page 内部任意 token offset。
 
 当前 Qwen3.6 target 的 Linear Attention state 不能从 KV prefix 单独重建。Prefix lookup 只能使用保留了
 完整 continuation state 的 target-declared checkpoint。当前可复用位置是 current resume frontier 和一份
-有效时的 typed rewrite checkpoint，具体 claim/restore 语义见 §10。落在这两个 checkpoint
-之外的更短 token prefix 是 arbitrary partial hit，本设计不支持。
+有效时的 typed rewrite checkpoint，以及有界 RAM 中保存的完整 prefix checkpoints；具体 claim/restore
+语义见 §10。没有完整 continuation image 的更短 token prefix 不能直接命中。
 
 Paged KV Store 本身可以按任意 logical frontier truncate；这不表示上层拥有在任意位置恢复整个模型的
 能力。Reusable position 必须由 target 的完整 checkpoint 证明；增加新的 checkpoint 不需要改变 page
@@ -799,7 +799,8 @@ image，不必先上传 GDN。重选 GPU rewrite checkpoint、导入另一 RAM i
 首次 decode 前物化，仍使用同一 bridge 公式。切换分支时丢弃
 所选 frontier 之后的 images 的有效标记，避免旧分支状态被新 ledger 误认。Full reset 使旧
 frontiers 全部失效，但复用有界 host buffers，避免每次无关请求重新分配/清零大量 RAM。
-取消、retained eviction 和关闭 prefix reuse 的 cold request 释放 images。
+取消释放当前 lane 的 images。Retained eviction 或覆盖旧分枝前，可将完整状态转入下述历史缓存；
+关闭 prefix reuse 的新请求不捕获新检查点，也不使用历史命中，已有历史仍按预算淘汰。
 只报告 checkpoint frontier 为 cached tokens，其后即便 token 相同也按
 实际重算计费。这是完整状态恢复，不是稀疏注意力；额外 prefill 分块可能改变浮点结合顺序，
 不能据此声称与不同分块的 cold run bit-equivalent。
@@ -828,9 +829,31 @@ allocations，使相应 IDs 不属于各自 free sets；不需要 page refcount 
 pages 返回各自 pool；随后各 pool 的 exact frontier 和 fixed continuation state 一起切换到该 checkpoint。
 该过程不复制 retained KV payload。
 
-多个 active requests 不从同一 retained bundle 分叉。若未来产品需要同一大 prefix 同时 fan-out，必须
-连同 Linear Attention/backend state branching 一起重新设计；仅共享 Main Text pages 不能形成完整
-可继续的 sequence state。
+多个 active requests 不共享同一可写 retained bundle。已完成 sibling 可以先归档完整 KV/GDN，再为
+新 lane 分配私有 GPU pages 并恢复。并发请求之间不共享可写 KV 或 GDN，不引入 GPU page refcount/COW。
+
+### 10.4 Historical branches
+
+Text/None/MTP、完整 GPU KV、prefix reuse 开启时，在覆盖/截断 retained 分枝或驱逐 lane 前，
+Program 将有效 Main/MTP KV 原始字节保存为不可变 host chunks（每块64页/4096 tokens），同时保存
+完整 per-rank GDN 和 tail-hidden 检查点、token ledger 与 prefix identity。首 token 快路径仍直接
+使用当前 lane 的 resident 状态；只有需要换分枝时发生历史 KV 传输。
+
+Planner 在 resident 和历史分枝中选择 identity 完整匹配的最远检查点。恢复历史时先在新 request
+的独占 GPU allocation 中导入原始 KV，各 plane/head 按 image 的完整 stride 读取，再恢复对应
+GDN/tail/MTP bridge。分枝内没有保存完整状态的位置仍要重算；cached tokens 只报告保存的 frontier。
+`ABD → ABC → ABDE` 因而可恢复 ABD 的检查点，并继续 E；多个对话树进入同一历史集合。
+来自同一已恢复 lineage、未被覆盖的完整 host chunk 可以共享；独立重算的相同 token 不据此合并
+KV，以免把不同浮点关联结果混为同一状态。部分尾块重新导出，GPU pages 始终私有。
+
+`--prefix-cache-tokens` 默认1000000，0关闭历史缓存，保留原有当前 GPU reuse。
+预算只计算历史中不重复的 Main Text chunks，按64-token页取整；不乘 TP rank，也不重复计算共享块。
+超限时按分枝最初归档顺序 FIFO 删除最旧分枝。归档 GDN images 另有每 Program 2 GiB上限，
+先移除旧分枝的内部检查点，仍不够则淘汰最旧分枝；当前 lanes 的 images 仍受独立2 GiB预算限制。
+QUASAR INT8-G64 的1M主KV加MTP约33.4 GiB主机RAM，此外还有状态、元数据和传输期间的临时所有权。
+这不是 RSS 硬上限。已选择的 plan 持有恢复资源直到 admission 完成，预算淘汰不会使其悬空。
+Vision、DFlash、稀疏 RAM-KV 不进入此缓存。此传输不改 codec 或重算 GDN，但不同 suffix/prefill
+分块可能改变浮点关联；不能声称与不同 schedule 的 cold full-prefill 输出逐位一致。
 
 ---
 

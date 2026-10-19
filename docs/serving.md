@@ -195,9 +195,9 @@ artifact template's existing tool/reasoning-instruction composition.
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
-not exposed by the loaded template returns HTTP 400 with code
-`reasoning_effort_not_supported` before prompt preparation.
+`medium`, and `xhigh`; omitting effort uses that template's declared default. After any
+protocol-specific mapping described below, an effort not exposed by the loaded template
+returns HTTP 400 with code `reasoning_effort_not_supported` before prompt preparation.
 
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
 select the corresponding template effort when available. The other OpenAI protocol values
@@ -336,7 +336,7 @@ wire response contains typed `output` Items.
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.effort` | `none` disables thinking. On graded Qwen templates, `minimal`/`low` map to `low`, `medium` to `medium`, and `high`/`xhigh`/`max` to `xhigh`. On toggle-only templates, every non-`none` value enables thinking without a graded budget. |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -352,6 +352,10 @@ wire response contains typed `output` Items.
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored.
+
+For example, use `"reasoning":{"effort":"high"}` in a Responses request. This is a local
+mapping to the checkpoint's template controls, not an OpenAI-equivalent reasoning token budget.
+The response echoes the requested effort. `reasoning.summary` remains unsupported.
 
 ### Input Item contract
 
@@ -611,7 +615,8 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, concurrency 1, INT8 KV, Text/None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `1000000` |
+| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, experimental concurrency 1–8, INT8 KV, Text/None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
@@ -752,9 +757,16 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-The prefix cache is process-local retained Engine state. Restarting the server clears it. With one
-active slot, serving an unrelated conversation can replace the retained entry; it is not a persistent
-cache of every conversation. In addition to the current resident frontier and a saved complete
+The prefix cache is process-local Engine state; restarting the server clears it. Text/None/MTP
+with complete GPU KV also retains historical branches and multiple conversation trees in host RAM.
+Before an old resident branch is overwritten or its lane evicted, its original Main/MTP KV and
+complete continuation checkpoints can be archived. `--prefix-cache-tokens` defaults to **1000000**
+unique page-rounded Main Text tokens, shared across all trees; overflow evicts the oldest archived
+branch first. A historical hit restores private writable GPU pages and exact state, including
+completed-sibling fan-out. `ABD → ABC → ABDE` can therefore recover ABD. Setting the budget
+to zero keeps current resident reuse but disables historical retention. This is not disk persistence
+or a process RSS cap: QUASAR INT8 Main KV plus MTP can use about **33.4 GiB RAM** at 1M tokens,
+plus state images and transfer headroom. In addition to the current resident frontier and a saved complete
 turn/response checkpoint, reusable text requests with None/MTP speculation and complete GPU KV
 retain bounded RAM checkpoints of every rank's exact GDN state and the target tail hidden.
 Shorter prompts or edits to a later suffix restore the longest saved frontier within their common
@@ -762,14 +774,16 @@ token/position prefix and recompute only the remaining suffix. Cache usage count
 whose computation was actually skipped. There is no arbitrary substring reuse or guarantee that
 every common-prefix token has a saved recurrent state.
 
-These host images add at most 2 GiB per Program (divided among the configured lanes), without
-additional VRAM. Capture uses one early boundary (half the prompt, capped at 64 tokens), then
+Active-lane state images have a 2 GiB per-Program budget divided among configured lanes;
+archived state has a separate 2 GiB cap, in addition to the historical KV token budget. Capture uses
+one early boundary (half the prompt, capped at 64 tokens), then
 budget-spaced actual prefill chunk ends and the final prompt boundary. The early split rejoins
 the ordinary chunk grid; not every small GPU chunk is copied to RAM. Under the budget, older
 redundant images are evicted, preserving a first and recent checkpoint when two images fit.
 Capture/restore transfer time is included
 in prefill timing. `--no-prefix-reuse` also skips these captures. Vision, DFlash and sparse RAM-KV
-keep the existing frontier/turn/response rules. See [prefix state ownership](maintainer/paged-kv-cache.md#10-prefix-reuse).
+keep the existing frontier/turn/response rules and do not archive historical branches.
+See [prefix state ownership](maintainer/paged-kv-cache.md#10-prefix-reuse).
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
 `restore_turn_checkpoint`, `restore_response_checkpoint`, and `restore_prefix_checkpoint`.

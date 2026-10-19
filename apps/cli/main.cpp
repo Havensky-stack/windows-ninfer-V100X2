@@ -312,6 +312,7 @@ int main(int argc, char** argv) {
         engine_options.prefill_chunk  = cli.prefill_chunk;
         engine_options.kv_cache       = cli.kv_cache;
         engine_options.ram_kv         = cli.ram_kv;
+        engine_options.prefix_cache_tokens = cli.prefix_cache_tokens;
         engine_options.volta_long_attention = cli.volta_long_attention;
         engine_options.volta_fast_decode = cli.volta_fast_decode;
         engine_options.speculative    = cli.speculative;

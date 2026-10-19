@@ -71,6 +71,27 @@ class LaunchContract(unittest.TestCase):
         self.assertFalse(self.settings.vision)
         self.assertIn('--volta-fast-decode', self.settings.command())
 
+    def test_history_budget_round_trip_and_long_attention_concurrency(self):
+        self.assertEqual(self.settings.prefix_cache_tokens, 1000000)
+        self.settings.prefix_cache_tokens = 123456
+        self.settings.long_attention = True
+        for concurrency in (1, 2, 4, 8):
+            self.settings.max_concurrency = concurrency
+            self.settings.validate()
+        path = Path(self.directory.name) / 'history.json'
+        self.settings.save(path)
+        restored = Settings(binary='', artifact='')
+        restored.load(path)
+        self.assertEqual(restored.prefix_cache_tokens, 123456)
+        command = restored.command()
+        self.assertEqual(command[command.index('--prefix-cache-tokens') + 1], '123456')
+        for budget in (0, 1000000):
+            restored.prefix_cache_tokens = budget
+            restored.validate()
+        restored.prefix_cache_tokens = -1
+        with self.assertRaises(ValueError):
+            restored.validate()
+
     def test_plain_decode_omits_speculative_options(self):
         self.settings.backend = 'none'
         command = self.settings.command()

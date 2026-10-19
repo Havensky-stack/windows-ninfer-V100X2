@@ -661,10 +661,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions& options) {
     if (options.volta_long_attention &&
         (TextConfig::query_heads != 24 || device.sm() != 70 || options.tp != 2 || options.pp != 1 ||
-         options.max_concurrency != 1 || options.enable_vision ||
+         options.enable_vision ||
          options.kv_cache != KvCacheStorage::Int8Group64 || options.ram_kv.gpu_tokens != 0 ||
          options.speculative.backend == SpeculativeBackend::DFlash)) {
-        throw std::invalid_argument("Volta long attention requires SM70 27B TP2 single-request Text/None/MTP with complete INT8 KV");
+        throw std::invalid_argument("Volta long attention requires SM70 27B TP2 Text/None/MTP with complete INT8 KV");
     }
     if (options.ram_kv.gpu_tokens != 0) {
         if constexpr (TextConfig::query_heads != 24) {
@@ -805,6 +805,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->pp                  = inputs.pp;
     impl->pipeline_chunks     = inputs.pipeline_chunks;
     impl->ram_kv              = inputs.ram_kv;
+    impl->prefix_cache_tokens = inputs.prefix_cache_tokens;
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -941,6 +942,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .pp             = options.pp,
         .pipeline_chunks = options.pp == 2 ? options.pipeline_chunks : 1U,
         .ram_kv         = options.ram_kv,
+        .prefix_cache_tokens = options.prefix_cache_tokens,
         .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

@@ -190,10 +190,25 @@ class GuiCacheDisplay(unittest.TestCase):
         self.assertEqual(self.gui._command(), before)
         self.assertNotIn(flag, self.gui.command.text())
 
+    def test_history_budget_configuration_and_concurrent_long_attention(self):
+        self.assertEqual(self.gui.prefix_cache_tokens.value(), 1000000)
+        for budget in (0, 123456):
+            self.gui.prefix_cache_tokens.setValue(budget)
+            settings = self.gui.configuration()
+            self.gui.prefix_cache_tokens.setValue(1000000)
+            self.gui.apply_configuration(settings)
+            self.assertEqual(self.gui.prefix_cache_tokens.value(), budget)
+            command = self.gui._command()
+            self.assertEqual(command[command.index('--prefix-cache-tokens') + 1], str(budget))
+        self.gui.volta_long_attention.setChecked(True)
+        for concurrency in (1, 2, 4, 8):
+            self.gui.max_concurrency.setValue(concurrency)
+            self.assertIsNone(self.gui._validate())
+
     def test_experimental_attention_rejects_incompatible_configuration(self):
         initial = self.gui.configuration()
         for name, value in (("tp", "4"), ("tp", "1"), ("kv_dtype", "bf16"),
-                            ("max_concurrency", 2), ("spec", "dflash")):
+                            ("spec", "dflash")):
             with self.subTest(name=name, value=value):
                 self.gui.apply_configuration(initial)
                 self.gui.volta_long_attention.setChecked(True)

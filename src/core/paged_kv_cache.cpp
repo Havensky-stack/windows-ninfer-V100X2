@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <type_traits>
 #include <sys/mman.h>
 
 namespace ninfer {
@@ -677,4 +678,73 @@ void resize_paged_kv_bundle(std::span<const PagedKVResize> changes) {
     }
 }
 
+} // namespace ninfer
+
+namespace ninfer {
+std::size_t PagedKVAllocation::snapshot_bytes(std::uint32_t pages) const {
+    if (!pool_ || pool_->ram_enabled()) { throw std::logic_error("snapshot requires complete GPU KV"); }
+    std::size_t bytes = 0;
+    for (const auto& plane : pool_->planes_) {
+        bytes += plane.bytes() / pool_->page_group_count() * pages;
+    }
+    return bytes;
+}
+
+namespace {
+template <class HostByte>
+void transfer_kv_pages(const PagedKVPool& pool, std::span<const std::int32_t> ids,
+                       std::uint32_t first, std::uint32_t count, std::span<HostByte> image,
+                       bool page_major, std::uint32_t image_pages, cudaStream_t stream) {
+    constexpr bool upload = std::is_const_v<HostByte>;
+    std::size_t offset = 0;
+    for (std::size_t index = 0; index < pool.plane_count(); ++index) {
+        const auto& plane = pool.plane(index);
+        const std::size_t head_bytes = plane.nb[2];
+        const std::size_t page_bytes = plane.bytes() / pool.page_group_count();
+        const std::size_t heads = page_major ? 1 : plane.ne[3];
+        const std::size_t stride = page_major ? page_bytes : head_bytes;
+        for (std::size_t head = 0; head < heads; ++head) {
+            for (std::uint32_t page = 0; page < count;) {
+                std::uint32_t run = 1;
+                while (page + run < count && ids[first + page + run] == ids[first + page] + run) { ++run; }
+                auto* gpu = static_cast<std::byte*>(plane.data) +
+                    (page_major ? 0 : head * plane.nb[3]) + ids[first + page] * stride;
+                auto* host = image.data() + offset + (head * image_pages + page) * stride;
+                if constexpr (upload) {
+                    CUDA_CHECK(cudaMemcpyAsync(gpu, host, run * stride, cudaMemcpyHostToDevice, stream));
+                } else {
+                    CUDA_CHECK(cudaMemcpyAsync(host, gpu, run * stride, cudaMemcpyDeviceToHost, stream));
+                }
+                page += run;
+            }
+        }
+        offset += page_bytes * image_pages;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+}
+void PagedKVAllocation::export_pages(std::uint32_t first, std::uint32_t count,
+                                    std::span<std::byte> image, cudaStream_t stream) const {
+    if (first > page_ids_.size() || count > page_ids_.size() - first ||
+        image.size() != snapshot_bytes(count)) { throw std::invalid_argument("invalid KV snapshot range"); }
+    transfer_kv_pages(*pool_, page_ids_, first, count, image,
+                      pool_->spec_.plane_order == PagedKVPlaneOrder::PageMajor, count, stream);
+}
+void PagedKVAllocation::import_pages(std::uint32_t first, std::uint32_t count,
+                                    std::span<const std::byte> image, cudaStream_t stream) {
+    if (first > page_ids_.size() || count > page_ids_.size() - first ||
+        image.size() != snapshot_bytes(count)) { throw std::invalid_argument("invalid KV restore range"); }
+    transfer_kv_pages(*pool_, page_ids_, first, count, image,
+                      pool_->spec_.plane_order == PagedKVPlaneOrder::PageMajor, count, stream);
+}
+void PagedKVAllocation::import_page_prefix(std::uint32_t first, std::uint32_t count,
+                                           std::uint32_t image_pages,
+                                           std::span<const std::byte> image, cudaStream_t stream) {
+    if (count > image_pages || first > page_ids_.size() || count > page_ids_.size() - first ||
+        image.size() != snapshot_bytes(image_pages)) {
+        throw std::invalid_argument("invalid KV image prefix");
+    }
+    transfer_kv_pages(*pool_, page_ids_, first, count, image,
+                      pool_->spec_.plane_order == PagedKVPlaneOrder::PageMajor, image_pages, stream);
+}
 } // namespace ninfer

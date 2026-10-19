@@ -283,6 +283,12 @@ class NInferGui(QWidget):
         self.cuda_graph.setChecked(True)
         self.prefix_reuse = QCheckBox("启用前缀缓存")
         self.prefix_reuse.setChecked(True)
+        self.prefix_cache_tokens = self._spin(1000000, 0, 100000000, 10000)
+        self.prefix_cache_tokens.setToolTip(
+            "历史分枝的主机 RAM KV 预算，推荐 1,000,000 tokens；0 仅保留当前 GPU 前缀。\n"
+            "按唯一 64-token 页计费，共享树干不重复计数，超额淘汰最旧分枝。\n"
+            "27B INT8 主 KV 加 MTP 约 33.4 GiB / 百万 tokens，另有至多 2 GiB 历史状态。\n"
+            "完整 GPU KV 的纯文本 None/MTP 支持；恢复旧枝需 RAM→GPU 传输。")
         self.vision = QCheckBox("开启视觉（图片 / 视频）")
         self.vision.setToolTip("对应 --vision；默认关闭，需重启 API。关闭时不加载视觉 GPU 权重。\n"
                                "开启时关闭两个纯文本实验开关和前缀复用（可手动启用缓存）；视觉预算与文本容量独立。")
@@ -304,7 +310,7 @@ class NInferGui(QWidget):
             "前序近无损界限仅9/25点通过；当前组合GPQA未跑，智力影响未知。\n"
             "默认关闭，需重启 API。")
         self.volta_long_attention.setToolTip(
-            "对应 --volta-long-attention；SM70 27B / TP2 / INT8 KV / 并发1 / 纯文本 None/MTP。\n"
+            "对应 --volta-long-attention；SM70 27B / TP2 / INT8 KV / 并发1–8 / 纯文本 None/MTP。\n"
             "保留全部历史 KV，改变 softmax/PV 累加顺序；可能改变输出。\n"
             "组合速度约 198.1 tok/s，不代表此开关单项收益；当前组合 GPQA 未测。\n"
             "默认关闭，需重启 API；不能与视觉、DFlash 或 RAM-KV 一起使用。")
@@ -363,7 +369,8 @@ class NInferGui(QWidget):
         for label, widget in (("KV 格式", self.kv_dtype),
                               ("推理后端", self.spec), ("草稿 token 数", self.draft_tokens),
                               ("草稿头", self.lm_head_draft), ("CUDA Graph", self.cuda_graph),
-                              ("前缀缓存", self.prefix_reuse), ("视觉", self.vision),
+                              ("前缀缓存", self.prefix_reuse), ("历史缓存预算 / tokens", self.prefix_cache_tokens),
+                              ("视觉", self.vision),
                               ("视觉 token 预算", self.vision_max_tokens),
                               ("默认最大输出", self.default_max_tokens)):
             inference.addRow(label, widget)
@@ -628,7 +635,7 @@ class NInferGui(QWidget):
         names = ("binary artifact host devices kv_capacity ram_budget temperature top_p top_k min_p "
                  "presence_penalty frequency_penalty seed port max_context prefill_chunk draft_tokens "
                  "vision_max_tokens pipeline_chunks ram_window max_concurrency default_max_tokens "
-                 "tp pp kv_dtype spec lm_head_draft cuda_graph prefix_reuse volta_long_attention "
+                 "tp pp kv_dtype spec lm_head_draft cuda_graph prefix_reuse prefix_cache_tokens volta_long_attention "
                  "volta_fast_decode vision ram_kv no_thinking preserve_thinking greedy cors")
         return {name: getattr(self, name) for name in names.split()}
 
@@ -840,8 +847,8 @@ class NInferGui(QWidget):
             return "实验 PP2 要求 TP1、两卡、并发1、NVFP4/QUASAR 纯文本 None/MTP；关闭两个数值实验"
         if self.volta_long_attention.isChecked() and (
                 self.vision.isChecked() or tp != 2 or self.kv_dtype.currentText() != "int8" or
-                self.max_concurrency.value() != 1 or self.ram_kv.isChecked() or spec not in {"none", "mtp"}):
-            return ("实验性长上下文注意力要求 TP2、INT8 KV、最大并发请求为 1、后端为 none 或 mtp、关闭视觉；"
+                self.ram_kv.isChecked() or spec not in {"none", "mtp"}):
+            return ("实验性长上下文注意力要求 TP2、INT8 KV、并发 1–8、后端为 none 或 mtp、关闭视觉；"
                     "请调整配置或取消勾选该开关。硬件和模型还须为 SM70 27B。")
         if self.volta_fast_decode.isChecked() and (tp != 2 or self.vision.isChecked() or
                                                     spec not in {"none", "mtp"}):
@@ -908,6 +915,7 @@ class NInferGui(QWidget):
             args.append("--lm-head-draft")
         if not self.cuda_graph.isChecked():
             args.append("--no-cuda-graph")
+        args += ["--prefix-cache-tokens", str(self.prefix_cache_tokens.value())]
         if not self.prefix_reuse.isChecked():
             args.append("--no-prefix-reuse")
         if self.volta_long_attention.isChecked():

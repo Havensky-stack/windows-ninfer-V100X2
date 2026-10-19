@@ -756,7 +756,7 @@ Exact hit 经 vocabulary-sharded output head 和 logit gather 完成采样，并
 按对应 TP 宽度的 MTP schedule 在首次 decode 前恢复 draft continuation；输入使用该 lane 的 tail hidden、
 committed ledger anchor、保存的三轴 bridge RoPE 和 proposal extent，不引用全局 prefill token/hidden scratch。
 每个 lane 的 pending bridge 在进入 batched verify 前各自完成，并计入 decode 时间；terminal anchor 不生成
-无用草稿。RAM exact hit 可只上传 tail hidden，完整 GDN image 仍由该 Sequence 独占持有，在首次 decode 或
+无用草稿。RAM exact hit 可只上传 tail hidden，完整 GDN image 仍由该 Sequence 保持不可变所有权，在首次 decode 或
 suffix prefill 前原样恢复各 rank 的状态。单 token terminal 后也保留该完整 image，后续 request 可继续使用；
 这不允许不完整快照复用。GPU rewrite checkpoint 的恢复不变，decode hot path 不增加每轮 hidden 镜像。
 
@@ -768,7 +768,12 @@ reuse frontier 之前且该位置没有快照，则本次保留合法 reuse 并�
 主动 full reset。只有 incoming prefix 不匹配任何完整 checkpoint 时才 full reset。
 
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
-sequence state，也不使用 copy-on-write branching。Request-local RNG、sampling、stop、generation
+sequence state，也不使用 GPU copy-on-write branching。历史/已完成 sibling 可以从不可变 host KV chunks
+和完整 GDN image 恢复到新 lane 的私有 GPU allocation；预算与 FIFO 规则见 Paged KV §10.4。
+Long attention 允许 SM70 TP2 Text/None/MTP 的实验性1–8并发；共享 KV admission 规则不变。
+`RuntimeStats::decode_wall_seconds` 每个 compact round 只累计一次 executor 墙钟，包括 commit/publication，
+排除 prefill，用于总 committed decode 吞吐，不能把各行耗时相加作为 batch 墙钟。
+Request-local RNG、sampling、stop、generation
 limit 和 output state 始终由新 request 创建。
 
 Retained state 占用实际 state-pool memory，但不占 active control slot，也不保留 future growth

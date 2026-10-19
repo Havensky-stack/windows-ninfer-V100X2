@@ -187,6 +187,8 @@ set_tests_properties(ninfer_qwen3_8_27b_v100x2_real_test
 add_executable(ninfer_long_attention_real_test targets/qwen3_6_27b/test_long_attention_real.cpp)
 target_link_libraries(ninfer_long_attention_real_test PRIVATE ninfer_engine)
 target_include_directories(ninfer_long_attention_real_test PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
+add_executable(ninfer_prefix_history_real_test targets/qwen3_6_27b/test_prefix_history_real.cpp)
+target_link_libraries(ninfer_prefix_history_real_test PRIVATE ninfer_engine)
 # TP2 INT8 KV + MTP3/DFlash7 cache continuation and response-checkpoint replay.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100x2_prefix_real.cpp

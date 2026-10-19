@@ -4,6 +4,82 @@ Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16
 
 [llama.cpp / LM Studio controls](llama-comparison.md) · [Other V100 profiles](performance-v100.md) · [TP4/NVLink](tp4.md) · [RAM-KV/PP2](experiments.md) · [Inherited upstream campaigns](performance-upstream.md)
 
+## Experimental long-context concurrency (2026-10-20)
+
+Long attention admits startup-fixed **1–8 active requests** on SM70 27B TP2
+Text/None/MTP. This matrix uses QUASAR NVFP4 v3, MTP4 with optimized proposals,
+CUDA Graphs, complete INT8 group-64 KV, 180000 shared KV capacity, chunk 1024,
+and both `volta_long_attention` and `volta_fast_decode`. Requests use greedy sampling,
+zero presence/frequency penalties and disabled model stop tokens. Each request receives
+exactly 2048, 16384 or 85000 tokens from the same saved code corpus and produces
+512 output tokens. Prefix reuse and historical retention are disabled for this cold matrix;
+there is no sharing of prompt computation between the requests.
+
+Each case is one submitted group, after loading and a short graph-path warmup outside timing.
+**Decode throughput** is the sum of committed output tokens excluding each first output,
+divided by summed executor decode-round wall time. Each compact round is counted once,
+including commit/publication; prefill and time between rounds are excluded. It is not the
+sum of per-request rates. **Whole-group throughput** is all output tokens divided by time
+from group submission until all results complete, including prefill and queue time.
+Mean batch is the number of request rows divided by the number of decode rounds.
+These are single measurements, without confidence intervals or a steady-state load claim.
+
+![Decode throughput, whole-group throughput and actual batch](assets/quasar-concurrency.svg)
+
+| Input tokens | Submitted requests | Total decode tok/s | Mean batch | Whole-group seconds | Including prefill tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 2048 | 1 | 177.45 | 1.00 | 4.12 | 124.15 |
+| 2048 | 2 | 171.44 | 1.95 | 8.41 | 121.79 |
+| 2048 | 4 | 231.97 | 3.83 | 13.70 | 149.50 |
+| 2048 | 8 | 159.62 | 7.29 | 35.35 | 115.86 |
+| 16384 | 1 | 175.72 | 1.00 | 13.22 | 38.72 |
+| 16384 | 2 | 198.02 | 1.79 | 25.71 | 39.82 |
+| 16384 | 4 | 252.86 | 2.97 | 49.31 | 41.53 |
+| 16384 | 8 | 209.31 | 4.35 | 102.01 | 40.15 |
+| 85000 | 1 | 198.32 | 1.00 | 71.33 | 7.18 |
+| 85000 | 2 | 193.26 | 1.21 | 142.77 | 7.17 |
+| 85000 | 4 | — | — | — | — |
+| 85000 | 8 | — | — | — | — |
+
+**10/12 cases completed.** During 85K/c4, GPU 0 at `0000:03:00.0` encountered
+unrecoverable PCIe AER and Xid 79 (fallen off the bus), followed by Xid 154
+(GPU reset required). That group produced no valid measurement; c8 was not started.
+The cause remains unconfirmed. Interrupted work contributes no result. Device recovery is
+required before resuming the missing cases; the table does not establish 85K/c4 or c8 performance.
+
+Configured concurrency is an upper bound. Each active request reserves its own full prompt
+and output entitlement in the shared KV pool: two 85K requests fit at 180K capacity,
+while four or eight execute in queued waves. Even when all requests fit, prefill/decode
+interleaving and requests finishing at different times can reduce the mean decode batch.
+Increasing concurrency can therefore reduce throughput; it is not a recommended default.
+
+This release extends scheduling and cache ownership, without adding a new single-request
+numerical speed profile. The v0.1.0 published 85K reference remains **198.105 / 198.097
+committed wall tok/s**, using chunk 2560 and 513 total output tokens. This cold concurrency
+matrix uses chunk 1024, 512 total outputs and executor-round timing, so subtracting it from
+that reference would not isolate a version improvement. Both experimental switches can
+change logits, output IDs or MTP acceptance; this is speed evidence, with **no new GPQA**.
+
+Reproduce with the Python 3.11 maintainer environment and explicit local paths:
+
+```bash
+cmake --build build-v100-tp4 --target ninfer_v100_concurrency_bench -j8
+.venv/bin/python3 tools/v100/bench_concurrency.py \
+  --binary build-v100-tp4/bench/ninfer_v100_concurrency_bench \
+  --artifact models/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --corpus profiles/bench/v100-code-85000-iommu-pt.ids \
+  --output profiles/bench/quasar-concurrency-20261020
+.venv/bin/python3 tools/v100/plot_concurrency.py \
+  --input profiles/bench/quasar-concurrency-20261020 --output docs/assets
+```
+
+The runner saves each completed case and detailed GPU/host health logs, and resumes only
+missing cases. [Compact measurements and draft counters](assets/quasar-concurrency.json)
+accompany the chart; full local reports retain request-level counts and scheduler samples.
+To render the saved incomplete matrix, add
+`--incomplete-reason 'GPU 0 Xid 79; device recovery required'` to the plot command.
+Without that option, missing cases are an error.
+
 ## QUASAR v3: saved-configuration MTP4 speed matrix (2026-10-19)
 
 The speed-only rerun is complete: **80/80 measured requests**, 40 per saved configuration,

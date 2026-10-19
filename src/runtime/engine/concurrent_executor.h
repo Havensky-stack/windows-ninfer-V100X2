@@ -1055,6 +1055,7 @@ private:
     }
 
     void run_decode_round(const RoundMembership& membership) {
+        const auto round_started = Clock::now();
         const std::span<const std::uint32_t> lanes = membership.lane_span();
         std::array<std::array<std::uint64_t, 2>, kMaximumConcurrency> previous_speculative{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1186,6 +1187,8 @@ private:
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
         }
+        cumulative_stats_.decode_wall_seconds +=
+            std::chrono::duration<double>(Clock::now() - round_started).count();
         publish_runtime_stats();
     }
 

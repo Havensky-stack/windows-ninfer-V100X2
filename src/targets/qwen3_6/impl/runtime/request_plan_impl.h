@@ -234,6 +234,35 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         }
     }
 
+    if (base.capture_prefix_checkpoints && prefix_cache_tokens != 0) {
+        // A completed sibling lane can seed a private continuation without sharing
+        // writable GPU pages. Archive only a sibling that improves this plan.
+        for (auto& sibling : sequences) {
+            if (&sibling == &sequence || !sibling.retained || !sibling.history_enabled) { continue; }
+            const auto matches = [&](std::uint32_t frontier) {
+                return frontier > plan->reuse_base &&
+                       qwen3_6::detail::prefix_matches(prompt, sibling.ledger,
+                                                      sibling.prefix_identity, frontier);
+            };
+            if (matches(sibling.execution_frontier) ||
+                std::any_of(sibling.prefix_checkpoints.begin(), sibling.prefix_checkpoints.end(),
+                    [&](const auto& checkpoint) { return matches(checkpoint.frontier); })) {
+                archive_prefix(sibling);
+            }
+        }
+        for (const auto& archive : prefix_history) {
+            for (const auto& checkpoint : archive->checkpoints) {
+                if (checkpoint.frontier > plan->reuse_base &&
+                    qwen3_6::detail::prefix_matches(prompt, archive->ledger, archive->identity,
+                                                   checkpoint.frontier)) {
+                    plan->archived_prefix = std::make_shared<ArchivedPrefix>(*archive);
+                    plan->reuse = ReusePath::RestorePrefixCheckpoint;
+                    plan->reuse_base = checkpoint.frontier;
+                }
+            }
+        }
+    }
+
     if (speculative_backend == SpeculativeBackend::Mtp) {
         const bool append_ready =
             plan->reuse == ReusePath::AppendAtFrontier && sequence.tail_hidden_valid &&
@@ -242,10 +271,12 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
         const bool checkpoint_ready = (is_rewrite_checkpoint_restore(plan->reuse) ||
                                        plan->reuse == ReusePath::RestorePrefixCheckpoint) &&
                                       decoder->mtp_cache() != nullptr && plan->reuse_base != 0 &&
-                                      sequence.mtp_kv_valid >= plan->reuse_base - 1;
+                                      (plan->archived_prefix ? plan->archived_prefix->mtp_valid : sequence.mtp_kv_valid) >=
+                                          plan->reuse_base - 1;
         if (plan->reuse != ReusePath::FullReset && !append_ready && !checkpoint_ready) {
             plan->reuse      = ReusePath::FullReset;
             plan->reuse_base = 0;
+            plan->archived_prefix.reset();
         }
     }
 
@@ -260,7 +291,7 @@ RequestPlan ProgramImplCore::plan_request_for_lane(std::uint32_t lane,
 
     const std::optional<RewriteCheckpointSpec>& desired = base.rewrite_checkpoint;
     const bool existing_checkpoint_matches =
-        desired && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
+        desired && !plan->archived_prefix && plan->reuse != ReusePath::FullReset && sequence.rewrite_checkpoint.valid &&
         sequence.rewrite_checkpoint.frontier == desired->frontier &&
         qwen3_6::detail::prefix_matches(prompt, sequence.ledger, sequence.prefix_identity,
                                         desired->frontier);

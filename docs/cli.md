@@ -185,7 +185,8 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--pipeline-chunks N` | PP prefill wave of `1..8` chunks; `1` is the serial control | `8` |
 | `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/PP1, one active request, INT8 KV, Text/None/MTP only; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `1000000` |
+| `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/PP1, 1–8 active requests, INT8 KV, Text/None/MTP only; excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |

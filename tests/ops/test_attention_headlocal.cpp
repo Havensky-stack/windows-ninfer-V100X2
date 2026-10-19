@@ -693,6 +693,7 @@ struct BatchHeadLocalCase {
     MappingPattern mapping;
     std::uint32_t seed;
     bool persistent_v_head_bias = false;
+    bool long_attention = false;
 };
 
 struct BatchRunResult {
@@ -815,7 +816,7 @@ int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
     }
 
     const ops::GqaExecutionEnvelope envelope{static_cast<std::uint32_t>(maximum_visible),
-                                             static_cast<std::uint32_t>(maximum_visible)};
+                                             static_cast<std::uint32_t>(maximum_visible), test_case.long_attention};
     const ReductionCriterion criterion = attention_criterion(dtype);
     const std::string label = std::string("gqa_attention batch ") + cache_name(dtype) +
                               " mapping=" + mapping_name(test_case.mapping) +
@@ -827,6 +828,26 @@ int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
                                                k, v, positions, envelope, label + " tp1");
     failures += reference.failures;
     const std::vector<double> reference_value = bf16_bits_to_double(reference.output);
+    std::vector<double> oracle(reference_value.size(), 0.0);
+    for (int row = 0; row < batch; ++row) {
+        const int valid = test_case.valid_columns[row];
+        if (valid == 0) { continue; }
+        auto expected_cache = global_rows[row];
+        const auto first_column = row * test_case.width;
+        const auto q_stride = kHeadDim * kGlobalGeometry.q_heads;
+        const auto kv_stride = kHeadDim * kGlobalGeometry.kv_heads;
+        const auto take = [](const auto& values, int offset, int count) {
+            return std::vector<float>(values.begin() + offset, values.begin() + offset + count);
+        };
+        const std::vector<std::int32_t> row_positions(positions.begin() + first_column,
+                                                    positions.begin() + first_column + valid);
+        append_cache(expected_cache, take(k, first_column * kv_stride, valid * kv_stride),
+                     take(v, first_column * kv_stride, valid * kv_stride), row_positions);
+        const auto values = ideal_attention(take(q, first_column * q_stride, valid * q_stride),
+                                             expected_cache, row_positions);
+        std::copy(values.begin(), values.end(), oracle.begin() + first_column * q_stride);
+    }
+    failures += verify_attention(label + " batched vs FP64 oracle", reference_value, oracle, criterion);
 
     for (int rank = 0; rank < kRanks; ++rank) {
         std::vector<HostCache> local_rows;
@@ -849,7 +870,7 @@ int run_batch_case(DType dtype, const BatchHeadLocalCase& test_case) {
             run_batch(rank, kLocalGeometry, dtype, local_rows, test_case, local_q, local_k, local_v,
                       positions, envelope, label + " tp2 rank=" + std::to_string(rank));
         failures += observed.failures;
-        failures += compare_device(label, rank, observed.output, reference_value, nullptr,
+        failures += compare_device(label, rank, observed.output, reference_value, &oracle,
                                    criterion, test_case.width, batch);
     }
     return failures;
@@ -1054,6 +1075,13 @@ int main(int argc, char** argv) {
         {"gqa_attention", 1, 0, 180000, MappingPattern::Fragmented, 1735u, false}, false, false);
     failures += run_case(DType::I8,
         {"gqa_attention_cached", 1, 64, 180000, MappingPattern::Offset, 1736u, false}, false, false);
+    if (!default_single_only) {
+        failures += run_batch_case(DType::I8,
+            {5, {2048, 16384, 85000, 32767}, {5, 3, 5, 0}, {3, 1, 0, 2},
+             MappingPattern::Fragmented, 1834u, true, true});
+        failures += run_batch_case(DType::I8,
+            {1, {85000, 2048}, {1, 1}, {1, 0}, MappingPattern::Offset, 1835u, true, true});
+    }
     if (long_context_only || default_single_only) {
         std::cout << (failures == 0 ? "PASS" : "FAIL")
                   << " head-local INT8 85K decode (independent FP64 oracle)\n";

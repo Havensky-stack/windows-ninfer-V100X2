@@ -550,6 +550,7 @@ void parse_reasoning(const Json& body, ResponsesRequest& out) {
     }
     out.generation.reasoning_effort       = *effort;
     out.generation.reasoning_effort_param = "reasoning.effort";
+    out.generation.map_responses_reasoning_effort = true;
 }
 
 void validate_metadata(const Json& body, ResponsesRequest& out) {

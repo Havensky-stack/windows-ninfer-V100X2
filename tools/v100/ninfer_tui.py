@@ -95,6 +95,7 @@ class Settings:
     vision_max_tokens: int = 1024
     graphs: bool = True
     prefix_reuse: bool = True
+    prefix_cache_tokens: int = 1000000
     thinking: bool = True
     preserve_thinking: bool = False
     greedy: bool = False
@@ -138,7 +139,8 @@ class Settings:
                 '--host', self.host, '--port', str(self.port), '--tp', str(self.tp),
                 '--devices', self.devices, '--max-context', str(self.context),
                 '--kv-dtype', self.kv_dtype, '--prefill-chunk', str(self.chunk),
-                '--max-concurrency', str(self.max_concurrency), '--default-max-tokens', str(self.max_output),
+                '--max-concurrency', str(self.max_concurrency),
+                '--prefix-cache-tokens', str(self.prefix_cache_tokens), '--default-max-tokens', str(self.max_output),
                 '--request-log-jsonl', str(local_path(self.log)),
                 '--log-stats-interval-ms', '1000']
         if self.pp != 1:
@@ -229,9 +231,11 @@ class Settings:
             raise ValueError('MTP draft window must be 1..5; accepting zero is valid')
         if self.backend == 'dflash' and (self.tp == 4 or not 1 <= self.drafts <= 7):
             raise ValueError('27B DFlash requires TP1/TP2 and a draft window of 1..7')
+        if not 0 <= self.prefix_cache_tokens <= 100000000:
+            raise ValueError('Historical prefix cache budget must be 0..100000000 tokens (host RAM)')
         if self.long_attention and (self.tp != 2 or self.backend == 'dflash' or self.vision or
-                                    self.kv_dtype != 'int8' or self.max_concurrency != 1 or self.ram_kv):
-            raise ValueError('Experimental long attention requires TP2 INT8 KV concurrency 1 Text None/MTP, no RAM-KV')
+                                    self.kv_dtype != 'int8' or self.ram_kv):
+            raise ValueError('Experimental long attention requires TP2 INT8 KV concurrency 1..8 Text None/MTP, no RAM-KV')
         if self.fast_decode and (self.tp != 2 or self.backend == 'dflash' or self.vision):
             raise ValueError('Experimental fast decode requires QUASAR SM70 TP2 Text None/MTP')
         if self.vision and (self.tp != 2 or self.backend == 'dflash'):
@@ -415,6 +419,7 @@ FIELDS = [
     ('ram_kv', 'Experimental RAM-KV', (False, True)),
     ('ram_window', 'RAM-KV GPU tokens', None), ('ram_budget', 'RAM archive bytes', None),
     ('graphs', 'CUDA Graphs', (False, True)), ('prefix_reuse', 'Prefix cache', (False, True)),
+    ('prefix_cache_tokens', 'History RAM tokens (1M ~34 GiB + state; 0 off)', None),
     ('thinking', 'Default thinking', (False, True)), ('greedy', 'Force greedy', (False, True)),
     ('preserve_thinking', 'Preserve thinking', (False, True)),
     ('max_concurrency', 'Max active requests', None),

@@ -124,6 +124,8 @@ struct EngineOptions {
     double yarn_factor                 = 4.0;
     std::uint32_t yarn_origin          = 262144;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Host historical branch KV budget; page-rounded unique tokens. Zero disables history.
+    std::uint32_t prefix_cache_tokens  = 1000000;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -540,6 +542,8 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds         = 0;
     std::uint64_t decode_row_rounds     = 0;
+    // Sum of executor decode-round wall time, including commit/publication, excluding prefill.
+    double decode_wall_seconds = 0.0;
     // Draft proposals and target-accepted drafts; bonus tokens are not accepted drafts.
     std::uint64_t speculative_drafted_tokens  = 0;
     std::uint64_t speculative_accepted_tokens = 0;

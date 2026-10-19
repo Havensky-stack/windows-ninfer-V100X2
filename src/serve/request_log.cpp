@@ -489,6 +489,7 @@ std::string format_server_start_json(
           {"ram_kv_gpu_tokens", memory.ram_kv_gpu_tokens},
           {"ram_kv_archive_bytes", memory.ram_kv_archive_bytes},
           {"ram_kv_budget_bytes", options.ram_kv.budget_bytes},
+          {"prefix_cache_tokens", options.prefix_cache_tokens},
           {"volta_long_attention", options.volta_long_attention},
           {"volta_fast_decode", options.volta_fast_decode},
           {"kv_capacity_page_groups", memory.kv_capacity_page_groups},

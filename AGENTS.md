@@ -121,8 +121,13 @@ This artifact's QAT/conversion quality is not established by inference smoke tes
 Text/None/MTP with complete GPU KV additionally retains exact per-rank GDN and tail-hidden
 checkpoints in at most 2 GiB host RAM per Program, divided among configured lanes. Shorter or
 edited shared prefixes restore the longest matching saved frontier and recompute its remaining
-suffix; reported cached tokens exclude that recomputation. This does not admit arbitrary
-substring reuse, KV sharing/fan-out, or partial-state reuse for Vision/DFlash/RAM-KV.
+suffix; reported cached tokens exclude that recomputation. Historical branches additionally retain
+immutable exact host KV chunks and complete checkpoints under a default 1000000-token unique
+page-rounded Main Text budget, with FIFO branch eviction and an independent 2 GiB archived state
+cap. Active lane state images retain their separate 2 GiB cap. Restored lineage can share immutable
+host chunks; every active request receives private writable GPU pages and GDN state. This admits
+historical branch and completed-sibling restoration, not arbitrary substring reuse or partial-state
+reuse for Vision/DFlash/RAM-KV. The token budget is not a process RSS limit.
 The explicitly requested remote extension targets four NVLink-connected V100-SXM2 16 GB cards,
 single-request TP4 Text/MTP on Qwen3.8-27B NVFP4 and native block-128 FP8. Native FP8 preserves
 source E4M3 codes and BF16 block multipliers without requantization and requires TP4 on SM70.
@@ -144,7 +149,7 @@ including TP2; the official NVFP4 v3 package preserves W8 projections and BF16 a
 The 27B draft window is at most seven. On this V100X2, the verified DFlash profile is 98304-token
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
-The optional `volta_long_attention` profile admits SM70 27B TP2/PP1 single-request
+The optional `volta_long_attention` profile admits SM70 27B TP2/PP1 experimental 1–8-request
 Text/None/MTP with complete INT8 group-64 KV, without Vision or RAM-KV. It retains every
 causally visible key but changes split partitioning, softmax association and PV accumulation;
 it is default-off and not bit-equivalent to ordinary attention. The 104-question local GPQA
