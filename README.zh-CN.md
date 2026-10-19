@@ -2,6 +2,11 @@
 
 [English](README.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [详细测评](docs/performance.md) · [HTTP API](docs/serving.md)
 
+**相比上代，同一 85K-token 代码任务的已提交 decode 吞吐从 143.46 提升至 198.10 tok/s，约提升 38.1%。**
+两次测评均使用双 V100 16 GB、180K 容量、TP2/MTP4、INT8 KV、CUDA Graphs 和 greedy 采样。
+本代成绩同时开启实验长注意力与快速数值路径，输出可能变化，当前组合未跑 GPQA。
+[本代成绩](docs/performance.md#quasar-v3-mtp4-retained-decode-profile-2026-10-19) · [上代成绩](docs/performance.md#quasar-v3-final-long-context-decode-evaluation)。
+
 面向 **双卡 Tesla V100-SXM2 16 GB** 的 Qwen3.8-27B 单请求推理，CUDA 12.8 / SM70。
 本机使用 SXM2 转 PCIe，已启用 PCIe P2P，**没有 NVLink**。
 主推 **QUASAR NVFP4 v3**，采用 TP2、INT8 group-64 KV 和 CUDA Graphs。

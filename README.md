@@ -2,6 +2,13 @@
 
 [中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
 
+**Compared with the previous version, committed decode throughput on the same 85K-token
+code task increased from 143.46 to 198.10 tok/s — about 38.1% faster.** Both measurements
+use two V100 16 GB cards, 180K capacity, TP2/MTP4, INT8 KV, CUDA Graphs and greedy sampling.
+The current result enables both experimental long attention and fast decode; output can
+change, and the current combination has no GPQA result.
+[Current result](docs/performance.md#quasar-v3-mtp4-retained-decode-profile-2026-10-19) · [Previous version](docs/performance.md#quasar-v3-final-long-context-decode-evaluation).
+
 Fast single-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**, CUDA 12.8 / SM70.
 The local cards use PCIe P2P through SXM2-to-PCIe adapters, **without NVLink**.
 **QUASAR NVFP4 v3 is the recommended model**, with TP2, INT8 group-64 KV and CUDA Graphs.
