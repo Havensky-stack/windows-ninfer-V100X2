@@ -72,7 +72,7 @@ class LaunchContract(unittest.TestCase):
         self.assertIn('--volta-fast-decode', self.settings.command())
 
     def test_history_budget_round_trip_and_long_attention_concurrency(self):
-        self.assertEqual(self.settings.prefix_cache_tokens, 1000000)
+        self.assertEqual(self.settings.prefix_cache_tokens, 384000)
         self.settings.prefix_cache_tokens = 123456
         self.settings.long_attention = True
         for concurrency in (1, 2, 4, 8):

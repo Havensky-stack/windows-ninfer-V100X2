@@ -615,7 +615,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `1000000` |
+| `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
 | `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, experimental concurrency 1–8, INT8 KV, Text/None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
@@ -760,12 +760,13 @@ reports the reused token count as `cache=`.
 The prefix cache is process-local Engine state; restarting the server clears it. Text/None/MTP
 with complete GPU KV also retains historical branches and multiple conversation trees in host RAM.
 Before an old resident branch is overwritten or its lane evicted, its original Main/MTP KV and
-complete continuation checkpoints can be archived. `--prefix-cache-tokens` defaults to **1000000**
+complete continuation checkpoints can be archived. `--prefix-cache-tokens` defaults to **384000**
 unique page-rounded Main Text tokens, shared across all trees; overflow evicts the oldest archived
 branch first. A historical hit restores private writable GPU pages and exact state, including
 completed-sibling fan-out. `ABD → ABC → ABDE` can therefore recover ABD. Setting the budget
 to zero keeps current resident reuse but disables historical retention. This is not disk persistence
-or a process RSS cap: QUASAR INT8 Main KV plus MTP can use about **33.4 GiB RAM** at 1M tokens,
+or a process RSS cap: QUASAR INT8 Main KV plus MTP can use about **12.8 GiB RAM** at the 384K default
+(about **33.4 GiB RAM** at 1M tokens),
 plus state images and transfer headroom. In addition to the current resident frontier and a saved complete
 turn/response checkpoint, reusable text requests with None/MTP speculation and complete GPU KV
 retain bounded RAM checkpoints of every rank's exact GDN state and the target tail hidden.

@@ -33,9 +33,10 @@ v0.1.0 is claimed. [Measurements and method](docs/performance.md#experimental-lo
 
 Prefix reuse now retains historical branches and multiple conversation trees: `ABD → ABC → ABDE`
 can recover the saved ABD frontier. Exact host KV chunks and complete GDN/MTP state restore
-into private GPU pages. GUI/TUI expose `--prefix-cache-tokens`, default **1,000,000**; oldest
+into private GPU pages. GUI/TUI expose `--prefix-cache-tokens`, default **384,000**; oldest
 branches are evicted on budget overflow. For QUASAR INT8 KV with MTP, that budget can use
-about **33.4 GiB host RAM**, plus state and temporary ownership. Archived state has a separate
+about **12.8 GiB host RAM**, plus state and temporary ownership. The 33.4 GiB figure applies to
+1M tokens. Archived state has a separate
 2 GiB cap. Zero disables historical retention while keeping current resident reuse.
 Vision, DFlash and sparse RAM-KV do not use historical branches.
 [Cache behavior and limits](docs/maintainer/paged-kv-cache.md#104-historical-branches).

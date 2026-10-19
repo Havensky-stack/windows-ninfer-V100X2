@@ -136,7 +136,7 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--prefix-cache-tokens N: historical host KV budget, default 1000000; 0 disables history.\n"
+           "--prefix-cache-tokens N: historical host KV budget, default 384000; 0 disables history.\n"
            "--volta-long-attention selects experimental complete-history SM70 TP2 INT8 attention (1..8 requests); floating-point output may differ.\n"
            "--volta-fast-decode selects experimental QUASAR TP2 Text NVFP4 FP32 epilogues and packed MTP W8; output may differ.\n"
            "--ram-kv-window enables experimental approximate Q/K mean-vector RAM-KV retrieval (SM70, 27B Text/MTP, TP1/TP2/PP2).\n"

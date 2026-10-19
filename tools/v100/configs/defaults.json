@@ -39,7 +39,7 @@
       "preserve_thinking": false,
       "greedy": false,
       "cors": true,
-      "prefix_cache_tokens": 1000000
+      "prefix_cache_tokens": 384000
     },
     "无视觉-mtp4-满上下文-长上下文速度优化": {
       "binary": "build-v100-tp4/apps/ninfer-serve",
@@ -79,7 +79,7 @@
       "preserve_thinking": false,
       "greedy": false,
       "cors": true,
-      "prefix_cache_tokens": 1000000
+      "prefix_cache_tokens": 384000
     }
   }
 }

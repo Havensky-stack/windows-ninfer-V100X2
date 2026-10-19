@@ -54,7 +54,7 @@ struct ServeOptions {
     std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     RamKvOptions ram_kv;
-    std::uint32_t prefix_cache_tokens = 1000000;
+    std::uint32_t prefix_cache_tokens = 384000;
     bool volta_long_attention = false;
     bool volta_fast_decode = false;
     SpeculativeOptions speculative;

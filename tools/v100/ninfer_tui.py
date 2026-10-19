@@ -95,7 +95,7 @@ class Settings:
     vision_max_tokens: int = 1024
     graphs: bool = True
     prefix_reuse: bool = True
-    prefix_cache_tokens: int = 1000000
+    prefix_cache_tokens: int = 384000
     thinking: bool = True
     preserve_thinking: bool = False
     greedy: bool = False
@@ -419,7 +419,7 @@ FIELDS = [
     ('ram_kv', 'Experimental RAM-KV', (False, True)),
     ('ram_window', 'RAM-KV GPU tokens', None), ('ram_budget', 'RAM archive bytes', None),
     ('graphs', 'CUDA Graphs', (False, True)), ('prefix_reuse', 'Prefix cache', (False, True)),
-    ('prefix_cache_tokens', 'History RAM tokens (1M ~34 GiB + state; 0 off)', None),
+    ('prefix_cache_tokens', 'History RAM tokens (384K ~12.8 GiB + state; 0 off)', None),
     ('thinking', 'Default thinking', (False, True)), ('greedy', 'Force greedy', (False, True)),
     ('preserve_thinking', 'Preserve thinking', (False, True)),
     ('max_concurrency', 'Max active requests', None),

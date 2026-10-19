@@ -125,7 +125,7 @@ struct EngineOptions {
     std::uint32_t yarn_origin          = 262144;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     // Host historical branch KV budget; page-rounded unique tokens. Zero disables history.
-    std::uint32_t prefix_cache_tokens  = 1000000;
+    std::uint32_t prefix_cache_tokens  = 384000;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;

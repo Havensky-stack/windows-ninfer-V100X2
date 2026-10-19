@@ -150,7 +150,7 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
-           "       --prefix-cache-tokens N: historical host KV budget, default 1000000; 0 disables history.\n"
+           "       --prefix-cache-tokens N: historical host KV budget, default 384000; 0 disables history.\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default).\n"
            "       Prefix reuse supports parallel Text/MTP, including exact prompt hits.\n"
            "       Text/None/MTP also restores RAM state checkpoints within a shared prefix\n"

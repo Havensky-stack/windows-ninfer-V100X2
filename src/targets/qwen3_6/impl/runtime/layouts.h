@@ -90,7 +90,7 @@ struct SequencePlanningInputs {
     int pp = 1;
     std::uint32_t pipeline_chunks = 1;
     RamKvOptions ram_kv;
-    std::uint32_t prefix_cache_tokens = 1000000;
+    std::uint32_t prefix_cache_tokens = 384000;
     bool volta_long_attention = false;
 };
 
@@ -124,7 +124,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     int pp              = 1;
     std::uint32_t pipeline_chunks = 1;
     RamKvOptions ram_kv;
-    std::uint32_t prefix_cache_tokens = 1000000;
+    std::uint32_t prefix_cache_tokens = 384000;
     bool volta_long_attention = false;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;

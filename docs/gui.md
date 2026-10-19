@@ -218,11 +218,12 @@ Responses 使用 `usage.input_tokens_details.cached_tokens`，Anthropic Messages
 完整 frontier / turn / response 检查点规则。
 
 历史分枝缓存的预算在“推理 → 历史缓存预算 / tokens”设置，随命名配置保存/加载。
-推荐默认 **1,000,000 tokens**；0 关闭历史分枝，仅保留当前 GPU 前缀。
+推荐默认 **384,000 tokens**；0 关闭历史分枝，仅保留当前 GPU 前缀。
 旧分枝在覆盖前把原始 KV、各 rank 的 GDN 和 tail hidden 保存到 RAM，
 因此 `ABD → ABC → ABDE` 可以回到 ABD 的完整检查点，不局限于上一个请求。
 多个对话树共用预算，按最早保存的分枝先淘汰；同一已恢复血统的完整不可变块只计一次。
-预算按 Main Text 的64-token页取整，不是进程内存上限：QUASAR TP2 INT8 KV 的1M预算，
-主 KV 加 MTP 最多约 **33.4 GiB RAM**，还需完整状态检查点及恢复时的临时余量。
+预算按 Main Text 的64-token页取整，不是进程内存上限：QUASAR TP2 INT8 KV 的384K预算，
+主 KV 加 MTP 最多约 **12.8 GiB RAM**；按1M tokens折算约33.4 GiB，还需完整状态检查点
+及恢复时的临时余量。
 恢复到有完整状态的最近前缀，其后需要重算的 token 不算命中。Vision、DFlash 和稀疏 RAM-KV
 不使用此历史分枝缓存。[所有权与预算](maintainer/paged-kv-cache.md#104-historical-branches)。

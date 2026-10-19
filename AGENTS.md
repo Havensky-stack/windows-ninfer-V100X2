@@ -122,7 +122,7 @@ Text/None/MTP with complete GPU KV additionally retains exact per-rank GDN and t
 checkpoints in at most 2 GiB host RAM per Program, divided among configured lanes. Shorter or
 edited shared prefixes restore the longest matching saved frontier and recompute its remaining
 suffix; reported cached tokens exclude that recomputation. Historical branches additionally retain
-immutable exact host KV chunks and complete checkpoints under a default 1000000-token unique
+immutable exact host KV chunks and complete checkpoints under a default 384000-token unique
 page-rounded Main Text budget, with FIFO branch eviction and an independent 2 GiB archived state
 cap. Active lane state images retain their separate 2 GiB cap. Restored lineage can share immutable
 host chunks; every active request receives private writable GPU pages and GDN state. This admits

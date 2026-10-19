@@ -28,8 +28,9 @@ KV 容量限制，超出后排队。2K / 16K / 85K 输入矩阵同时报告总�
 
 前缀缓存现保留历史分枝和多棵对话树：`ABD → ABC → ABDE` 可以恢复保存过的 ABD 检查点。
 历史 KV 原始字节与完整 GDN/MTP 状态恢复到各请求独占的 GPU pages。
-GUI/TUI 可设置 `--prefix-cache-tokens`，默认推荐 **1,000,000 tokens**，超预算淘汰最旧分枝。
-QUASAR INT8 主 KV 加 MTP 在该预算下约占 **33.4 GiB 主机内存**，另有状态与临时所有权；
+GUI/TUI 可设置 `--prefix-cache-tokens`，默认推荐 **384,000 tokens**，超预算淘汰最旧分枝。
+QUASAR INT8 主 KV 加 MTP 在该预算下约占 **12.8 GiB 主机内存**，另有状态与临时所有权；
+按 1M tokens 折算约为 33.4 GiB；
 归档状态另受 2 GiB 上限限制。设为 0 仅关闭历史保留，仍可复用当前 GPU 前缀。
 视觉、DFlash、稀疏 RAM-KV 不使用历史分枝。
 [缓存语义与限制](docs/maintainer/paged-kv-cache.md#104-historical-branches)。

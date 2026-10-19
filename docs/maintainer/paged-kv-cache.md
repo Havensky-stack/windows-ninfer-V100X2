@@ -846,11 +846,11 @@ GDN/tail/MTP bridge。分枝内没有保存完整状态的位置仍要重算；c
 来自同一已恢复 lineage、未被覆盖的完整 host chunk 可以共享；独立重算的相同 token 不据此合并
 KV，以免把不同浮点关联结果混为同一状态。部分尾块重新导出，GPU pages 始终私有。
 
-`--prefix-cache-tokens` 默认1000000，0关闭历史缓存，保留原有当前 GPU reuse。
+`--prefix-cache-tokens` 默认384000，0关闭历史缓存，保留原有当前 GPU reuse。
 预算只计算历史中不重复的 Main Text chunks，按64-token页取整；不乘 TP rank，也不重复计算共享块。
 超限时按分枝最初归档顺序 FIFO 删除最旧分枝。归档 GDN images 另有每 Program 2 GiB上限，
 先移除旧分枝的内部检查点，仍不够则淘汰最旧分枝；当前 lanes 的 images 仍受独立2 GiB预算限制。
-QUASAR INT8-G64 的1M主KV加MTP约33.4 GiB主机RAM，此外还有状态、元数据和传输期间的临时所有权。
+QUASAR INT8-G64 的384K主KV加MTP约12.8 GiB主机RAM；按1M tokens折算约33.4 GiB，此外还有状态、元数据和传输期间的临时所有权。
 这不是 RSS 硬上限。已选择的 plan 持有恢复资源直到 admission 完成，预算淘汰不会使其悬空。
 Vision、DFlash、稀疏 RAM-KV 不进入此缓存。此传输不改 codec 或重算 GDN，但不同 suffix/prefill
 分块可能改变浮点关联；不能声称与不同 schedule 的 cold full-prefill 输出逐位一致。

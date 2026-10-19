@@ -191,11 +191,11 @@ class GuiCacheDisplay(unittest.TestCase):
         self.assertNotIn(flag, self.gui.command.text())
 
     def test_history_budget_configuration_and_concurrent_long_attention(self):
-        self.assertEqual(self.gui.prefix_cache_tokens.value(), 1000000)
+        self.assertEqual(self.gui.prefix_cache_tokens.value(), 384000)
         for budget in (0, 123456):
             self.gui.prefix_cache_tokens.setValue(budget)
             settings = self.gui.configuration()
-            self.gui.prefix_cache_tokens.setValue(1000000)
+            self.gui.prefix_cache_tokens.setValue(384000)
             self.gui.apply_configuration(settings)
             self.assertEqual(self.gui.prefix_cache_tokens.value(), budget)
             command = self.gui._command()
