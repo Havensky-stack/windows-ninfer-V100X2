@@ -76,3 +76,6 @@ Pending implementation work:
 - [Softmax Attention organization and migration](maintainer/softmax-attention.md) describes the
   single target state for an unfinished source and public-contract cutover; it is not the current
   implementation map.
+
+- [Linux V100 prebuilt package](prebuilt.md): bundled runtime dependencies, requirements and reproduction.
+- [Docker](docker.md): default QUASAR download/TUI and custom model URLs.

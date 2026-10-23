@@ -64,7 +64,8 @@ keep model/request defaults. The native context ceiling is 262144; no implicit Y
 `Vision ON / OFF` controls `--vision`; it is off in the default Text profile. `Visual token budget`
 controls `--vision-max-tokens`. Turning Vision on/off requires stopping and restarting the child.
 The same QUASAR v3 artifact contains both Text and Vision; off omits all Vision GPU payloads.
-The Vision preset disables prefix reuse and both Text-only numerical experiments. A 1024 visual
+The Vision preset keeps prefix reuse and numerical experiments off initially. Turning Vision on
+only disables fast decode and RAM-KV; long attention may stay enabled. A 1024 visual
 budget suffices for the chart image; the bundled five-second video requires 4096 in the tested
 98K-capacity profile. This budget is independent of text context and aggregate across request media.
 
@@ -73,7 +74,7 @@ disables prefix reuse to match the 85K timing setup. The normal MTP4 preset keep
 defaults and prefix reuse. `i` explains the combined ~198.1 tok/s result, the final W8 step's
 ~0.84% gain, and the prior 25-point logit evidence (9/25 near-lossless, max KL 0.001903103).
 IQ/task-accuracy impact is unknown; the current combination has no GPQA result. Gains are not
-independent per-switch ratios. Vision and DFlash reject these Text-only experiments.
+independent per-switch ratios. Vision accepts long attention but rejects fast decode; DFlash rejects both experiments.
 Relative edited paths are resolved from the repository root, matching the child working directory.
 The [QUASAR measurements](performance.md) describe its 85K coding workload and quality limits.
 TP4 needs four suitable devices and the corresponding artifact; see [TP4/NVLink](tp4.md).
@@ -126,3 +127,14 @@ transfer headroom. This is not a process RSS cap. Vision, DFlash and sparse RAM-
 Long attention admits experimental startup-fixed concurrency **1–8**; all independent requests
 share the GPU KV pool, so configured concurrency does not guarantee that many long prompts
 can run simultaneously. See [concurrency measurements](performance.md#experimental-long-context-concurrency-2026-10-20).
+
+## CPU Vision (0.1.2)
+
+`Vision encoder GPU / CPU` selects `--vision-device gpu|cpu` when Vision is enabled and persists
+in saved settings. CPU keeps tower weights and computation in RAM, uploading only BF16 visual
+embeddings before language prefill. Image/video latency increases; CPU encoding happens before
+joining the GPU FIFO so existing decode can continue. CPU/GPU arithmetic can change output;
+no new GPQA result is available. Long attention admits Vision; fast decode remains text-only.
+
+CPU 视觉模式下，启动器将 API 的媒体准备/排队超时设为 600000 ms（10 分钟）；
+命令行直接启动服务时，大图或视频需自行提高 `--pending-timeout-ms`，默认 30 秒可能不够。

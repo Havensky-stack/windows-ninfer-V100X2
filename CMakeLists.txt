@@ -126,6 +126,9 @@ else()
   endif()
 endif()
 find_package(Threads REQUIRED)
+set(BLA_SIZEOF_INTEGER 4)
+set(BLA_PREFER_PKGCONFIG ON)
+find_package(BLAS REQUIRED)
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

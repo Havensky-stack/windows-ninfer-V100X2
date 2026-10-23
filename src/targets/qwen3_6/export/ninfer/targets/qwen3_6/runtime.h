@@ -137,6 +137,11 @@ class Program {
 public:
     ~Program() noexcept;
 
+    // Host-only request staging. Called outside the executor/device lock after ingress
+    // capacity is reserved. Reads immutable model weights; never touches GPU/sequence state.
+    [[nodiscard]] double prepare_media(PreparedPrompt& prompt,
+                                       const PreparationControl& control) const;
+
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
     Program(Program&&)                 = delete;

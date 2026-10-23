@@ -28,7 +28,7 @@ else:
     from launcher_sampling import SAMPLING_LIMITS, validate_sampling
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL_ROOT = Path('/Models/ninfer-V100X2')
+MODEL_ROOT = Path(os.environ.get('NINFER_MODEL_DIR', '/Models/ninfer-V100X2'))
 MODELS = {
     'quasar': MODEL_ROOT / 'quasar-v3/qwen3_8_27b_nvfp4.ninfer',
     'nvfp4': MODEL_ROOT / 'qwen3_8_27b_nvfp4.ninfer',
@@ -92,6 +92,7 @@ class Settings:
     long_attention: bool = False
     fast_decode: bool = False
     vision: bool = False
+    vision_device: str = 'gpu'
     vision_max_tokens: int = 1024
     graphs: bool = True
     prefix_reuse: bool = True
@@ -161,7 +162,10 @@ class Settings:
             if self.optimized:
                 args += ['--lm-head-draft']
         if self.vision:
-            args += ['--vision', '--vision-max-tokens', str(self.vision_max_tokens)]
+            args += ['--vision', '--vision-device', self.vision_device,
+                     '--vision-max-tokens', str(self.vision_max_tokens)]
+            if self.vision_device == 'cpu':
+                args += ['--pending-timeout-ms', '600000']
         for enabled, flag in ((self.long_attention, '--volta-long-attention'),
                               (self.fast_decode, '--volta-fast-decode'),
                               (not self.graphs, '--no-cuda-graph'),
@@ -233,15 +237,17 @@ class Settings:
             raise ValueError('27B DFlash requires TP1/TP2 and a draft window of 1..7')
         if not 0 <= self.prefix_cache_tokens <= 100000000:
             raise ValueError('Historical prefix cache budget must be 0..100000000 tokens (host RAM)')
-        if self.long_attention and (self.tp != 2 or self.backend == 'dflash' or self.vision or
+        if self.long_attention and (self.tp != 2 or self.backend == 'dflash' or
                                     self.kv_dtype != 'int8' or self.ram_kv):
-            raise ValueError('Experimental long attention requires TP2 INT8 KV concurrency 1..8 Text None/MTP, no RAM-KV')
+            raise ValueError('Experimental long attention requires TP2 INT8 KV concurrency 1..8 Text/Vision None/MTP, no RAM-KV')
         if self.fast_decode and (self.tp != 2 or self.backend == 'dflash' or self.vision):
             raise ValueError('Experimental fast decode requires QUASAR SM70 TP2 Text None/MTP')
         if self.vision and (self.tp != 2 or self.backend == 'dflash'):
-            raise ValueError('Vision requires TP2 None/MTP; disable Text-only experiments')
+            raise ValueError('Vision requires TP2 None/MTP; fast decode remains Text-only')
         if self.vision and local_path(self.artifact).name in ('qwen3_8_27b_q4_k_m.ninfer', 'qwen3_8_27b_fp8.ninfer'):
             raise ValueError('Q4_K_M and native FP8 do not support Vision')
+        if self.vision_device not in ('gpu', 'cpu'):
+            raise ValueError('Vision device must be gpu or cpu')
         if not 1 <= self.vision_max_tokens <= 32768:
             raise ValueError('Vision budget must be 1..32768')
         if self.kv_dtype not in ('int8', 'bf16') or not 1 <= self.max_concurrency <= 8:
@@ -413,6 +419,7 @@ FIELDS = [
     ('backend', 'Speculation', ('mtp', 'dflash', 'none')), ('drafts', 'Max drafts', None),
     ('optimized', 'Optimized draft head', (False, True)),
     ('vision', 'Vision ON / OFF', (False, True)),
+    ('vision_device', 'Vision encoder GPU / CPU', ('gpu', 'cpu')),
     ('vision_max_tokens', 'Visual token budget', None),
     ('fast_decode', 'Experimental fast math', (False, True)),
     ('long_attention', 'Experimental attention', (False, True)),
@@ -707,7 +714,6 @@ class Launcher:
                             setattr(self.settings, field, choices[(choices.index(value) + 1) % len(choices)])
                             if field == 'vision' and self.settings.vision:
                                 self.settings.fast_decode = False
-                                self.settings.long_attention = False
                                 self.settings.prefix_reuse = False
                                 self.settings.ram_kv = False
                             if field == 'backend' and self.settings.backend in ('none', 'dflash'):
@@ -728,6 +734,8 @@ def main() -> int:
     parser.add_argument('--no-settings', action='store_true', help='do not read or save preferences')
     parser.add_argument('--binary', type=Path, help='explicit ninfer-serve executable')
     parser.add_argument('--artifact', type=Path, help='explicit model .ninfer path')
+    parser.add_argument('--host', help='override the API listen address')
+    parser.add_argument('--log', type=Path, help='override the request JSONL log path')
     parser.add_argument('--print-command', action='store_true', help='print command without loading a model')
     args = parser.parse_args()
     candidates = [ROOT / 'build-v100/apps/ninfer-serve', ROOT / 'build-v100-tp4/apps/ninfer-serve']
@@ -749,6 +757,10 @@ def main() -> int:
         settings.binary = str(args.binary.expanduser().resolve())
     if args.artifact:
         settings.artifact = str(args.artifact.expanduser().resolve())
+    if args.host:
+        settings.host = args.host
+    if args.log:
+        settings.log = str(args.log.expanduser().resolve())
     if args.print_command:
         print(settings.display_command())
         return 0

@@ -5,12 +5,15 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 
 namespace ninfer::artifact {
 class MaterializedArtifact;
 }
 
 namespace ninfer::targets::qwen3_6 {
+
+struct HostVisionWeights;
 
 struct VisionBackboneConfig {
     static constexpr int layers              = 27;
@@ -87,10 +90,16 @@ struct VisionCommonWeights {
 };
 
 struct VisionWeights {
+    std::shared_ptr<const HostVisionWeights> host;
     VisionCommonWeights common;
     Weight merger_fc2;
     Tensor merger_fc2_bias;
 };
+
+[[nodiscard]] std::shared_ptr<const HostVisionWeights> materialize_host_vision(
+    artifact::MaterializedArtifact& materialized, const VisionBackbonePlan& backbone,
+    const VisionMergerInputPlan& merger_input, const VisionMergerNormPlan& merger_norm,
+    artifact::ObjectHandle merger_fc2, artifact::ObjectHandle merger_fc2_bias, int output_hidden);
 
 [[nodiscard]] VisionBackbonePlan bind_vision_backbone(artifact::Binder& binder,
                                                       artifact::TensorPlacement placement);

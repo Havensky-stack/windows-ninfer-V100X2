@@ -181,6 +181,11 @@ public:
             .active_lanes = max_concurrency_, .main_kv_pages = max_concurrency_, .backend_kv_pages = 0};
     }
 
+    std::function<double(const ninfer::PreparationControl&)> media_preparation;
+    double prepare_media(q36::PreparedPrompt&, const ninfer::PreparationControl& control) const {
+        return media_preparation ? media_preparation(control) : 0.0;
+    }
+
     // The budget comes from the request's own options, never from the script queue: with several
     // requests in flight the executor plans one while another is still holding the queue head.
     [[nodiscard]] ScriptedPlan plan_request_base(const q36::PreparedPrompt& prompt,
@@ -682,6 +687,37 @@ void test_engine_scope_failure_still_fails_all(const q36::Frontend& frontend,
            "a request after a device failure was not refused as unavailable");
 }
 
+void test_host_preparation_failure_releases_capacity(const q36::Frontend& frontend,
+                                                     const ninfer::DeviceContext& device) {
+    ScriptedInstance instance{.loaded = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(1),
+                              .request_memory = {}, .kv_capacity_resolution = {}};
+    auto options = executor_options();
+    options.max_pending_requests = 1;
+    Executor executor(instance, options, device);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (const auto kind : {ninfer::RequestErrorKind::Cancelled, ninfer::RequestErrorKind::QueueTimeout}) {
+        bool observed = false;
+        instance.program->media_preparation = [&](const ninfer::PreparationControl& control) -> double {
+            observed = control.deadline == deadline && control.cancellation.requested();
+            throw ninfer::RequestError(kind, "scripted CPU media preparation failure");
+        };
+        auto prompt = frontend.prepare_tokens({0});
+        const auto summary = prompt.summary();
+        bool failed = false;
+        try {
+            (void)executor.submit(std::move(prompt), summary, 0.0, request_options(1),
+                ninfer::PreparationControl{.deadline = deadline,
+                    .cancellation = ninfer::CancellationView([] { return true; })});
+        } catch (const ninfer::RequestError& error) { failed = error.kind() == kind; }
+        expect(observed && failed, "CPU preparation did not receive deadline/cancellation or propagate its failure");
+        instance.program->media_preparation = {};
+        instance.program->push_script(GenerationScript{.tokens = {0}});
+        const auto next = run_request(executor, frontend, 1);
+        expect(next.ok && next.content == "x", "failed CPU preparation leaked ingress capacity");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -699,5 +735,6 @@ int main() {
     test_request_scope_failure_is_isolated(frontend, device, true);
     test_request_scope_failure_is_isolated(frontend, device, false);
     test_engine_scope_failure_still_fails_all(frontend, device);
+    test_host_preparation_failure_releases_capacity(frontend, device);
     return failures == 0 ? 0 : 1;
 }

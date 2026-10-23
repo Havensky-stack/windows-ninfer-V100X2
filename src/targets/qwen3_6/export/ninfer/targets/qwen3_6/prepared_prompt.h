@@ -103,6 +103,9 @@ struct PreparedPromptData {
     // One immutable payload per Vision item, in the same order as vision_items.
     std::vector<std::shared_ptr<const PreparedMediaPayload>> media_payloads;
     std::vector<VisionItem> vision_items;
+    // Immutable CPU encodings referenced only after Engine submission fixes the resident
+    // model. Frontend/cache preparation never attaches model-specific visual embeddings.
+    std::vector<std::shared_ptr<const std::vector<std::uint16_t>>> host_vision_embeddings;
     PromptIdentity identity;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
@@ -116,12 +119,14 @@ struct PreparedPromptData {
     // session can still revisit the same item in a later Text chunk.
     void release_all_media_payloads() noexcept {
         for (auto& payload : media_payloads) { payload.reset(); }
+        host_vision_embeddings.clear();
     }
 };
 
 class PreparedPromptAccess {
 public:
     [[nodiscard]] static const PreparedPromptData& view(const PreparedPrompt& prompt);
+    [[nodiscard]] static PreparedPromptData& mutable_view(PreparedPrompt& prompt);
     [[nodiscard]] static PreparedPromptData take(PreparedPrompt&& prompt);
 };
 

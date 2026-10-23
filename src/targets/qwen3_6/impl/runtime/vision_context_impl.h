@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "targets/qwen3_6/impl/vision/host.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "ninfer/ops/add_bias.h"
 #include "ninfer/ops/gelu.h"
@@ -15,6 +16,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -137,6 +139,10 @@ VisionContext::VisionContext(DeviceContext& ctx, const LoadedModelData& weights)
         throw std::invalid_argument("Vision execution was requested without materialized weights");
     }
     const auto& vision = *weights.vision;
+    if (vision.host) {
+        host_ = vision.host.get();
+        return;
+    }
     patch_embed_       = &vision.common.patch_embedding;
     patch_embed_bias_  = &vision.common.patch_embedding_bias;
     position_embed_    = &vision.common.position_embedding;
@@ -208,6 +214,9 @@ void VisionContext::encode(const VisionItemView& item, Tensor& output,
         output.ne[1] != static_cast<std::int32_t>(tokens64) || output.ne[2] != 1 ||
         output.ne[3] != 1 || !output.is_contiguous() || output.data == nullptr) {
         throw std::invalid_argument("Vision output must be contiguous BF16 [H,V]");
+    }
+    if (host_ != nullptr) {
+        throw std::logic_error("CPU Vision must be encoded before GPU admission");
     }
     const VisionWorkspaceLayout layout = build_workspace_layout(
         patches64, tokens64, static_cast<std::size_t>(control.segment_count));
@@ -387,10 +396,25 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         if (!payload || payload->patch_elements != patch_elements) {
             throw std::invalid_argument("Vision item patch payload has an invalid shape");
         }
-        timers_.emplace_back(device_);
-        timers_.back().start();
-        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
-        timers_.back().record_stop();
+        if (context_.is_cpu()) {
+            const auto start = std::chrono::steady_clock::now();
+            if (active->item_index >= prompt_.host_vision_embeddings.size()) {
+                throw std::logic_error("CPU Vision request was not staged before GPU admission");
+            }
+            const auto& encoded = prompt_.host_vision_embeddings[active->item_index];
+            if (!encoded || encoded->size() * sizeof(std::uint16_t) != output.bytes()) {
+                throw std::logic_error("CPU Vision embedding extent mismatch");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(output.data, encoded->data(), output.bytes(),
+                                       cudaMemcpyHostToDevice, device_.stream));
+            CUDA_CHECK(cudaStreamSynchronize(device_.stream));
+            host_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        } else {
+            timers_.emplace_back(device_);
+            timers_.back().start();
+            context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
+            timers_.back().record_stop();
+        }
         workspace_.reset();
         active_item_ = active->item_index;
         encoded_payloads_pending_release_.push_back(active->item_index);
@@ -402,6 +426,9 @@ void VisionPrefillSession::release_encoded_media_payloads() noexcept {
     for (const std::uint32_t item_index : encoded_payloads_pending_release_) {
         if (item_index >= prompt_.media_payloads.size()) { std::terminate(); }
         prompt_.media_payloads[item_index].reset();
+        if (item_index < prompt_.host_vision_embeddings.size()) {
+            prompt_.host_vision_embeddings[item_index].reset();
+        }
     }
     encoded_payloads_pending_release_.clear();
 }
@@ -409,7 +436,7 @@ void VisionPrefillSession::release_encoded_media_payloads() noexcept {
 double VisionPrefillSession::elapsed_seconds() const {
     double milliseconds = 0.0;
     for (const CudaEventTimer& timer : timers_) { milliseconds += timer.elapsed_ms(); }
-    return milliseconds / 1000.0;
+    return milliseconds / 1000.0 + host_seconds_;
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

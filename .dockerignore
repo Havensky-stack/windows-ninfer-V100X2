@@ -1,4 +1,6 @@
 .git
+.env
+.env.*
 .cache
 .claude
 .codex

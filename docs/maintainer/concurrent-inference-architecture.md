@@ -770,7 +770,7 @@ reuse frontier 之前且该位置没有快照，则本次保留合法 reuse 并�
 一个 retained entry 同时只能被一个 active request 消费。多个 active requests 不共享同一份可写
 sequence state，也不使用 GPU copy-on-write branching。历史/已完成 sibling 可以从不可变 host KV chunks
 和完整 GDN image 恢复到新 lane 的私有 GPU allocation；预算与 FIFO 规则见 Paged KV §10.4。
-Long attention 允许 SM70 TP2 Text/None/MTP 的实验性1–8并发；共享 KV admission 规则不变。
+Long attention 允许 SM70 TP2 Text/Vision None/MTP 的实验性1–8并发；共享 KV admission 规则不变。
 `RuntimeStats::decode_wall_seconds` 每个 compact round 只累计一次 executor 墙钟，包括 commit/publication，
 排除 prefill，用于总 committed decode 吞吐，不能把各行耗时相加作为 batch 墙钟。
 Request-local RNG、sampling、stop、generation
@@ -1467,3 +1467,18 @@ admission。Later arrivals 从未成为 H 的 donor，也不能恢复已消费�
 - [Serving behavior](../serving.md)
 - [Qwen3.6-27B model semantics](qwen3.6-27b-model.md)
 - [Qwen3.6-35B-A3B model semantics](qwen3.6-35b-a3b-model.md)
+
+### CPU Vision request staging (0.1.2)
+
+`Program::prepare_media` is a const host-only submission stage reading immutable CPU tower
+weights. `ConcurrentExecutor::submit` reserves bounded outstanding capacity first, stages media
+outside queue/execution locks, then appends the complete request to the FIFO. The CPU stage
+never changes GDN/KV, graph addresses or decode membership. Frontend-owned prepared/cache
+payloads remain model-neutral; immutable embeddings attach only after submission fixes the
+resident model. A Program-local FIFO retains at most 128 MiB, keyed by media digest, modality and
+grid. Request references are consumed by the existing family Vision prefill scatter and released
+after GPU consumers complete. This embedding cache is independent of historical text KV. CPU
+encoding time is separately added to `vision_seconds`, and submission wall time includes it once.
+Explicit deadlines and cancellation cover staging; the ordinary Engine default queue timeout
+begins after staging. Serving passes an explicit preparation deadline. Failures release the
+reserved outstanding slot.

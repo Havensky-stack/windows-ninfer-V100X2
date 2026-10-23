@@ -45,6 +45,9 @@ int main() {
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-device", "cpu"}).vision_device == ninfer::VisionDevice::Cpu,
+                      "CPU Vision device did not parse");
+    failures += check(defaults.vision_device == ninfer::VisionDevice::Gpu, "Vision device default is not GPU");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.vision_max_tokens == ninfer::kMaximumVisionTokenBudget,
                       "Vision token budget default changed");

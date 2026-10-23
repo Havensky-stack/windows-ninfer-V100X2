@@ -123,19 +123,27 @@ void verify(const char* path) {
         require(plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,
                 "QUASAR DFlash projections lost their W8 format");
     }
+    for (const auto device : {ninfer::VisionDevice::Gpu, ninfer::VisionDevice::Cpu}) {
     for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp}) {
         Binder binder(reader, 2);
         const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
-            {.vision = true, .speculative = backend}, 2);
+            {.vision = true, .vision_device = device, .speculative = backend}, 2);
         int vision_objects = 0;
+        int host_vision_objects = 0;
+        for (const auto& placement : plan.materialization.host_objects) {
+            host_vision_objects += object_name(binder.descriptor(placement.object)).starts_with("vision/");
+        }
         for (const auto& placement : plan.materialization.device_objects) {
             if (object_name(binder.descriptor(placement.object)).starts_with("vision/")) {
                 require(placement.device == 0, "Vision must live only on the primary TP2 device");
                 ++vision_objects;
             }
         }
-        require(vision_objects > 0 && !plan.bindings.features.volta_fast_decode,
-                "Vision must upload its payload and keep experimental Text kernels disabled");
+        require((device == ninfer::VisionDevice::Gpu ? vision_objects > 0 && host_vision_objects == 0
+                                                    : vision_objects == 0 && host_vision_objects > 0) &&
+                !plan.bindings.features.volta_fast_decode,
+                "Vision weights must reside only on the selected encoder device");
+    }
     }
     {
         Binder binder(reader, 2);

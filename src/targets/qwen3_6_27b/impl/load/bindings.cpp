@@ -1134,7 +1134,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
 
     const artifact::TensorPlacement vision_placement =
-        features.vision ? (tp == 2 ? artifact::TensorPlacement::PrimaryDevice
+        features.vision ? (features.vision_device == VisionDevice::Cpu ? artifact::TensorPlacement::Host
+                                 : tp == 2 ? artifact::TensorPlacement::PrimaryDevice
                                    : artifact::TensorPlacement::Device)
                         : artifact::TensorPlacement::ValidateOnly;
     if (ggml_k) {
@@ -1396,6 +1397,12 @@ void LoadedModelData::build_device_view(const BindingPlan& plan, int device,
     if (plan.features.vision) {
         if (device != 0) { return; }
         auto& vision  = runtime.vision.emplace();
+        if (plan.features.vision_device == VisionDevice::Cpu) {
+            vision.host = qwen3_6::materialize_host_vision(backing, plan.vision_backbone,
+                plan.vision_merger_input, plan.vision_merger_norm, plan.vision_merger_fc2,
+                plan.vision_merger_fc2_bias, 5120);
+            return;
+        }
         vision.common = qwen3_6::materialize_vision_common(
             backing, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
         vision.merger_fc2      = artifact::materialized_weight(backing, plan.vision_merger_fc2,

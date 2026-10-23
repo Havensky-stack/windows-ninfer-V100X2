@@ -4,6 +4,8 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/vision/host.h"
+#include "targets/qwen3_6/impl/frontend/media_cache.h"
 
 #include <stdexcept>
 #include <utility>
@@ -120,6 +122,14 @@ Program<Variant>::Program(std::unique_ptr<detail::ProgramImpl<Variant>> impl) no
 
 template <>
 Program<Variant>::~Program() noexcept = default;
+
+template <>
+double Program<Variant>::prepare_media(PreparedPrompt& prompt, const PreparationControl& control) const {
+    if (!impl_->model.vision || !impl_->model.vision->host) { return 0.0; }
+    auto& data = PreparedPromptAccess::mutable_view(prompt);
+    if (!data.has_media()) { return 0.0; }
+    return impl_->host_vision_cache.prepare(*impl_->model.vision->host, data, control);
+}
 
 template <>
 RequestBasePlan<Variant>

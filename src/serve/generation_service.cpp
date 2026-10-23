@@ -248,6 +248,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.volta_long_attention     = options_.volta_long_attention;
     engine_options.volta_fast_decode     = options_.volta_fast_decode;
     engine_options.enable_vision            = options_.enable_vision;
+    engine_options.vision_device = options_.vision_device;
     engine_options.vision_max_tokens        = options_.vision_max_tokens;
     engine_options.use_cuda_graph           = options_.use_cuda_graph;
     engine_options.speculative              = options_.speculative;
@@ -324,7 +325,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
         prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              prepared.lifetime->deadline);
+                                              control);
         prepared.sampling   = prepared.generation.resolved_sampling();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);

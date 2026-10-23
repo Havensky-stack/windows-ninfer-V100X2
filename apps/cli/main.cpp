@@ -317,6 +317,7 @@ int main(int argc, char** argv) {
         engine_options.volta_fast_decode = cli.volta_fast_decode;
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
+        engine_options.vision_device = cli.vision_device;
         engine_options.vision_max_tokens = cli.vision_max_tokens;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
         engine_options.load_progress  = load_progress.callback();

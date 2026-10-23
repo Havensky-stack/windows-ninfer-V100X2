@@ -175,6 +175,8 @@ ObjectHandle bind_tensor(Binder& binder, std::string_view name, NumericFormat fo
         // Whole tensor on the primary rank. Reuses the storage-mode primitive instead of a
         // second placement entry point.
         binder.materialize_on_device(handle, 0);
+    } else if (placement == TensorPlacement::Host) {
+        binder.materialize_on_host(handle);
     } else {
         binder.validate_only(handle);
     }
@@ -272,6 +274,35 @@ Weight materialized_weight(const MaterializedArtifact& materialized, ObjectHandl
         return row_scale_weight(materialized, handle, format, rows, columns, device);
     }
     return row_split_weight(materialized, handle, format, rows, columns, device);
+}
+
+Weight materialized_host_weight(const MaterializedArtifact& materialized, ObjectHandle handle,
+                                NumericFormat format, std::int32_t rows, std::int32_t columns) {
+    if (storage_layout_for(format) != StorageLayout::RowSplitK128V1 || rows <= 0 || columns <= 0) {
+        throw std::invalid_argument("host weight requires a positive row-split matrix");
+    }
+    const std::array<std::uint64_t, 2> shape{static_cast<std::uint64_t>(rows),
+                                           static_cast<std::uint64_t>(columns)};
+    const auto geometry = row_split_geometry(format, shape);
+    const auto payload = materialized.host_bytes(handle);
+    if (payload.size() != geometry.encoded_bytes) {
+        throw ArtifactError("host weight payload does not match its matrix shape");
+    }
+    Weight out{};
+    out.payload = out.qdata = payload.data();
+    out.payload_bytes = payload.size();
+    out.high_plane_bytes = geometry.high_plane_bytes;
+    out.qhigh = geometry.high_plane_bytes ? payload.data() + geometry.high_plane_offset : nullptr;
+    out.scales = payload.data() + geometry.scale_plane_offset;
+    out.qtype = qtype_for(format);
+    out.layout = QuantLayout::RowSplit;
+    out.n = out.shape[0] = out.padded_shape[0] = rows;
+    out.k = out.shape[1] = columns;
+    out.padded_shape[1] = static_cast<std::int32_t>(geometry.padded_columns);
+    out.group = out.group_size = geometry.group_size;
+    out.scale_dtype = DType::FP16;
+    out.ndim = 2;
+    return out;
 }
 
 } // namespace ninfer::artifact

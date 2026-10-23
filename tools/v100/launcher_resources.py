@@ -53,6 +53,7 @@ class MemoryOptions:
     optimized: bool = True
     concurrency: int = 1
     vision: bool = False
+    vision_device: str = "gpu"
     vision_tokens: int = 1024
     graphs: bool = True
     ram_window: int = 0
@@ -67,6 +68,7 @@ class MemoryEstimate:
     workspace_high: int
     graph: int
     auto: bool
+    host_vision_bytes: int = 0
 
     @property
     def low(self) -> int:
@@ -90,13 +92,19 @@ def estimate_memory(path: Path, options: MemoryOptions) -> list[MemoryEstimate]:
         raise ValueError('KV 容量须为正数')
     capacity = (capacity + 63) // 64 * 64
     weights = [0] * (o.tp * o.pp)
+    host_vision_bytes = 0
     for obj in objects:
         name = obj['name']
         if obj.get('kind') != 'tensor':
             continue
         if name.startswith('vision/'):
-            if o.vision:
+            if o.vision and o.vision_device == "gpu":
                 weights[0] += obj['bytes']
+            elif o.vision and o.vision_device == "cpu":
+                elements = 1
+                for extent in obj['shape']:
+                    elements *= extent
+                host_vision_bytes += 4 * elements
             continue
         if name.startswith('mtp/') and o.backend != 'mtp':
             continue
@@ -129,7 +137,7 @@ def estimate_memory(path: Path, options: MemoryOptions) -> list[MemoryEstimate]:
     chunk = min(o.chunk, o.context)
     # Vocabulary logits and activation working sets dominate measured 27B prefill space.
     workspace = chunk * (248320 * 2 + 5120 * 12) + 32 * MIB
-    if o.vision:
+    if o.vision and o.vision_device == "gpu":
         visual = o.vision_tokens * 4 * (1152 * 8 + 4304 * 2) * 2
         workspace = max(workspace, visual + 64 * MIB)
     if o.backend == 'dflash':
@@ -149,7 +157,8 @@ def estimate_memory(path: Path, options: MemoryOptions) -> list[MemoryEstimate]:
             kv += (capacity + (64 * o.concurrency if o.drafts > 1 else 0)) * token_bytes // (16 * o.tp)
         transient = o.vision_tokens * 5120 * 2 if o.vision and rank == 0 else 0
         results.append(MemoryEstimate(weight, kv, state, int(workspace * 0.85) + transient,
-                                      int(workspace * 1.25) + transient, graph, o.capacity == 'auto' and not o.ram_window))
+                                      int(workspace * 1.25) + transient, graph, o.capacity == 'auto' and not o.ram_window,
+                                      host_vision_bytes if rank == 0 else 0))
     return results
 
 

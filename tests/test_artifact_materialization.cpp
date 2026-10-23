@@ -231,14 +231,14 @@ int main() {
                     fp8_weight.payload_bytes == kFp8TensorBytes,
                 "materialized FP8 Weight metadata is incomplete");
 
-        const auto retained = materialized.resource_bytes(resource);
+        const auto retained = materialized.host_bytes(resource);
         require(std::equal(retained.begin(), retained.end(), kResource.begin(), kResource.end()),
                 "retained resource payload differs from the artifact");
 
         const auto& stats = materialized.stats();
         require(stats.tensor_count == 3 && stats.resource_count == 1 &&
                     stats.h2d_bytes == kTensor.size() + kSecondTensor.size() + kFp8TensorBytes &&
-                    stats.retained_resource_bytes == kResource.size() &&
+                    stats.retained_host_bytes == kResource.size() &&
                     stats.file_bytes == kResource.size() +
                                             ninfer::artifact::Reader::direct_io_alignment +
                                             kTailReadBytes,

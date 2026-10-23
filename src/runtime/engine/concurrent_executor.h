@@ -126,8 +126,10 @@ public:
 
     Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
-                      Clock::time_point pending_deadline = {}) {
+                      const PreparationControl& preparation = {}) {
         const Clock::time_point submitted = Clock::now();
+        Clock::time_point pending_deadline = preparation.deadline;
+        const bool explicit_deadline = pending_deadline != Clock::time_point{};
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
         }
@@ -154,9 +156,16 @@ public:
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
+            // CPU media work must not hold the device/execution mutex or stall active decode.
+            const double host_vision_seconds = instance_.program->prepare_media(
+                prompt, preparation);
+            // The default queue timeout begins after host encoding. A caller's explicit
+            // deadline still covers the entire submission, including CPU media work.
+            if (!explicit_deadline) { pending_deadline = Clock::now() + pending_timeout_; }
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);
+            request->host_vision_seconds = host_vision_seconds;
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -322,6 +331,7 @@ private:
         targets::qwen3_6::OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
+        double host_vision_seconds = 0.0;
         ResolvedRequestOptions options;
         Clock::time_point deadline;
         Clock::time_point submitted;
@@ -483,6 +493,7 @@ private:
                 request->prepare_seconds +
                 std::chrono::duration<double>(*request->first_token - request->submitted).count();
         }
+        result.timings.vision_seconds += request->host_vision_seconds;
         result.timings.total_seconds =
             request->prepare_seconds +
             std::chrono::duration<double>(Clock::now() - request->submitted).count();

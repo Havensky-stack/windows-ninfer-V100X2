@@ -632,7 +632,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    if (plan.features.vision) {
+    if (plan.features.vision && plan.features.vision_device == VisionDevice::Gpu) {
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = plan.vision_max_tokens;
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
@@ -659,12 +659,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 // `RopeMode::Yarn`. The single caller passes it straight into the sequence plan, so the ceiling is
 // resolved exactly once per Engine construction.
 std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions& options) {
+    if (options.vision_device != VisionDevice::Gpu && options.vision_device != VisionDevice::Cpu) {
+        throw std::invalid_argument("unknown vision_device");
+    }
+    if (!options.enable_vision && options.vision_device != VisionDevice::Gpu) {
+        throw std::invalid_argument("CPU Vision requires enable_vision");
+    }
     if (options.volta_long_attention &&
         (TextConfig::query_heads != 24 || device.sm() != 70 || options.tp != 2 || options.pp != 1 ||
-         options.enable_vision ||
          options.kv_cache != KvCacheStorage::Int8Group64 || options.ram_kv.gpu_tokens != 0 ||
          options.speculative.backend == SpeculativeBackend::DFlash)) {
-        throw std::invalid_argument("Volta long attention requires SM70 27B TP2 Text/None/MTP with complete INT8 KV");
+        throw std::invalid_argument("Volta long attention requires SM70 27B TP2 Text/Vision None/MTP with complete INT8 KV");
     }
     if (options.ram_kv.gpu_tokens != 0) {
         if constexpr (TextConfig::query_heads != 24) {

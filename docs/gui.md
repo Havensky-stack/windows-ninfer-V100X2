@@ -47,7 +47,7 @@ bash tools/v100/ninfer-gui.sh
 ```bash
 bash tools/v100/ninfer-gui.sh \
   --repo /home/z/ninfer-V100X2 \
-  --binary /home/z/ninfer-V100X2/build-v100-tp4/apps/ninfer-serve \
+  --binary /home/z/ninfer-V100X2/build-v100/apps/ninfer-serve \
   --artifact /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer
 ```
 
@@ -127,12 +127,12 @@ bash tools/v100/ninfer-gui.sh \
 其他支持的模型和执行方式通过字段配置，所有组合共用同一配置保存、加载入口。
 
 “推理 → 视觉”默认关闭，对应 `--vision`。打开时加载同一 QUASAR v3 文件里的
-333 个视觉对象到主卡；关闭时不分配这些 GPU 权重和视觉工作区。无需重复下载模型。
+333 个视觉对象：默认 GPU 模式放主卡，CPU 模式只放主机 RAM；关闭时不分配塔权重和视觉工作区。无需重复下载模型。
 “视觉 token 预算”对应 `--vision-max-tokens`，独立于文本上下文容量，按一条请求所有媒体合计。
 图片测试用 180K 文本容量、1024 视觉预算；现有五秒视频测试用 98K 容量、4096 视觉预算。
 较小预算可能拒绝视频。开关和预算会保存，重启 API 后生效。
 
-勾选视觉会关闭两个纯文本实验开关及前缀复用；可手动重新启用缓存。QUASAR 的 TP2 / MTP4 /
+勾选视觉会关闭 fast decode、RAM-KV 及前缀复用，但可保留 long attention；可手动重新启用缓存。QUASAR 的 TP2 / MTP4 /
 4096 容量现有前缀集成检查已通过，包括视觉桥接、媒体变化/追加、停止和恢复。TP4、DFlash、Q4_K_M 和 native FP8 的不支持组合在启动前被阻止。
 GUI 是 API 启动器；图片/视频由客户端通过既有 OpenAI/Anthropic 接口传入。
 
@@ -147,7 +147,7 @@ GUI 是 API 启动器；图片/视频由客户端通过既有 OpenAI/Anthropic �
 
 - “NVFP4 / MTP 快速数值路径”：`--volta-fast-decode`，QUASAR / SM70 / TP2 / 纯文本 None/MTP；
   NVFP4 全局缩放移到 FP32 K 归约后，并启用 MTP W8 特定分区/归约。
-- “完整历史长注意力”：`--volta-long-attention`，SM70 27B / TP2 / INT8 KV / 实验性并发1–8 / 纯文本 None/MTP；
+- “完整历史长注意力”：`--volta-long-attention`，SM70 27B / TP2 / INT8 KV / 实验性并发1–8 / 文本或视觉 None/MTP；
   保留每个历史 KV，但改变 softmax、PV 和归约顺序。
 
 组合在 85K 实际输入、180K 容量、MTP4、greedy、Graph 下测得 **198.105 / 198.097 committed tok/s**。
@@ -227,3 +227,14 @@ Responses 使用 `usage.input_tokens_details.cached_tokens`，Anthropic Messages
 及恢复时的临时余量。
 恢复到有完整状态的最近前缀，其后需要重算的 token 不算命中。Vision、DFlash 和稀疏 RAM-KV
 不使用此历史分枝缓存。[所有权与预算](maintainer/paged-kv-cache.md#104-historical-branches)。
+
+## CPU 视觉塔（0.1.2）
+
+开启视觉后，在“视觉推理设备”选择 `gpu`（默认）或 `cpu`。CPU 模式只把视觉塔放入主机 RAM，
+媒体编码结束后上传 BF16 特征；显存区间不再计入塔权重/编码工作区，但仍计 GPU 特征缓冲。
+下方同时显示 CPU 塔权重 RAM 估计，另需媒体工作区与已有缓存 RAM。选项支持设置和配置保存/加载。
+图片/视频会更慢，其他已入队请求可继续解码。CPU 与 GPU 计算的数值差异可能改变输出，未跑新 GPQA。
+开启视觉只自动关闭 fast decode 和 RAM-KV，不再关闭 long attention；该长注意力实验仍默认关闭。
+
+CPU 视觉模式下，启动器将 API 的媒体准备/排队超时设为 600000 ms（10 分钟）；
+命令行直接启动服务时，大图或视频需自行提高 `--pending-timeout-ms`，默认 30 秒可能不够。

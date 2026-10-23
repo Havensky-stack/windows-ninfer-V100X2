@@ -901,6 +901,11 @@ const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& promp
     return *prompt.data_;
 }
 
+PreparedPromptData& PreparedPromptAccess::mutable_view(PreparedPrompt& prompt) {
+    if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
+    return *prompt.data_;
+}
+
 PreparedPromptData PreparedPromptAccess::take(PreparedPrompt&& prompt) {
     if (prompt.data_ == nullptr) { throw std::invalid_argument("prepared prompt is empty"); }
     auto data = std::move(prompt.data_);

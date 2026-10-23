@@ -4,6 +4,60 @@ Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16
 
 [llama.cpp / LM Studio controls](llama-comparison.md) · [Other V100 profiles](performance-v100.md) · [TP4/NVLink](tp4.md) · [RAM-KV/PP2](experiments.md) · [Inherited upstream campaigns](performance-upstream.md)
 
+## v0.1.2: visual long attention and CPU Vision (2026-10-23)
+
+This release adds Vision to the default-off long-attention profile and optionally moves the
+visual tower to CPU RAM. It does not introduce a new text decode kernel or claim another
+pure-text speedup over v0.1.1. Fast decode remains incompatible with Vision. QUASAR TP4
+qualification is assigned to v0.2.0.
+
+The qualification below uses the same local two V100s, driver 580.178.04, CUDA 12.8, QUASAR v3,
+TP2, MTP4 with optimized proposals, complete INT8 group-64 KV, CUDA Graphs, chunk 1024,
+86024-token context/KV capacity, 4096-token visual budget, greedy sampling and no prefix reuse.
+Each cold request has exactly **85000 occupied prompt tokens and 129 committed outputs**;
+the image case includes a 128x128 red-square image plus repeated text. EOS is ignored up to
+the fixed output budget. This is a functional/latency stress fixture, not an answer-quality
+evaluation or the older code-task fixture that produced 198.1 tok/s. Each row is one request.
+
+| Tower placement / input | Vision seconds | Prefill seconds | TTFT seconds | Committed wall decode tok/s | Draft accepted / proposed |
+|---|---:|---:|---:|---:|---:|
+| GPU / image + text | 0.0728 | 68.7531 | 68.8937 | 160.176 | 91 / 146 |
+| CPU / image + text | 5.6701 | 68.6886 | 74.4271 | 160.294 | 91 / 146 |
+| GPU / text only, Vision enabled | 0 | 68.4658 | 68.5344 | 129.351 | 82 / 177 |
+| CPU / text only, Vision enabled | 0 | 68.3060 | 68.3832 | 129.180 | 82 / 177 |
+
+Committed wall decode is `(129 - 1) / (total_seconds - first_token_seconds)`. The text-only
+outputs match exactly across tower placement; the measured decode difference is about -0.13%
+for CPU placement, not evidence of a new speedup or a general bound. Image outputs differ
+between CPU and GPU even though accepted-draft totals agree. CPU visual arithmetic and long
+attention can change logits or generated output; no new GPQA or losslessness claim is made.
+
+CPU placement removes **282.02 MiB** of primary-rank GPU weight residency, with no second-rank
+tower copy in either mode. The FP32 host tower is about **1.716 GiB**; measured process peak RSS
+was 3.732 GiB with CPU Vision versus 1.864 GiB with GPU Vision for the image fixture. These RSS
+numbers include loading and scratch, not just the tower, and do not bound historical KV storage.
+Program-local immutable visual embeddings have a separate 128 MiB FIFO retention cap.
+
+Independent CPU Op oracles, the real load-placement check and cross-chunk image/prefix/MTP
+state checks pass. The native test command is documented in [tests](../tests/README.md#cpu-vision-and-visual-long-attention-012).
+Local qualification results and detailed GPU health logs are saved under
+`profiles/bench/v0.1.2/`. Power limits and clocks are unchanged. The Linux prebuilt is qualified
+separately from a relocated extraction; [requirements and packaging](prebuilt.md).
+
+The relocated package runs with no external `LD_LIBRARY_PATH`: its loaded non-system/non-driver
+DSOs resolve inside the extracted package. Real HTTP checks cover red-circle and blue-square
+images, repeated-image CPU embedding reuse, mixed text/image concurrency and four-frame video.
+During a 5.776-second CPU image encode, an already-running text response produced 287 streamed
+deltas over the central 5.276 seconds; its largest observed gap was 19.2 ms. This establishes
+continued decode on this workload, not a universal latency bound. A repeated image avoided the
+CPU tower (only about 0.14 ms upload time remained).
+
+For a four-frame red-circle-to-blue-square video, CPU and GPU return the same correct answer
+when explicitly asked to identify the first and final frames. With the broader video-summary
+prompt, both omit one scene (CPU describes the red circle, GPU the blue square). The explicit
+probe verifies that both temporal segments are usable; it does not establish general video
+description accuracy. CPU visual arithmetic remains an opt-in numerical profile.
+
 ## Experimental long-context concurrency (2026-10-20)
 
 Long attention admits startup-fixed **1–8 active requests** on SM70 27B TP2

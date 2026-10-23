@@ -77,6 +77,11 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
 };
 
+enum class VisionDevice : std::uint8_t {
+    Gpu,
+    Cpu,
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
@@ -144,6 +149,8 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // CPU keeps the complete visual encoder in host RAM; only embeddings reach the GPU.
+    VisionDevice vision_device             = VisionDevice::Gpu;
     // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
     // use min(max_context, vision_max_tokens), independent of the text context ceiling.
     std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;

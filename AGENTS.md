@@ -114,7 +114,8 @@ measurements of this target. The supported identities are
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
 `qwen3.6-35b-a3b/groupwise-int`.
 The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
-SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2 and both experimental decode profiles. It registers the published QUASAR v3 container identity, preserves its
+SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2 and the fast-decode numerical profile. Vision admits the default-off
+long-attention profile on TP2 with complete INT8 group-64 KV. It registers the published QUASAR v3 container identity, preserves its
 256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
 controls and optional W8/BF16 DFlash2 package. The 27B draft window remains at most seven.
 This artifact's QAT/conversion quality is not established by inference smoke tests.
@@ -150,10 +151,25 @@ The 27B draft window is at most seven. On this V100X2, the verified DFlash profi
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
 The optional `volta_long_attention` profile admits SM70 27B TP2/PP1 experimental 1–8-request
-Text/None/MTP with complete INT8 group-64 KV, without Vision or RAM-KV. It retains every
+Text/Vision with None/MTP and complete INT8 group-64 KV, without RAM-KV. It retains every
 causally visible key but changes split partitioning, softmax association and PV accumulation;
 it is default-off and not bit-equivalent to ordinary attention. The 104-question local GPQA
 comparison is behavioral evidence, not a full 198-question evaluation or proof of losslessness.
+
+Vision optionally uses `VisionDevice::Cpu` / `--vision-device cpu` with `--vision`. Its tower
+weights decode once from original signed groupwise codes and exact FP16 scales into one FP32
+host copy, without requantization or GPU tower residency. This explicit CPU representation is
+not a GPU repacking path. Family-owned host scheduling keeps BF16 activation boundaries, 2-D
+RoPE, complete temporal-segment attention and the merger. Only final BF16 embeddings upload.
+CPU encoding runs on the submitting host thread after ingress-capacity reservation and before
+joining the GPU FIFO; it neither locks the GPU executor nor changes text/decode leaves. A caller's
+explicit submission deadline and cancellation cover CPU work; the default queue timeout starts after staging.
+Each request references immutable embeddings in a Program-local 128 MiB FIFO cache, keyed by media
+digest, modality and grid, never the frontend's shared media cache. The CPU/GPU
+arithmetic and long attention need not produce identical embeddings, logits or output. Real
+qualification for this release uses the QUASAR v3 TP2/MTP4 artifact; no new GPQA is claimed.
+Release 0.1.2 contains these Vision changes and an optional qualified Linux SM70 prebuilt;
+QUASAR TP4 qualification is reserved for 0.2.0 and must not be imported from the dirty TP4 workspace.
 
 The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP2
 Text/None/MTP. It selects packed NVFP4 parents with FP32 scale-after-K-reduction and

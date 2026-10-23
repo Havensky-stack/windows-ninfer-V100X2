@@ -291,7 +291,12 @@ class NInferGui(QWidget):
             "完整 GPU KV 的纯文本 None/MTP 支持；恢复旧枝需 RAM→GPU 传输。")
         self.vision = QCheckBox("开启视觉（图片 / 视频）")
         self.vision.setToolTip("对应 --vision；默认关闭，需重启 API。关闭时不加载视觉 GPU 权重。\n"
-                               "开启时关闭两个纯文本实验开关和前缀复用（可手动启用缓存）；视觉预算与文本容量独立。")
+                               "开启时关闭快速数值路径和前缀复用（可手动启用缓存）；视觉预算与文本容量独立。")
+        self.vision_device = QComboBox()
+        self.vision_device.addItems(["gpu", "cpu"])
+        self.vision_device.setToolTip("GPU：较快；CPU：视觉塔仅驻主机 RAM，图片/视频编码较慢，文本推理仍在 GPU。\n"
+                                      "CPU 使用 FP32 计算并保留 BF16 激活边界，输出可能有数值差异，未做 GPQA。\n"
+                                      "CPU 模式将 API 准备/排队超时设为 10 分钟，以容纳慢速媒体编码。")
         self.vision_max_tokens = self._spin(1024, 1, 32768, 128)
         self.vision_max_tokens.setToolTip("每个请求的图片/视频合计视觉 token 上限；增加会占用更多显存。")
         self.volta_fast_decode = QCheckBox("实验：NVFP4 / MTP 快速数值路径")
@@ -310,10 +315,10 @@ class NInferGui(QWidget):
             "前序近无损界限仅9/25点通过；当前组合GPQA未跑，智力影响未知。\n"
             "默认关闭，需重启 API。")
         self.volta_long_attention.setToolTip(
-            "对应 --volta-long-attention；SM70 27B / TP2 / INT8 KV / 并发1–8 / 纯文本 None/MTP。\n"
+            "对应 --volta-long-attention；SM70 27B / TP2 / INT8 KV / 并发1–8 / 文本或视觉 None/MTP。\n"
             "保留全部历史 KV，改变 softmax/PV 累加顺序；可能改变输出。\n"
             "组合速度约 198.1 tok/s，不代表此开关单项收益；当前组合 GPQA 未测。\n"
-            "默认关闭，需重启 API；不能与视觉、DFlash 或 RAM-KV 一起使用。")
+            "默认关闭，需重启 API；不能与 DFlash 或 RAM-KV 一起使用；视觉可用，快速数值路径仍仅限文本。")
         self.max_concurrency = self._spin(1, 1, 8, 1)
         self.default_max_tokens = self._spin(65536, 1, 1048576, 1024)
         self.api_key = QLineEdit()
@@ -371,6 +376,7 @@ class NInferGui(QWidget):
                               ("草稿头", self.lm_head_draft), ("CUDA Graph", self.cuda_graph),
                               ("前缀缓存", self.prefix_reuse), ("历史缓存预算 / tokens", self.prefix_cache_tokens),
                               ("视觉", self.vision),
+                              ("视觉推理设备", self.vision_device),
                               ("视觉 token 预算", self.vision_max_tokens),
                               ("默认最大输出", self.default_max_tokens)):
             inference.addRow(label, widget)
@@ -636,7 +642,7 @@ class NInferGui(QWidget):
                  "presence_penalty frequency_penalty seed port max_context prefill_chunk draft_tokens "
                  "vision_max_tokens pipeline_chunks ram_window max_concurrency default_max_tokens "
                  "tp pp kv_dtype spec lm_head_draft cuda_graph prefix_reuse prefix_cache_tokens volta_long_attention "
-                 "volta_fast_decode vision ram_kv no_thinking preserve_thinking greedy cors")
+                 "volta_fast_decode vision vision_device ram_kv no_thinking preserve_thinking greedy cors")
         return {name: getattr(self, name) for name in names.split()}
 
     def configuration(self) -> dict:
@@ -653,6 +659,8 @@ class NInferGui(QWidget):
         return values
 
     def _validate_configuration(self, values: dict) -> None:
+        if isinstance(values, dict):
+            values = {"vision_device": "gpu", **values}
         widgets = self._option_widgets()
         if not isinstance(values, dict) or set(values) != set(widgets):
             raise ValueError("配置项不完整或包含未知字段")
@@ -672,6 +680,7 @@ class NInferGui(QWidget):
             validate_sampling(name, values[name])
 
     def apply_configuration(self, values: dict) -> None:
+        values = {"vision_device": "gpu", **values}
         if self.process is not None:
             raise ValueError("请先停止服务再加载配置")
         self._validate_configuration(values)
@@ -846,9 +855,9 @@ class NInferGui(QWidget):
                         spec == "dflash" or self.volta_fast_decode.isChecked() or self.volta_long_attention.isChecked()):
             return "实验 PP2 要求 TP1、两卡、并发1、NVFP4/QUASAR 纯文本 None/MTP；关闭两个数值实验"
         if self.volta_long_attention.isChecked() and (
-                self.vision.isChecked() or tp != 2 or self.kv_dtype.currentText() != "int8" or
+                tp != 2 or self.kv_dtype.currentText() != "int8" or
                 self.ram_kv.isChecked() or spec not in {"none", "mtp"}):
-            return ("实验性长上下文注意力要求 TP2、INT8 KV、并发 1–8、后端为 none 或 mtp、关闭视觉；"
+            return ("实验性长上下文注意力要求 TP2、INT8 KV、并发 1–8、后端为 none 或 mtp、支持视觉；"
                     "请调整配置或取消勾选该开关。硬件和模型还须为 SM70 27B。")
         if self.volta_fast_decode.isChecked() and (tp != 2 or self.vision.isChecked() or
                                                     spec not in {"none", "mtp"}):
@@ -923,7 +932,10 @@ class NInferGui(QWidget):
         if self.volta_fast_decode.isChecked():
             args.append("--volta-fast-decode")
         if self.vision.isChecked():
-            args += ["--vision", "--vision-max-tokens", str(self.vision_max_tokens.value())]
+            args += ["--vision", "--vision-device", self.vision_device.currentText(),
+                     "--vision-max-tokens", str(self.vision_max_tokens.value())]
+            if self.vision_device.currentText() == "cpu":
+                args += ["--pending-timeout-ms", "600000"]
         if self.api_key.text():
             args += ["--api-key", self.api_key.text()]
         if self.no_thinking.isChecked():
@@ -971,7 +983,7 @@ class NInferGui(QWidget):
             kv_dtype=self.kv_dtype.currentText(), chunk=self.prefill_chunk.value(),
             backend=self.spec.currentText(), drafts=self.draft_tokens.value(),
             optimized=self.lm_head_draft.isChecked(), concurrency=self.max_concurrency.value(),
-            vision=self.vision.isChecked(), vision_tokens=self.vision_max_tokens.value(),
+            vision=self.vision.isChecked(), vision_device=self.vision_device.currentText(), vision_tokens=self.vision_max_tokens.value(),
             graphs=self.cuda_graph.isChecked(), ram_window=self.ram_window.value() if self.ram_kv.isChecked() else 0)
 
     def _refresh_memory_estimate(self) -> None:
@@ -983,6 +995,9 @@ class NInferGui(QWidget):
         except (OSError, ValueError, KeyError, TypeError) as error:
             estimates = []
             note = f"预估不可用：{error}"
+        host_vision = sum(estimate.host_vision_bytes for estimate in estimates)
+        if host_vision:
+            note += f" CPU 视觉塔权重约 {host_vision / GIB:.2f} GiB RAM，另需媒体工作区；图片/视频编码较慢。"
         ids = self.devices.text().split(',')
         count = min(4, int(self.tp.currentText()) * int(self.pp.currentText()))
         for rank, (block, heading, detail, bar) in enumerate(self.memory_rows):
@@ -1068,7 +1083,6 @@ class NInferGui(QWidget):
 
     def _vision_changed(self, enabled: bool) -> None:
         if enabled:
-            self.volta_long_attention.setChecked(False)
             self.volta_fast_decode.setChecked(False)
             # Vision starts with cold requests; users may enable prefix reuse.
             self.prefix_reuse.setChecked(False)
@@ -1076,6 +1090,7 @@ class NInferGui(QWidget):
         self._update_feature_controls()
 
     def _update_feature_controls(self, *_args) -> None:
+        self.vision_device.setEnabled(self.vision.isChecked())
         self.vision_max_tokens.setEnabled(self.vision.isChecked())
         self.pipeline_chunks.setEnabled(self.pp.currentText() == "2")
         self.ram_window.setEnabled(self.ram_kv.isChecked())

@@ -22,6 +22,11 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.speculative.draft_tokens  = drafts ? std::stoul(drafts) : 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.enable_vision             = true;
+    options.vision_max_tokens         = 4096;
+    if (std::getenv("NINFER_TEST_CPU_VISION") != nullptr) {
+        options.vision_device = ninfer::VisionDevice::Cpu;
+    }
+    options.volta_long_attention = std::getenv("NINFER_TEST_LONG_ATTENTION") != nullptr;
     if (std::getenv("NINFER_TEST_TP2") != nullptr) {
         options.tp = 2;
         options.devices = {0, 1};

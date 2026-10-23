@@ -43,6 +43,7 @@ struct Options {
     bool volta_long_attention = false;
     bool volta_fast_decode = false;
     SpeculativeOptions speculative;
+    VisionDevice vision_device = VisionDevice::Gpu;
     bool enable_vision  = false;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
     bool use_cuda_graph = true;

@@ -20,6 +20,21 @@ The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
 
+## v0.1.2: visual long attention and optional CPU Vision
+
+`--volta-long-attention` now accepts TP2 image/video input with None/MTP and complete INT8 KV.
+`--vision --vision-device cpu` keeps the visual tower in host RAM and computes it on CPU;
+only BF16 visual embeddings are uploaded. GUI/TUI expose the same GPU/CPU selection and save it
+in configurations. Image/video encoding is slower; text/model/KV/MTP execution stays on GPU.
+CPU encoding happens before the GPU queue, allowing existing decode requests to continue.
+Both CPU/GPU arithmetic differences and long attention can change outputs; no new GPQA is claimed.
+Fast decode remains text-only. QUASAR TP4 belongs to 0.2.0.
+
+An optional [Linux V100 binary package](docs/prebuilt.md) accompanies this release, alongside
+GitHub's source archives. It bundles runtime libraries and requires a compatible NVIDIA driver,
+not a local CUDA Toolkit. [Docker](docs/docker.md) defaults to pulling the QUASAR v3 artifact
+and opening TUI; its model URL is configurable.
+
 ## v0.1.1: concurrency, historical branches and Responses
 
 Experimental long attention now supports **1–8 active requests** with TP2/MTP4.
@@ -71,7 +86,8 @@ Answers were not graded; no new GPQA or other capability evaluation was run.
 
 `--volta-long-attention` retains every historical KV entry but changes floating-point
 reductions and can change output. `--volta-fast-decode` changes NVFP4/MTP arithmetic.
-Both are off by default and exposed as experiments in GUI/TUI; Vision excludes both.
+Both are off by default and exposed as experiments in GUI/TUI; Vision supports long attention
+and still excludes fast decode.
 A separate 85K-input / 180K-capacity coding fixture measured **198.105 / 198.097 tok/s**
 with both enabled and MTP4. Its current combination has no GPQA result. Throughput depends
 on the task and draft acceptance; this is not a general 200 tok/s result.
@@ -118,13 +134,14 @@ tok/s LM Studio. [Full tables and comparison conditions](docs/llama-comparison.m
 ## Build and launch
 
 Linux, CUDA 12.8, NVIDIA driver, CMake 3.28+, C++20 compiler, Ninja, pkg-config,
-FFmpeg development libraries and libcurl are required. The dependency script builds a local
+FFmpeg development libraries, libcurl and LP64 BLAS (OpenBLAS recommended) are required. The dependency script builds a local
 prefix when system versions are too old.
 
 ```bash
 bash tools/v100/build_dependencies.sh
 PKG_CONFIG_PATH="$PWD/build/_deps/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
 cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$PWD/build/_deps/install" \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=70 -DBUILD_TESTING=OFF
 cmake --build build-v100 --target ninfer ninfer-serve -j2
@@ -151,7 +168,7 @@ The initial configuration library includes **Vision / 248000 context / 1024 visu
 and **Text / 262144 context / long attention**; both use MTP4 with fast decode off.
 Select a configuration and click Load, then check the model and executable paths for your
 machine. The supplied paths are `models/quasar-v3/qwen3_8_27b_nvfp4.ninfer` and
-`build-v100-tp4/apps/ninfer-serve`; use `build-v100/apps/ninfer-serve` for the build above.
+`build-v100/apps/ninfer-serve`; set the model path to your actual download location.
 KV follows context capacity unless the separate KV control is expanded. Vision changes
 take effect after a server restart. [Configuration and model-path setup](docs/gui.md).
 

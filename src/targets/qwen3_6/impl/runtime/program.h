@@ -16,6 +16,7 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "targets/qwen3_6/impl/vision/host.h"
 
 #include <cstdint>
 #include <array>
@@ -340,6 +341,7 @@ public:
     void reset_memory_peaks() noexcept;
 
     const LoadedModelData& model;
+    mutable qwen3_6::HostVisionCache host_vision_cache;
     ExecutionContext& execution;
     DeviceContext& device;
     const int device_count;

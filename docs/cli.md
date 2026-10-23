@@ -56,7 +56,8 @@ GPU residency is frozen when the Engine starts:
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
-- `--vision` loads those allocations and enables image/video input.
+- `--vision` enables image/video input. `--vision-device gpu` (default) loads those GPU allocations;
+  `--vision-device cpu` instead keeps the tower in host RAM and reserves only the GPU embedding transient.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
@@ -186,12 +187,13 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
-| `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/PP1, 1–8 active requests, INT8 KV, Text/None/MTP only; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/PP1, 1–8 active requests, INT8 KV, Text/Vision None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
 | `--volta-fast-decode` | experimental QUASAR SM70 TP2 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-device gpu\|cpu` | visual encoder placement; requires `--vision` for CPU; CPU weights remain in host RAM, final BF16 embeddings upload; may change numerical outputs | `gpu` |
 | `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
@@ -334,3 +336,28 @@ growth.
 
 All weight, sequence, workspace, request-transient, and graph allocations are released when the
 Engine is destroyed.
+
+## CPU visual encoding (0.1.2)
+
+Use `--vision --vision-device cpu` to trade visual encoding latency and host RAM for lower GPU
+residency. Source codes and FP16 group scales are decoded exactly to one FP32 host copy on load;
+there is no new weight quantization. CPU Ops retain BF16 activation/result boundaries, 2-D RoPE,
+all causally permitted language keys and all keys within each temporal vision segment. CPU and
+CUDA reduction/GEMM arithmetic are not bit-identical, so embeddings and output can differ.
+No new GPQA or task-accuracy percentage is available.
+
+CPU visual encoding runs in the submitting thread after the bounded ingress slot is reserved,
+before the request joins the GPU FIFO. It reads immutable weights and does not hold the GPU
+execution lock; other requests may continue decoding. Explicit submission deadlines and cancellation also bound
+CPU work; the ordinary Engine default queue timeout begins after encoding. Request references are
+freed after their GPU consumers finish. A Program-local immutable embedding cache retains at most 128 MiB in FIFO order, keyed by media digest, modality and grid;
+repeated images do not rerun the CPU tower. This cache is separate from the text KV history budget. Large media still consumes host scratch
+space in addition to resident tower weights. CPU placement does not enable Vision on unsupported
+artifacts, TP4, PP2, DFlash or sparse RAM-KV.
+For serving large CPU media, increase `--pending-timeout-ms` (for example `600000`); the server
+default of 30 seconds still covers preparation and can expire during CPU encoding. GUI/TUI select
+600000 ms when CPU Vision is enabled. The deadline is finite and can still reject oversized work.
+
+`--volta-long-attention` can be combined with GPU or CPU Vision on SM70 27B TP2/PP1, complete
+INT8 group-64 KV, None/MTP and experimental concurrency 1–8. It remains default-off and changes
+floating-point association. `--volta-fast-decode` remains incompatible with Vision.

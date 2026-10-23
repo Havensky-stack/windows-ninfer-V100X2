@@ -62,6 +62,10 @@ endif()
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
+add_library(ninfer_host_ops STATIC ops/host/vision.cpp)
+ninfer_internal_includes(ninfer_host_ops)
+target_link_libraries(ninfer_host_ops PUBLIC ninfer_core PRIVATE BLAS::BLAS)
+
 add_library(ninfer_ops STATIC
   ops/linear/ggml_k/ggml_k.cu
   ops/common/allreduce.cu
@@ -341,6 +345,7 @@ endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+target_link_libraries(ninfer_ops PRIVATE ninfer_host_ops)
 target_link_libraries(ninfer_ops PRIVATE ${CMAKE_DL_LIBS})
 if(TARGET ninfer_nvfp4_tma)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_tma)

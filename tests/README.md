@@ -359,3 +359,19 @@ A permanent test should protect one current risk, such as:
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
+
+## CPU Vision and visual long attention (0.1.2)
+
+`ninfer_host_vision_test` runs without a GPU. It checks exact signed-code/FP16-scale decoding for
+all real tower/merger matrix shapes, FP64 linear and full segmented attention oracles, independent
+LayerNorm/GELU/RoPE/position interpolation, and BF16 representation. The CPU path retains original
+mathematical weights and BF16 Op outputs; pairwise GPU equality is not its numerical oracle.
+
+`ninfer_quasar_load_plan_test` checks that CPU Vision places every tower object on host and none
+on either GPU, while GPU Vision remains primary-rank-only. `ninfer_qwen3_6_27b_prefix_real_test`
+accepts `NINFER_TEST_CPU_VISION=1` and `NINFER_TEST_LONG_ATTENTION=1` alongside the existing TP2
+and MTP4 settings to exercise real cross-chunk media, continuation, edited media and MTP state.
+`ninfer_vision_long_real_test` accepts `--cpu`, `--image`, `--eager`, `--prompt-tokens N` and
+`--output-tokens N`; set the exact `NINFER_QUASAR_ARTIFACT` path. Its default is 85,000 occupied
+text tokens with GPU Vision enabled, long attention and MTP4; it prints JSON wall timing,
+acceptance, memory and committed IDs. These checks are not GPQA or proof of checkpoint quality.

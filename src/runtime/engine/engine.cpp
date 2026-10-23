@@ -331,7 +331,7 @@ ModelSamplingDefaults Engine::sampling_defaults() const {
 }
 
 GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
-                                std::chrono::steady_clock::time_point pending_deadline) {
+                                const PreparationControl& control) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
 
@@ -373,7 +373,7 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else {
                 auto submission = executor->submit(std::move(prompt.impl_->value), prompt_summary,
                                                    prepare_seconds, std::move(resolved_options),
-                                                   pending_deadline);
+                                                   control);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
                     impl_, std::move(submission), resolved_sampling));
             }
@@ -383,7 +383,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
                                   const CancellationView& cancellation) {
-    return submit(std::move(prompt), std::move(options)).wait(sink, cancellation);
+    return submit(std::move(prompt), std::move(options), PreparationControl{.cancellation = cancellation})
+        .wait(sink, cancellation);
 }
 
 const EngineOptions& Engine::options() const {

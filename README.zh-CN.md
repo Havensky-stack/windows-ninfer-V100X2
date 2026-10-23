@@ -16,6 +16,17 @@
 91.41%；AIME'26 两者均为 100%。这些是外部源模型成绩，不是本机转换后的质量分数，
 也不代表数学无损。[公开来源、独立对比和限制](docs/model-quality.md)。
 
+## v0.1.2：视觉长注意力与可选 CPU 视觉塔
+
+- 实验性完整历史长注意力支持 TP2 图片/视频、None/MTP、完整 INT8 KV；快速数值路径仍仅限文本。
+- 新增 `--vision --vision-device cpu`，视觉塔只驻主机 RAM、CPU 编码，最后上传 BF16 视觉特征。
+  GUI/TUI 可选 GPU/CPU 并保存到配置；显存预估同步区分 CPU 权重和 GPU 特征缓冲。
+- CPU 编码在进入 GPU 队列前进行，已有请求可以继续解码；图片/视频首字会更慢。
+  CPU/GPU 数值路径和长注意力可能改变输出，未做新 GPQA，不宣称无损。
+- 提供可选的 [Linux x86_64 / V100 预编译包](docs/prebuilt.md)和源码包；不含模型、驱动或 Qt。
+- [Docker](docs/docker.md) 默认下载 QUASAR v3 后打开 TUI，支持指定其他模型链接。
+  QUASAR TP4 的资格验证留给 **0.2.0**。
+
 ## v0.1.1：并发、历史分枝缓存与 Responses
 
 实验长注意力现支持 **1–8 个活跃请求**，使用 TP2/MTP4。实际同时执行的请求数仍受共享
@@ -62,7 +73,7 @@ CUDA Graphs、chunk 2560，**快速数值路径均关闭**；无视觉配置开�
 
 `--volta-long-attention` 保留全部历史 KV，但改变浮点归约，输出可能变化；
 `--volta-fast-decode` 改变 NVFP4/MTP 算术路径。两者均默认关闭，在 GUI/TUI 的实验入口选择，
-视觉模式不支持。另一份 **85K 实际输入、180K 容量的代码任务**，同时开启两者时测得
+视觉模式现可使用长注意力，仍不支持快速数值路径。另一份 **85K 实际输入、180K 容量的代码任务**，同时开启两者时测得
 **198.105 / 198.097 tok/s**，仍使用 MTP4，当前组合未跑 GPQA。
 速度取决于任务与草稿接受率，不能据此宣称通用 200 tok/s。
 [数值影响与已保留的解码优化](docs/performance.md#quasar-v3-mtp4-retained-decode-profile-2026-10-19)。
@@ -111,6 +122,7 @@ pkg-config、FFmpeg 开发库和 libcurl。系统版本不足时先构建本地�
 bash tools/v100/build_dependencies.sh
 PKG_CONFIG_PATH="$PWD/build/_deps/install/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
 cmake -S . -B build-v100 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$PWD/build/_deps/install" \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc \
   -DCMAKE_CUDA_ARCHITECTURES=70 -DBUILD_TESTING=OFF
 cmake --build build-v100 --target ninfer ninfer-serve -j2
@@ -135,8 +147,8 @@ bash tools/v100/ninfer-gui.sh
 导入/导出与删除，首次配置库包含两份默认配置：**视觉 / 248000 上下文 / 1024 视觉预算**，
 以及**无视觉 / 262144 上下文 / 长注意力**；两份均为 MTP4，快速数值路径关闭。
 选择配置后点击“加载”，再核对本机模型与程序路径。内置文件中分别为
-`models/quasar-v3/qwen3_8_27b_nvfp4.ninfer` 和 `build-v100-tp4/apps/ninfer-serve`，
-按上方命令构建时将程序路径改为 `build-v100/apps/ninfer-serve`。
+`models/quasar-v3/qwen3_8_27b_nvfp4.ninfer` 和 `build-v100/apps/ninfer-serve`，
+请将模型路径改为实际下载位置。
 KV 默认跟随上下文，展开“独立 KV”后才单独设置；视觉开关在重启服务后生效。
 [配置管理与模型路径设置](docs/gui.md)。
 

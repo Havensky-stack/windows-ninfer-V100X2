@@ -12,6 +12,7 @@ target_sources(ninfer_engine PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/state/round_state.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/runtime/visual_scatter.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/bindings.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/host.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/impl/vision/control.cpp)
 
 target_include_directories(ninfer_engine PRIVATE

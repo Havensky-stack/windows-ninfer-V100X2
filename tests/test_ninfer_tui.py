@@ -51,11 +51,17 @@ class LaunchContract(unittest.TestCase):
         command = self.settings.command()
         self.assertIn('--vision', command)
         self.assertEqual(command[command.index('--vision-max-tokens') + 1], '1024')
-        for field in ('long_attention', 'fast_decode'):
-            setattr(self.settings, field, True)
-            with self.assertRaises(ValueError):
-                self.settings.validate()
-            setattr(self.settings, field, False)
+        self.settings.long_attention = True
+        self.settings.vision_device = 'cpu'
+        self.settings.validate()
+        command = self.settings.command()
+        self.assertEqual(command[command.index('--vision-device') + 1], 'cpu')
+        self.assertEqual(command[command.index('--pending-timeout-ms') + 1], '600000')
+        self.settings.fast_decode = True
+        with self.assertRaises(ValueError):
+            self.settings.validate()
+        self.settings.fast_decode = False
+        self.settings.long_attention = False
         self.settings.backend = 'dflash'
         with self.assertRaises(ValueError):
             self.settings.validate()

@@ -19,6 +19,7 @@ inline constexpr std::size_t kVirtualStorageDevices = 2;
 enum class TensorPlacement : std::uint8_t {
     Device,
     PrimaryDevice,
+    Host,
     ValidateOnly,
 };
 
@@ -138,6 +139,7 @@ public:
     void materialize_virtual_rows(ObjectHandle handle,
                                   std::array<SliceRange, kVirtualStorageDevices> ranges);
     void retain_on_host(ObjectHandle handle);
+    void materialize_on_host(ObjectHandle handle);
     void validate_only(ObjectHandle handle);
     void validate_unconsumed_matching(std::string_view prefix = "");
     MaterializationPlan finish();
