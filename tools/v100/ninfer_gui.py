@@ -300,7 +300,7 @@ class NInferGui(QWidget):
         self.vision_max_tokens = self._spin(1024, 1, 32768, 128)
         self.vision_max_tokens.setToolTip("每个请求的图片/视频合计视觉 token 上限；增加会占用更多显存。")
         self.volta_fast_decode = QCheckBox("实验：NVFP4 / MTP 快速数值路径")
-        self.volta_long_attention = QCheckBox("实验：完整历史长注意力")
+        self.volta_long_attention = QCheckBox("实验：完整历史长注意力（文本 / 图片 / 视频）")
         self.ram_kv = QCheckBox("实验：RAM-KV 近似历史检索")
         self.ram_window = self._spin(32768, 64, 262144, 64)
         self.ram_budget = QLineEdit("32000000000")
@@ -317,7 +317,7 @@ class NInferGui(QWidget):
         self.volta_long_attention.setToolTip(
             "对应 --volta-long-attention；SM70 27B / TP2 / INT8 KV / 并发1–8 / 文本或视觉 None/MTP。\n"
             "保留全部历史 KV，改变 softmax/PV 累加顺序；可能改变输出。\n"
-            "组合速度约 198.1 tok/s，不代表此开关单项收益；当前组合 GPQA 未测。\n"
+            "纯文本与快速数值路径组合约 198.1 tok/s，不代表视觉或此开关单项收益；当前组合 GPQA 未测。\n"
             "默认关闭，需重启 API；不能与 DFlash 或 RAM-KV 一起使用；视觉可用，快速数值路径仍仅限文本。")
         self.max_concurrency = self._spin(1, 1, 8, 1)
         self.default_max_tokens = self._spin(65536, 1, 1048576, 1024)
@@ -407,7 +407,7 @@ class NInferGui(QWidget):
         experimental.addRow("RAM archive bytes", self.ram_budget)
         experimental.addRow("流水线 PP", self.pp)
         experimental.addRow("PP prefill chunks", self.pipeline_chunks)
-        attention_note = QLabel("数值实验可能改变输出；RAM-KV 使用近似注意力。")
+        attention_note = QLabel("长注意力支持 TP2 图片/视频；快速数值路径仅限文本。数值实验可能改变输出；RAM-KV 使用近似注意力。")
         attention_note.setObjectName('muted')
         attention_note.setWordWrap(True)
         experimental.addRow(attention_note)
@@ -826,7 +826,9 @@ class NInferGui(QWidget):
 
     def show_experimental_details(self) -> None:
         QMessageBox.information(self, "实验说明",
-            "数值路径 + 长注意力：85K 输入、MTP4、greedy 下组合约 198.1 tok/s；末步 W8 约 +0.84%。\n"
+            "完整历史长注意力支持 TP2 文本、图片和视频，None/MTP、完整 INT8 KV；GPU/CPU 视觉塔均可用。\n"
+            "开启视觉会保留长注意力；快速数值路径仍仅限文本。两项实验默认关闭，修改后需重启 API。\n\n"
+            "纯文本数值路径 + 长注意力：85K 输入、MTP4、greedy 下组合约 198.1 tok/s；末步 W8 约 +0.84%。\n"
             "不是各开关的独立增幅。前序组合 25 点 argmax 一致，最小 cosine 0.998831，最大 KL 0.001903；\n"
             "near-lossless 仅 9/25 通过，当前组合未测 GPQA。可能改变输出和草稿接受位置。\n\n"
             "RAM-KV 在长 prefill 和 decode 中使用检索历史，可能降低长上下文质量；收益未测。\n"

@@ -74,7 +74,9 @@ disables prefix reuse to match the 85K timing setup. The normal MTP4 preset keep
 defaults and prefix reuse. `i` explains the combined ~198.1 tok/s result, the final W8 step's
 ~0.84% gain, and the prior 25-point logit evidence (9/25 near-lossless, max KL 0.001903103).
 IQ/task-accuracy impact is unknown; the current combination has no GPQA result. Gains are not
-independent per-switch ratios. Vision accepts long attention but rejects fast decode; DFlash rejects both experiments.
+independent per-switch ratios and do not describe Vision throughput. `Long attention (Text/Vision)`
+also supports TP2 images/video with either GPU or CPU vision encoding and complete INT8 KV;
+`Fast math (Text only)` excludes Vision. DFlash rejects both experiments.
 Relative edited paths are resolved from the repository root, matching the child working directory.
 The [QUASAR measurements](performance.md) describe its 85K coding workload and quality limits.
 TP4 needs four suitable devices and the corresponding artifact; see [TP4/NVLink](tp4.md).
