@@ -11,10 +11,12 @@ comparison, CUDA 12.8 build and API launch. Other hardware and experiments have 
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, dual-GPU (`--tp 2`) execution, and common runtime options |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, dual-GPU serving, and YaRN extended context |
 | [TUI / 终端启动器](tui.md) | SSH/local terminal API launch, explicit model/device selection, MTP/DFlash presets, live logs and owned-process stop |
+| [Docker](docker.md) | CUDA 12.8 / V100 image, automatic QUASAR download, custom model URLs, persistent settings and default TUI |
 | [PyQt 控制台](gui.md) | 图形化启动/停止 API、TP/设备、上下文/KV、MTP/DFlash、缓存、并发和采样参数 |
 | [QUASAR performance](performance.md) | local 85K code, concurrent throughput, DFlash JSONL, task matrix, numerical limits and partial GPQA |
 | [llama.cpp / LM Studio](llama-comparison.md) | historical same-Q4_K_M controls and comparison conditions |
 | [TP4 / NVLink](tp4.md) | separate four-V100 host, official NVFP4/native FP8, API and 1Cat controls |
+| [WSL2](wsl/README.md) | experimental V100 TP2 deployment, measured bottlenecks and 0.2.0 adaptation work |
 | [Other V100 measurements](performance-v100.md) | official NVFP4, Q4_K_M, transport and prefix-cache controls |
 | [RAM-KV / PP2 experiments](experiments.md) | approximate retrieval and layer-pipeline measurements |
 | [Alternative models / Vision](alternatives.md) | Q4_K_M conversion and opt-in official-NVFP4 Vision |

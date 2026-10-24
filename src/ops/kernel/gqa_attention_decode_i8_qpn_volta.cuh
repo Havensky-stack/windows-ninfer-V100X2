@@ -15,11 +15,11 @@ __device__ __forceinline__ void gqa_single_qpn_pv_half(half2 (&d)[4], unsigned a
                  : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
 }
 
-// TP2 T=1 has six query rows per KV head. Independent Volta quadpairs fill an
+// TP2/TP4 T=1 have six query rows per KV head. Independent Volta quadpairs fill an
 // 8-row x 32-dimension PV tile, avoiding the generic kernel's 32-row padding.
 // The default profile retains 16-key partition boundaries, eight-key softmax
 // updates and FP16 PV contributions; the opt-in long profile uses FP32 PV.
-template <bool MultiBatch, bool Masked, typename CacheInput, bool LongProfile>
+template <typename G, bool MultiBatch, bool Masked, typename CacheInput, bool LongProfile>
 __global__ __launch_bounds__(256, 2) void gqa_attention_single_qpn_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
     std::int8_t* keys, std::int8_t* values, half* key_scales, half* value_scales,
@@ -28,7 +28,7 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_single_qpn_volta_partial
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
     float scale, __nv_bfloat16* partial, float* partial_m, float* partial_l) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
-    using G = Gqa27Tp2Geometry;
+    static_assert(G::QHeads == 12 || G::QHeads == 6);
     constexpr int D = kGqaHeadDim, Bc = 32, Stride = D + 8, PStride = Bc + 8;
     constexpr int Vector = 16;
     constexpr float Log2E = 1.4426950408889634074f;

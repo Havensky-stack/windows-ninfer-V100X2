@@ -1,6 +1,6 @@
 services:
   ninfer:
-    image: ninfer:v100
+    image: ${NINFER_IMAGE:-ninfer-v100:0.2.0}
     build:
       context: .
       args:

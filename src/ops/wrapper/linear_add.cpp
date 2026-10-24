@@ -440,6 +440,43 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
     validate_add_split_residency(x, w, residual, ec);
 
 #ifdef NINFER_VOLTA_BUILD
+    bool published_tp4 = ec.device_count == 4 && policy == LinearPolicy::A16Only &&
+                         x[0].ne[1] <= 8 && norm && norm->weight.size() == 4 &&
+                         norm->output.size() == 4 && events.packet_storage(0);
+    for (int rank = 0; rank < ec.device_count && published_tp4; ++rank) {
+        published_tp4 &= ec.dev[rank]->sm() == 70 && w[rank].qtype == QType::NVFP4 &&
+                         w[rank].layout == QuantLayout::VoltaQpnPrepacked &&
+                         w[rank].n == 5120 && (w[rank].k == 1536 || w[rank].k == 4352) &&
+                         aligned_to(residual[rank].data, 16) &&
+                         aligned_to(norm->weight[rank].data, 16) &&
+                         aligned_to(norm->output[rank].data, 16);
+    }
+    if (published_tp4) {
+        for (int rank = 0; rank < 4; ++rank) {
+            require_tensor(residual[rank], DType::BF16, 5120, x[rank].ne[1], "residual");
+            if (x[rank].dtype == DType::FP16) {
+                // Gated norm and SwiGLU can carry their BF16-rounded FP16 images directly
+                // into the published quarter-shard output/down projection.
+                require_tensor(x[rank], DType::FP16, w[rank].k, x[rank].ne[1], "x");
+                detail::validate_nvfp4_weight(w[rank], "NVFP4 TP4 FP16-image projection");
+                if (!aligned_to(x[rank].data, 16) || overlaps(x[rank], residual[rank])) {
+                    throw std::invalid_argument("NVFP4 TP4 FP16-image projection: invalid input");
+                }
+            } else {
+                validate_linear_semantics(x[rank], w[rank], residual[rank], policy);
+            }
+            if (!workspace[rank]) throw std::invalid_argument("TP4 QPN publication needs workspace");
+        }
+        const std::array<void*, 4> storage{events.packet_storage(0), events.packet_storage(1),
+                                         events.packet_storage(2), events.packet_storage(3)};
+        detail::for_each_rank(ec, [&](int rank) {
+            detail::nvfp4_linear_add_qpn_publish4(x[rank], w[rank],
+                rank == 0 ? residual[rank] : Tensor{}, residual[rank], *workspace[rank],
+                storage, rank, PeerEvents::kPacketMaxBytes, ec.dev[rank]->stream);
+        });
+        detail::allreduce_published_sum_rmsnorm(residual, staging, *norm, ec, events);
+        return;
+    }
     bool out_of_place_qpn = ec.device_count == 2 && policy == LinearPolicy::A16Only &&
                             x[0].ne[1] <= 8;
     for (int rank = 0; rank < ec.device_count; ++rank) {
@@ -507,13 +544,10 @@ void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> 
     });
     // allreduce_sum owns staging residency, shape and non-overlap checks, and the selected
     // reduction profile. Public numerical evidence compares directly with the complete formula.
-    allreduce_sum(std::span(target).first(ec.device_count), staging, ec, events);
     if (norm != nullptr) {
-        detail::for_each_rank(ec, [&](int rank) {
-            Tensor normalized = norm->output[rank];
-            rmsnorm(residual[rank], norm->weight[rank], norm->eps, norm->unit_offset,
-                    normalized, ec.dev[rank]->stream);
-        });
+        allreduce_sum_rmsnorm(std::span(target).first(ec.device_count), staging, *norm, ec, events);
+    } else {
+        allreduce_sum(std::span(target).first(ec.device_count), staging, ec, events);
     }
 }
 

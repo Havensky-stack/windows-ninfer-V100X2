@@ -174,7 +174,8 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     Tensor& cache_v_scale = cache.v_scale_pages;
 
 #ifdef NINFER_VOLTA_BUILD
-    if constexpr (Geometry::QHeads == 12 && (TokenTile == 5 || TokenTile == 6)) {
+    if constexpr ((Geometry::QHeads == 12 || Geometry::QHeads == 6) &&
+                  (TokenTile == 5 || TokenTile == 6)) {
         if (volta_long_attention && implementation_window > 16390) {
             const __nv_bfloat16* new_k = nullptr;
             const __nv_bfloat16* new_v = nullptr;
@@ -187,7 +188,7 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
             return;
         }
     }
-    if constexpr (Geometry::QHeads == 12 && TokenTile == 1) {
+    if constexpr ((Geometry::QHeads == 12 || Geometry::QHeads == 6) && TokenTile == 1) {
         if (implementation_window > 16390) {
             const __nv_bfloat16* new_k = nullptr;
             const __nv_bfloat16* new_v = nullptr;
@@ -224,13 +225,13 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     static_cast<__nv_bfloat16*>(partial_acc.data),
                     static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
         };
-        if constexpr (Geometry::QHeads == 12 && TokenTile == 5) {
+        if constexpr ((Geometry::QHeads == 12 || Geometry::QHeads == 6) && TokenTile == 5) {
             if (implementation_window > 16390) {
                 launch_volta.template operator()<8>();
             } else {
                 launch_volta.template operator()<4>();
             }
-        } else if constexpr (Geometry::QHeads == 12 && TokenTile == 4) {
+        } else if constexpr ((Geometry::QHeads == 12 || Geometry::QHeads == 6) && TokenTile == 4) {
             if (implementation_window > 16390) {
                 launch_volta.template operator()<8>();
             } else {
@@ -462,9 +463,9 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
     const dim3 reduce_grid(Geometry::QHeads, div_up(kGqaHeadDim, kDChunk),
                            invocation.width * invocation.batch_size);
     const auto launch_reduce = [&]<bool Int8, bool MultiBatch, bool Masked, bool Offset>() {
-        const auto launch_staged = [&]<int SplitTile>() {
+        const auto launch_staged = [&]<int SplitTile, bool DirectNumerator = false>() {
             gqa_attention_small_t_reduce_output_kernel<Geometry, kDChunk, Int8, MultiBatch, Masked,
-                                                       Offset, SplitTile>
+                                                       Offset, SplitTile, DirectNumerator>
                 <<<reduce_grid, kReduceBlock, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(partial_acc.data),
                     static_cast<const float*>(partial_m.data),
@@ -478,7 +479,13 @@ void gqa_attention_small_t_launch_for(const Tensor& q, CacheInput input, const T
                     envelope.volta_long_attention);
         };
 #ifdef NINFER_VOLTA_BUILD
-        if constexpr (Int8 && Geometry::QHeads == 12) {
+        if constexpr (Int8 && Geometry::QHeads == 6) {
+            if (envelope.volta_long_attention && implementation_window > 65536) {
+                launch_staged.template operator()<8, true>();
+                return;
+            }
+        }
+        if constexpr (Int8 && (Geometry::QHeads == 12 || Geometry::QHeads == 6)) {
             if (invocation.width == 5 && implementation_window > 32768) {
                 // Stage twice as many split vectors without changing their summation order.
                 launch_staged.template operator()<16>();

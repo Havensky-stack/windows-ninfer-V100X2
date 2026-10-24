@@ -1200,7 +1200,8 @@ constexpr std::int32_t kShardQueryKeyRows = 2048;  // Q4G64_F16S query_key shard
 constexpr std::int32_t kShardValueZRows   = 6144;  // Q5G64_F16S value_z shard
 
 // TP4 retains the represented NVFP4/FP8-row weight values and BF16 projection boundary.
-// The quarter Linear computes Q|K|V|Z once; two pitched copies publish the disjoint outputs.
+// Wide or non-QPN quarter projections stage Q|K|V|Z; narrow SM70 QPN publishes each section
+// directly, with the same represented BF16 projection boundary.
 std::size_t quarter_projection_workspace(QType qtype, LinearPolicy policy,
                                          std::int32_t min_tokens, std::int32_t max_tokens) {
     if ((qtype != QType::NVFP4 && qtype != QType::FP8_E4M3FN_ROW_BF16S &&
@@ -1221,6 +1222,13 @@ void project_fused_shard(const Tensor& x, const Weight& w, Tensor& qkv, Tensor& 
     if (w.n == 4096) {
         (void)quarter_projection_workspace(w.qtype, policy, x.ne[1], x.ne[1]);
         if (workspace == nullptr) { throw std::invalid_argument("TP4 GDN needs workspace"); }
+#ifdef NINFER_VOLTA_BUILD
+        if (w.qtype == QType::NVFP4 && w.layout == QuantLayout::VoltaQpnPrepacked &&
+            x.ne[1] <= 8) {
+            detail::nvfp4_gdn_input_sm70_launch(x, w, qkv, z, workspace, stream);
+            return;
+        }
+#endif
         auto scope = workspace->scope();
         Tensor packed = workspace->alloc(DType::BF16, {4096, x.ne[1]});
         linear(x, w, packed, policy, *workspace, stream);
@@ -1822,7 +1830,8 @@ void gdn_input_proj_conv_record_column_parallel(
         Tensor record_flat = flatten_columns(record_dst[slot], conv_weight[slot].ne[0], geometry[slot]);
 #ifdef NINFER_VOLTA_BUILD
         if (ec.dev[rank]->sm() == 70 && w.qtype == QType::NVFP4 &&
-            w.layout == QuantLayout::VoltaQpnPrepacked && w.n == 8192 && w.k == 5120 &&
+            w.layout == QuantLayout::VoltaQpnPrepacked &&
+            (w.n == 8192 || w.n == 4096) && w.k == 5120 &&
             geometry[slot].batch == 1 && geometry[slot].width <= 8) {
             auto input = flatten_columns(x[slot], 5120, geometry[slot]);
             detail::nvfp4_gdn_input_sm70_record_launch(input, w, conv_weight[slot],

@@ -13,6 +13,44 @@ history behavior and the advertised OpenAI/Anthropic request schemas are unchang
 `build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
+## Model residency
+
+The GUI/TUI can release GPU residency while retaining one immutable copy of the original `.ninfer`
+container in host RAM. These NInfer control endpoints use the server's configured bearer or
+`x-api-key` authentication; they do not change the OpenAI/Anthropic request formats:
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| GET | `/ninfer/model` | Return model state, retained bytes, progress and active request count |
+| POST | `/ninfer/model/offload` | Copy original container to RAM once, then destroy the GPU Engine |
+| POST | `/ninfer/model/load` | Reconstruct the same configured Engine directly from RAM |
+
+Example status: `{"state":"ram","retained_host_bytes":19782432752,"phase":"ready",`
+`"done":0,"total":0,"active_requests":0,"cache_preserved":false}`. The four states are `gpu`,
+`offloading`, `ram`, `loading`; `done`/`total` are phase-local bytes or work units (zero total means
+indeterminate progress). POST waits until the transition completes; launchers issue it in a worker
+and poll GET separately. Repeating offload in `ram` or load in `gpu` succeeds without doing work.
+
+An active request owns its reservation through response consumption and generation-handle
+destruction. Offload returns **409 `model_busy`** while any such reservation exists; competing
+transitions also return 409. New inference/token-count requests return **503 `model_not_loaded`**
+while offloaded or transitioning. `/health` remains process liveness (`{"status":"ok"}`), including
+in RAM state. Model listing and stored Responses remain accessible. No inference is auto-reloaded.
+
+First offload requires the artifact still on disk and available host RAM covering the complete file
+plus 1 GiB headroom (otherwise **507 `insufficient_host_memory`**). A failed copy leaves the active
+GPU Engine intact. Successful offload releases its model allocations, KV/GDN, workspace and graphs;
+CUDA driver context/module overhead can remain. Recreate uses original codes/scales/divisors and
+the same artifact materialization route, with no disk fallback or requantization. RAM is retained
+after load for subsequent unloads and freed when the server stops. It is ordinary pageable RAM,
+not pinned/locked memory or an RSS limit. Reload failure returns an error and keeps the RAM state
+retryable. Runtime throughput counters remain cumulative across residency cycles.
+
+This is model residency control, **not request pause/resume**: KV, archived prefixes and processed
+media caches are discarded, and the next request starts cold. TP/PP, capacity, Vision placement,
+speculation and all other startup settings remain fixed. Reload rebuilds runtime allocations and
+CUDA Graphs; it is faster storage access, not an instant GPU context restoration.
+
 ## Start the server
 
 ```bash
@@ -600,6 +638,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--prefill-decode-rounds N` | experimental decode rounds between prefill steps while both phases are runnable; `1..64`; larger values favor existing streams and delay the prefilling request's first token | `1` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
@@ -616,12 +655,13 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
 | `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
-| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, experimental concurrency 1–8, INT8 KV, Text/Vision None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
-| `--volta-fast-decode` | experimental QUASAR SM70 TP2 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
+| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/TP4, PP1, experimental concurrency 1–8, INT8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
+| `--max-output-tokens N` | server-wide hard output limit for Chat Completions, Responses and Messages; `0` disables it | `0` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
 | `--vision-device gpu\|cpu` | visual encoder placement; requires `--vision` for CPU; CPU weights remain in host RAM, final BF16 embeddings upload; may change numerical outputs | `gpu` |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
@@ -638,6 +678,11 @@ curl http://127.0.0.1:8080/v1/models \
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
+
+Requests above `--max-output-tokens` return HTTP 400 with code `max_output_tokens_exceeded`
+before model preparation. An omitted default output budget is lowered to this ceiling when needed;
+an explicit `--default-max-tokens` above it is rejected at startup. The Engine additionally limits
+generation to the remaining total context capacity.
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
@@ -722,6 +767,12 @@ capacity returns HTTP 429 with code `server_overloaded`. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
 There is no admission ETA or unbounded overflow queue.
+
+When prefill and decode are both runnable, `--prefill-decode-rounds N` runs up to `N`
+compact decode rounds between bounded prefill steps. The default `1` retains alternation;
+larger values favor existing streams and increase the prefilling request's TTFT. Each round
+still includes every decode-ready lane and processes completion/cancellation at its boundary.
+With one active request, or when only one phase is runnable, this option has no effect.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

@@ -46,7 +46,18 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 65536;
+    int max_output_tokens = 0; // zero leaves the context limit as the only ceiling
 };
+
+inline void validate_output_token_limit(int tokens, const RequestLimits& limits,
+                                        std::string_view param) {
+    if (limits.max_output_tokens > 0 && tokens > limits.max_output_tokens) {
+        throw ApiException(ApiError{400, "invalid_request_error",
+            "Requested output exceeds the server limit of " +
+                std::to_string(limits.max_output_tokens) + " tokens",
+            std::string(param), "max_output_tokens_exceeded"});
+    }
+}
 
 struct CompletionUsage {
     int prompt_tokens     = 0;

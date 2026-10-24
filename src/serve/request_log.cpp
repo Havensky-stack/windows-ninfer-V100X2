@@ -455,6 +455,7 @@ std::string format_server_start_json(
                               {"media_preprocess_threads", options.media_preprocess_threads},
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
+                              {"max_output_tokens", options.max_output_tokens},
                               {"default_thinking", options.enable_thinking},
                               {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"] = Json{{"path", options.artifact_path},
@@ -498,6 +499,7 @@ std::string format_server_start_json(
           {"max_pending_requests", options.max_pending_requests},
           {"pending_timeout_ms", options.pending_timeout_ms},
           {"prefill_chunk", options.prefill_chunk},
+          {"prefill_decode_rounds", options.prefill_decode_rounds},
           {"log_stats_interval_ms", options.log_stats_interval_ms},
           {"kv_cache", kv_cache_name(options.kv_cache)},
           {"vision", options.enable_vision},

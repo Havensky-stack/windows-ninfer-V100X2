@@ -1,11 +1,22 @@
 # NInfer V100X2
 
-[English](README.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [详细测评](docs/performance.md) · [HTTP API](docs/serving.md)
+[English](README.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [详细测评](docs/performance.md) · [HTTP API](docs/serving.md)
 
 **相比 v0.1.0 前的上代解码实现，同一 85K-token 代码任务的已提交 decode 吞吐从 143.46 提升至 198.10 tok/s，约提升 38.1%。**
 两次测评均使用双 V100 16 GB、180K 容量、TP2/MTP4、INT8 KV、CUDA Graphs 和 greedy 采样。
 本代成绩同时开启实验长注意力与快速数值路径，输出可能变化，当前组合未跑 GPQA。
 [本代成绩](docs/performance.md#quasar-v3-mtp4-retained-decode-profile-2026-10-19) · [上代成绩](docs/performance.md#quasar-v3-final-long-context-decode-evaluation)。
+
+此前 220 W 主机的四卡 NVLink 在 **85K 输入、QUASAR/MTP4** 下实测 **283.118 / 283.367 committed wall tok/s**，
+均值 **283.242 ± 0.176**，保留 **220 W / 1200 MHz** 限制。借鉴 1Cat 的通信与 Split-D
+机制后，prefill 从约 1743 提高到 **2334.73 tok/s**。同机现有 1Cat 1.5.1 在相同
+85K/MTP4 任务下为 **98.25 / 102.51 tok/s**，
+首字更快；计算/KV 精度与输出不同，不能当作同质量比较。TP4 普通模式、前缀及实际 85K
+Graph/eager 状态检查已通过。Split-D 和实验数值路径可能改变输出，当前组合未跑 GPQA，
+另一台 **300 W** 主机现以同一 85K/MTP4 fixture 实测 **322.138 / 322.218 tok/s**，
+均值 **322.178**，prefill **2731.60 tok/s**；这是不同主机与功耗条件下的实测，不能视为纯代码提速。
+这些 TP4 改动随 **v0.2.0** 发布，同时提供 Linux SM70 预编译包和 Docker 镜像归档。
+[方法与结果](docs/tp4.md)。
 
 面向 **双卡 Tesla V100-SXM2 16 GB** 的 Qwen3.8-27B 单请求推理，CUDA 12.8 / SM70。
 本机使用 SXM2 转 PCIe，已启用 PCIe P2P，**没有 NVLink**。
@@ -15,6 +26,20 @@
 维护者个人实际体验是跟 FP8 一档的。作者公布的源模型 GPQA-D 为 90.91%，BF16 为
 91.41%；AIME'26 两者均为 100%。这些是外部源模型成绩，不是本机转换后的质量分数，
 也不代表数学无损。[公开来源、独立对比和限制](docs/model-quality.md)。
+
+## v0.2.0：四卡 TP4、模型热卸载与 Docker 成品
+
+QUASAR TP4 Text/MTP4 支持已验证的长注意力与快速解码，两项仍默认关闭。
+300 W 四 V100 主机在 **85K 实际输入**下达到 **322.18 committed tok/s**，
+prefill **2731.60 tok/s**；同机 TP2 为 199.23 tok/s。这里改变了并行宽度，
+不是相同输出或纯代码提速对比。此前 220 W 主机为 283.24 tok/s。
+[完整条件、数值限制与无 P2P 对照](docs/tp4.md)。
+
+GUI/TUI 新增空闲时卸载到内存、从内存重载 GPU；模型保留在 RAM，KV/前缀/媒体缓存清空。
+包含实验性 WSL2 TP2 通信适配。附件提供源码、[Linux SM70 预编译包](docs/prebuilt.md)、
+[可直接加载的 Docker 镜像](docs/docker.md)、校验文件和所打包 FFmpeg 运行库的原版源码。
+Docker 使用相同预编译程序，默认下载模型后进入 TUI。
+服务新增 `--max-output-tokens`，可为三个 API 设置统一输出硬上限。
 
 ## v0.1.2：视觉长注意力与可选 CPU 视觉塔
 
@@ -31,7 +56,8 @@
 
 实验长注意力现支持 **1–8 个活跃请求**，使用 TP2/MTP4。实际同时执行的请求数仍受共享
 KV 容量限制，超出后排队。2K / 16K / 85K 输入矩阵同时报告总解码吞吐与实际批大小。
-**已完成 10/12 组**；85K/4 并发时 GPU 0 掉总线（Xid 79），85K/4、8 并发缺测。
+**12/12 组均已完成**；85K/4、8 受共享 KV 限制以两请求波次排队，decode 分别为
+192.50 / 192.95 tok/s。
 本版不宣称相比 v0.1.0 有额外单请求提速。
 [测量结果和方法](docs/performance.md#experimental-long-context-concurrency-2026-10-20)。
 
@@ -48,7 +74,7 @@ QUASAR INT8 主 KV 加 MTP 在该预算下约占 **12.8 GiB 主机内存**，另
 
 Responses 可用 `reasoning: {"effort": "high"}`，按当前 Qwen 模板映射；`none` 关闭思考。
 七档入参均通过实际端口的流式/非流式检查。[接口说明](docs/serving.md)。
-后续 Release 只提供源码，并记录更新日志及 85K 输入的性能变化。
+Release 记录更新日志及 85K 输入的性能变化；除源码外，按版本附带已验证的预编译包和镜像。
 
 ## QUASAR NVFP4 最新测评 · 2026-10-19
 
@@ -114,6 +140,16 @@ CUDA Graphs、chunk 2560，**快速数值路径均关闭**；无视觉配置开�
 LM Studio 约 62.5–62.8 tok/s。[完整表格与条件](docs/llama-comparison.md)。
 
 ## 构建和启动
+
+Docker 首次启动自动下载 QUASAR NVFP4 v3，随后默认打开 TUI：
+
+```bash
+docker compose build
+docker compose run --rm --service-ports ninfer
+```
+
+按 `s` 加载模型并启动 API。模型和配置保存在命名卷中，换模型可传 `--model HF链接`。
+需要 NVIDIA Container Toolkit；[Docker 配置及完整参数](docs/docker.md)。
 
 需要 Linux、NVIDIA 驱动、CUDA 12.8、CMake 3.28+、C++20 编译器、Ninja、
 pkg-config、FFmpeg 开发库和 libcurl。系统版本不足时先构建本地依赖：
@@ -185,7 +221,7 @@ CLI 用 `build-v100/apps/ninfer`，相同推理参数加 `--prompt TEXT --max-ne
 
 | 文档 | 内容 |
 |---|---|
-| [TP4 / NVLink](docs/tp4.md) | 远端四卡、官方 NVFP4/native FP8、API 与 1Cat 对照 |
+| [TP4 / NVLink](docs/tp4.md) | 远端四卡、QUASAR/官方 NVFP4/native FP8 与同机 TP2 对照 |
 | [其他 V100 测评](docs/performance-v100.md) | 官方 NVFP4、Q4_K_M、P2P/staging、前缀缓存 |
 | [RAM-KV / PP2 实验](docs/experiments.md) | 稀疏检索与启动时固定的分层流水线 |
 | [替代模型 / 视觉](docs/alternatives.md) | Q4_K_M 转换、QUASAR 图片/视频入口 |
@@ -201,8 +237,10 @@ CLI 用 `build-v100/apps/ninfer`，相同推理参数加 `--prompt TEXT --max-ne
 本分支基于 [Neroued/ninfer](https://github.com/Neroued/ninfer)、RTX 3060 TP2 工作和
 [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100)，并参考了
 [plus1998/Ninfer-V100-Duo](https://github.com/plus1998/Ninfer-V100-Duo) 的 Volta NVFP4 路线。
-TP2 BF16 packet-push 通信借鉴 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)
+TP2/TP4 BF16 packet-push 通信借鉴 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)
 的双 epoch 机制，其上游注明来自 [haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100)。
+TP4 直接 attention combine 也参考其 grouped combine；投影调度参考其 QPN kernel 与
+[v100-skinny](https://github.com/dnv2003/v100-skinny)。
 [解码源码调研与接入状态](docs/v100-decode-survey.md)。
 DFlash2 参考 [Inco AI](https://inco.ai/blog/dflash2/) 和
 [草稿 checkpoint](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)；

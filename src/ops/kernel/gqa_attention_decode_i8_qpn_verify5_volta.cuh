@@ -6,14 +6,14 @@
 
 namespace ninfer::ops {
 
-// SM70 TP2 five-query verifier for the optional complete-history long profile.
+// SM70 TP2/TP4 five-query verifier for the optional complete-history long profile.
 // Four 8-row QK warps each own their online softmax. Q fragments are distributed
 // across quadpairs, then broadcast for each contraction: 32 rather than 128 Q
 // registers per lane. K/V reuse the initial Q staging tile after that broadcast
 // representation is resident. Eight dimension warps accumulate PV in FP32.
 // This 32-key softmax/partition profile is not bit-equivalent to the 16-key TC
 // verifier; both are checked against the same decoded-input attention oracle.
-template <bool MultiBatch, bool Masked, typename CacheInput>
+template <typename G, bool MultiBatch, bool Masked, typename CacheInput>
 __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partial_i8_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
     std::int8_t* keys, std::int8_t* values, half* key_scales, half* value_scales,
@@ -22,7 +22,7 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partia
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
     float scale, __nv_bfloat16* partial, float* partial_m, float* partial_l) {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 700
-    using G = Gqa27Tp2Geometry;
+    static_assert(G::QHeads == 12 || G::QHeads == 6);
     constexpr int T = 5, D = kGqaHeadDim, Bc = 32, Stride = D + 8, PStride = Bc + 8;
     constexpr int Rows = T * G::GroupSize, RowTiles = (Rows + 7) / 8;
     constexpr float Log2E = 1.4426950408889634074f;
@@ -171,6 +171,20 @@ __global__ __launch_bounds__(256, 2) void gqa_attention_verify5_qpn_volta_partia
             }
         }
         __syncthreads();
+        // TP4 streams one KV head per rank. Fetch the next tile while the
+        // current tile's QK/softmax/PV runs, without another register buffer.
+        if constexpr (G::QHeads == 6) {
+            if (tid < 64) {
+                const int next_key = tile + Bc + tid / 2;
+                if (next_key < end) {
+                    const int page = pages[(next_key >> kPagedKVPageShift) - first_page];
+                    const auto code = gqa_kv_quant_code_index<G>(
+                        page, head, (tid & 1) * 128, next_key & kPagedKVPageMask);
+                    asm volatile("prefetch.global.L2 [%0];" : : "l"(keys + code));
+                    asm volatile("prefetch.global.L2 [%0];" : : "l"(values + code));
+                }
+            }
+        }
         if (warp < RowTiles) {
             float dot[Bc / 32][8] = {};
 #pragma unroll

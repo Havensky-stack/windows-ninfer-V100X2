@@ -213,6 +213,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .output_rows    = TextConfig::output_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
+                                         .gdn_record_norm_heads =
+                                             plan.features.mtp() && TextConfig::gdn_value_heads / tp == 12
+                                                 ? 12 : 0,
                                          .enable_mtp     = plan.features.mtp(),
                                          .enable_dflash  = plan.features.dflash()});
     out.prefill_hidden = add_tensor(
@@ -420,6 +423,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::I32, 1, logit_columns);
         matrix(layout, DType::FP32, plan.tp, logit_columns);
         matrix(layout, DType::I32, plan.tp, logit_columns);
+        // Head projection may materialize a private A16 input image for small T.
+        // Reserve its maximum two-byte activation image; the Op owns selection.
+        if (logit_columns >= 3 && logit_columns <= 8) {
+            auto image = layout.scope();
+            matrix(layout, DType::FP16, TextConfig::hidden, logit_columns);
+        }
     };
 
     // The MTP round's own tp2 additions. Its three all-reduces share ONE [hidden, T] staging
@@ -442,6 +451,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::I32, 1, logit_columns);
         matrix(layout, DType::FP32, plan.tp, logit_columns);
         matrix(layout, DType::I32, plan.tp, logit_columns);
+        // Full-vocabulary proposal fallback can use the same private input image
+        // as target verification; reserve it independently of head selection.
+        if (logit_columns >= 3 && logit_columns <= 8) {
+            auto image = layout.scope();
+            matrix(layout, DType::FP16, TextConfig::hidden, logit_columns);
+        }
     };
 
     WorkspacePlan out;
@@ -666,10 +681,10 @@ std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions
         throw std::invalid_argument("CPU Vision requires enable_vision");
     }
     if (options.volta_long_attention &&
-        (TextConfig::query_heads != 24 || device.sm() != 70 || options.tp != 2 || options.pp != 1 ||
+        (TextConfig::query_heads != 24 || device.sm() != 70 || (options.tp != 2 && options.tp != 4) || options.pp != 1 ||
          options.kv_cache != KvCacheStorage::Int8Group64 || options.ram_kv.gpu_tokens != 0 ||
          options.speculative.backend == SpeculativeBackend::DFlash)) {
-        throw std::invalid_argument("Volta long attention requires SM70 27B TP2 Text/Vision None/MTP with complete INT8 KV");
+        throw std::invalid_argument("Volta long attention requires SM70 27B TP2/TP4 Text/None/MTP (Vision on TP2 only) with complete INT8 KV");
     }
     if (options.ram_kv.gpu_tokens != 0) {
         if constexpr (TextConfig::query_heads != 24) {
@@ -903,8 +918,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         if (impl->tp == 4) {
             // Four-rank event/copy topology also contributes to rank 0's driver residency.
             // At C=1, 4096 capacity, SM70 MTP3 consumed 26 MiB versus the TP2 24 MiB bound.
+            // QUASAR MTP4 at C=2 consumed up to 150 MiB on a non-root rank: the two
+            // exact-b graph families exceed the former 96 MiB reservation. Reserve
+            // 96 MiB per short-context batch class (192 MiB at C=2), retaining the
+            // measured per-device check after preparation.
+            const std::size_t multiplier = impl->speculative_backend == SpeculativeBackend::Mtp ? 4 : 2;
             impl->graph_allowance_bytes = checked_mul(
-                impl->graph_allowance_bytes, 2, "TP4 per-device graph allowance");
+                impl->graph_allowance_bytes, multiplier, "TP4 per-device graph allowance");
         }
     }
 

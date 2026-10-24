@@ -276,6 +276,25 @@ void HttpServer::register_routes() {
     server_.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         res.set_content(nlohmann::json{{"status", "ok"}}.dump(), "application/json");
     });
+    const auto residency_response = [this](httplib::Response& res) {
+        const auto state = service_->model_residency();
+        res.set_content(nlohmann::json{
+            {"state", state.state}, {"retained_host_bytes", state.retained_host_bytes},
+            {"phase", state.phase}, {"done", state.done}, {"total", state.total},
+            {"active_requests", state.active_requests}, {"cache_preserved", false}
+        }.dump(), "application/json");
+    };
+    server_.Get("/ninfer/model", [residency_response](const httplib::Request&, httplib::Response& res) {
+        residency_response(res);
+    });
+    server_.Post("/ninfer/model/offload", [this, residency_response](const httplib::Request&, httplib::Response& res) {
+        service_->offload_to_memory();
+        residency_response(res);
+    });
+    server_.Post("/ninfer/model/load", [this, residency_response](const httplib::Request&, httplib::Response& res) {
+        service_->load_from_memory();
+        residency_response(res);
+    });
     server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
         handle_models(req, res);
     });
@@ -356,6 +375,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_output_tokens = options_.max_output_tokens;
         request                   = parse_chat_completion_request(body, limits);
         if (request.model != public_model_id_) {
             ApiError error;
@@ -537,6 +557,7 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     try {
         RequestLimits limits;
         limits.default_max_tokens       = options_.default_max_tokens;
+        limits.max_output_tokens = options_.max_output_tokens;
         const GenerationRequest request = parse_messages_request(body, limits);
         const int input_tokens          = service_->count_prompt_tokens(
             request, [&req] { return req.is_connection_alive && !req.is_connection_alive(); });
@@ -568,6 +589,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_output_tokens = options_.max_output_tokens;
         // The Anthropic endpoint accepts any `model` string (Claude Code sends real
         // Claude model names) and echoes it back; it never 404s on model id.
         request = parse_messages_request(body, limits);

@@ -3,6 +3,7 @@
 #include "ops/linear/w8/w8_prepack_sm70.h"
 #endif
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -304,12 +305,22 @@ W8Launch select_w8_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     throw std::invalid_argument("w8 linear: unsupported policy");
 }
 
+std::size_t w8_prepacked_workspace_bytes(std::int32_t n, std::int32_t k,
+                                        std::int32_t first, std::int32_t last) noexcept {
+#ifdef NINFER_VOLTA_BUILD
+    if (n == 62080 && k == 5120 && first <= 8 && last >= 3) {
+        return static_cast<std::size_t>(k) * std::min(last, 8) * 2;
+    }
+#endif
+    return 0;
+}
+
 void w8_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                 cudaStream_t stream) {
+                 WorkspaceArena* workspace, cudaStream_t stream) {
     const W8Launch launch = select_w8_launch(w.n, w.k, x.ne[1], policy);
 #ifdef NINFER_VOLTA_BUILD
     if (w.layout == QuantLayout::VoltaQpnPrepacked) {
-        launch_w8_prepacked_sm70(x, w, out, stream);
+        launch_w8_prepacked_sm70(x, w, out, workspace, stream);
         return;
     }
 #endif

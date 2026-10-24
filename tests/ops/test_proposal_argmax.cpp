@@ -91,6 +91,7 @@ int main() {
         cuda_check(cudaGetDeviceProperties(&device, 0), "device properties");
         int failures = 0;
         if (device.major == 7 && device.minor == 0) {
+            failures += run_case(32768, 5120, 1, 32768, true);
             failures += run_case(65536, 5120, 1, 65536, true);
         }
         failures += run_case(512, 5120, 5, 497, false);

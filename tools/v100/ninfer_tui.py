@@ -23,9 +23,11 @@ from urllib.request import ProxyHandler, build_opener
 if __package__:
     from .gui_cache import CacheMonitor
     from .launcher_sampling import SAMPLING_LIMITS, validate_sampling
+    from .launcher_model import ModelControl
 else:
     from gui_cache import CacheMonitor
     from launcher_sampling import SAMPLING_LIMITS, validate_sampling
+    from launcher_model import ModelControl
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_ROOT = Path(os.environ.get('NINFER_MODEL_DIR', '/Models/ninfer-V100X2'))
@@ -237,11 +239,11 @@ class Settings:
             raise ValueError('27B DFlash requires TP1/TP2 and a draft window of 1..7')
         if not 0 <= self.prefix_cache_tokens <= 100000000:
             raise ValueError('Historical prefix cache budget must be 0..100000000 tokens (host RAM)')
-        if self.long_attention and (self.tp != 2 or self.backend == 'dflash' or
+        if self.long_attention and (self.tp not in (2, 4) or self.backend == 'dflash' or
                                     self.kv_dtype != 'int8' or self.ram_kv):
-            raise ValueError('Experimental long attention requires TP2 INT8 KV concurrency 1..8 Text/Vision None/MTP, no RAM-KV')
-        if self.fast_decode and (self.tp != 2 or self.backend == 'dflash' or self.vision):
-            raise ValueError('Experimental fast decode requires QUASAR SM70 TP2 Text None/MTP')
+            raise ValueError('Experimental long attention requires TP2/TP4 INT8 KV concurrency 1..8 Text/Vision None/MTP (Vision TP2 only), no RAM-KV')
+        if self.fast_decode and (self.tp not in (2, 4) or self.backend == 'dflash' or self.vision):
+            raise ValueError('Experimental fast decode requires QUASAR SM70 TP2/TP4 Text None/MTP')
         if self.vision and (self.tp != 2 or self.backend == 'dflash'):
             raise ValueError('Vision requires TP2 None/MTP; fast decode remains Text-only')
         if self.vision and local_path(self.artifact).name in ('qwen3_8_27b_q4_k_m.ninfer', 'qwen3_8_27b_fp8.ninfer'):
@@ -298,6 +300,7 @@ class Server:
         self.stats: CacheMonitor | None = None
         self.stats_error = ''
         self.restart_pending = False
+        self.model_control: ModelControl | None = None
 
     @property
     def running(self) -> bool:
@@ -316,6 +319,10 @@ class Server:
         self.stats_error = ''
         self.prefill = self.decode = 0.0
         self.status, self.stop_deadline = 'LOADING', 0.0
+        host = {'0.0.0.0': '127.0.0.1', '::': '::1'}.get(settings.host, settings.host)
+        if ':' in host:
+            host = '[' + host.strip('[]') + ']'
+        self.model_control = ModelControl(f'http://{host}:{settings.port}', settings.api_key)
         self.process = subprocess.Popen(settings.command(), cwd=ROOT, env=runtime_environment(),
                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                         text=True, encoding='utf-8', errors='replace')
@@ -343,6 +350,11 @@ class Server:
 
     def poll(self, settings: Settings) -> None:
         now = time.monotonic()
+        if self.running and not self.stop_deadline and self.status.startswith('ONLINE') and self.model_control:
+            self.model_control.poll()
+            if self.model_control.error:
+                self.lines.put('Model control failed: ' + self.model_control.error)
+                self.model_control.error = ''
         if self.stats is not None:
             try:
                 self.stats.poll()
@@ -355,6 +367,7 @@ class Server:
         if self.process is not None and not self.running:
             self.status = f'EXIT {self.process.returncode}'
             self.process = None
+            self.model_control = None
             self.stop_deadline = 0.0
             if self.restart_pending:
                 self.start(settings)
@@ -550,6 +563,9 @@ class Launcher:
             'Long attention (Text/images/video): complete history; different softmax/PV reduction order.',
             'Long attention: TP2 / complete INT8 KV / None or MTP; GPU or CPU vision encoder.',
             'Combined Text-only 85K / 180K capacity / TP2 / INT8 KV / MTP4: ~198.1 committed tok/s.',
+            'Remote TP4 / 220 W / 1200 MHz, same 85K/MTP4 fixture: 267.34 / 267.64 wall tok/s.',
+            'TP4: +14.57% over 231.30; prefill ~2339 tok/s. Split-D can change output.',
+            'TP4 normal, prefix and actual-85K Graph/eager state checks PASS; quality is separate.',
             'Final packed-W8 step: +0.84% over the preceding ~196.45 tok/s pair.',
             'These are combined results, not independent per-switch speedups.',
             'Prior 25 full-vocabulary probes: argmax 25/25, min cosine 0.998830814,',
@@ -560,7 +576,7 @@ class Launcher:
             'PP2: TP1 on two devices; serial decode, no established speed gain.',
             'RAM-KV: approximate retrieved history during prefill AND decode; quality can drop.',
             'RAM-KV gains/quality unmeasured here. Archive bytes are NOT a process RSS limit.',
-            'Details: docs/performance.md and docs/v100-decode-survey.md',
+            'Details: docs/performance.md, docs/tp4.md and docs/v100-decode-survey.md',
         ]
         self.show_lines(screen, 'Experimental gains and output impact', lines)
 
@@ -647,10 +663,18 @@ class Launcher:
             acceptance = f'{stats.live_accepted_tokens / stats.live_drafted_tokens:.1%}' if stats.live_drafted_tokens else 'no drafts'
             summary = f'Cache {stats.latest_rate:.1%} / session {stats.total_rate:.1%}  Drafts {acceptance}  [v details]'
         put(screen, height - 5, 1, summary)
-        put(screen, height - 4, 1, self.notice)
-        put(screen, height - 3, 1, 'c command  i impact  v metrics  l logs  s start/stop  r restart  q quit')
+        model = self.server.model_control
+        residency = ''
+        if model and self.server.running:
+            residency = f'Model: {model.state.upper()}  RAM {model.retained_host_bytes / 1024**3:.2f} GiB'
+            if model.busy:
+                residency += f'  {model.phase}'
+                if model.total:
+                    residency += f' {model.done / model.total:.1%}'
+        put(screen, height - 4, 1, residency or self.notice)
+        put(screen, height - 3, 1, 'u unload->RAM  g load->GPU  s start/stop  r restart  v metrics  l logs  q quit')
         persistence = 'settings autosaved' if self.settings_path else 'session settings only'
-        put(screen, height - 2, 1, 'Up/Down/Tab field  Enter/Space edit  p preset  m model  (' + persistence + ')')
+        put(screen, height - 2, 1, 'Arrows/Tab field  Enter edit  c command  i impact  p preset  m model  (' + persistence + ')')
         screen.refresh()
 
     def run(self, screen) -> None:
@@ -679,6 +703,10 @@ class Launcher:
                     self.show_lines(screen, 'Server log snapshot', list(self.logs))
                 elif key == ord('r'):
                     self.server.restart()
+                elif key in (ord('u'), ord('g')) and self.server.running and not self.server.stop_deadline:
+                    model = self.server.model_control
+                    if model:
+                        model.action('offload' if key == ord('u') else 'load')
                 elif key == ord('s'):
                     if self.server.running:
                         self.server.stop()

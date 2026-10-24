@@ -126,6 +126,7 @@ struct Variant {
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(WeightsProfile profile, int tp, std::int32_t first,
                                                                              std::int32_t last);
 
+
     // --- tp == 2 split forms -------------------------------------------------------------------
     //
     // One call drives BOTH ranks: every argument is an array indexed by rank, holding that rank's
@@ -224,6 +225,9 @@ struct Variant {
                                        std::span<const Tensor> beta,
                                        std::span<WorkspaceArena* const> workspace,
                                        const ExecutionContext& ec);
+    [[nodiscard]] static DType gdn_output_input_dtype(const Weight& w, int tp, int tokens);
+    [[nodiscard]] static DType post_mixer_input_dtype(const PostMixerWeights& w,
+                                                     int tp, int tokens);
     static void post_mixer(std::span<const Tensor> hidden,
                            std::span<const PostMixerWeights* const> w,
                            std::span<const Tensor> residual,

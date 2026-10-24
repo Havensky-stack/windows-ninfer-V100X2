@@ -94,6 +94,9 @@ struct Variant {
                                        std::span<const Tensor> beta,
                                        std::span<WorkspaceArena* const> workspace,
                                        const ExecutionContext& ec);
+    [[nodiscard]] static DType gdn_output_input_dtype(const Weight& w, int tp, int tokens);
+    [[nodiscard]] static DType post_mixer_input_dtype(const PostMixerWeights& w,
+                                                     int tp, int tokens);
     static void post_mixer(std::span<const Tensor> hidden,
                            std::span<const PostMixerWeights* const> w,
                            std::span<const Tensor> residual,

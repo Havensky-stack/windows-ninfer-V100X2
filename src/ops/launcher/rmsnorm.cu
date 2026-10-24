@@ -11,7 +11,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <RmsEpilogue Epilogue>
+template <RmsEpilogue Epilogue, bool Fp16Image = false>
 void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tensor& out,
                     std::int32_t d, std::int64_t rows, float eps, bool aligned2,
                     cudaStream_t stream) {
@@ -19,6 +19,7 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
     const auto* w_bf16 = static_cast<const __nv_bfloat16*>(weight.data);
     const auto* z_bf16 = z != nullptr ? static_cast<const __nv_bfloat16*>(z->data) : nullptr;
     auto* out_bf16     = static_cast<__nv_bfloat16*>(out.data);
+    auto* output_pairs = static_cast<RmsOutputPair<Fp16Image>*>(out.data);
 
     if (aligned2 && d == 128 && Epilogue == RmsEpilogue::Plain) {
         // Plain per-head D128 is latency-bound for Q32/KV8 rows. Four rows per CTA follows the
@@ -35,11 +36,11 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
         constexpr int kBlock         = 512;
         constexpr int kWarpsPerBlock = kBlock / kWarpSize;
         const auto blocks = static_cast<unsigned int>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-        rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock><<<blocks, kBlock, 0, stream>>>(
+        rmsnorm_warp_bf16x2_kernel<Epilogue, kBlock, Fp16Image><<<blocks, kBlock, 0, stream>>>(
             reinterpret_cast<const __nv_bfloat162*>(x_bf16),
             reinterpret_cast<const __nv_bfloat162*>(w_bf16),
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-            reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+            output_pairs, d, rows, eps);
     } else if (aligned2 && d == 2048 && Epilogue == RmsEpilogue::Plain) {
         // The 512-thread CTA is faster than 128/256-thread alternatives at every measured DFlash
         // extent and reaches the same-topology payload floor at the prefill endpoint.
@@ -49,22 +50,22 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
             reinterpret_cast<const __nv_bfloat162*>(z_bf16),
             reinterpret_cast<__nv_bfloat162*>(out_bf16), rows, eps);
     } else if (aligned2 && d >= 512 && d <= 3072 && d % 512 == 0) {
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6>
+        rmsnorm_cta_bf16x2_kernel<Epilogue, 256, 6, Fp16Image>
             <<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                output_pairs, d, rows, eps);
     } else if (aligned2 && d > 3072 && d <= 8192 && d % 1024 == 0) {
-        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8>
+        rmsnorm_cta_bf16x2_kernel<Epilogue, 512, 8, Fp16Image>
             <<<static_cast<unsigned int>(rows), 512, 0, stream>>>(
                 reinterpret_cast<const __nv_bfloat162*>(x_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(w_bf16),
                 reinterpret_cast<const __nv_bfloat162*>(z_bf16),
-                reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
+                output_pairs, d, rows, eps);
     } else {
-        rmsnorm_generic_kernel<Epilogue><<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
-            x_bf16, w_bf16, z_bf16, out_bf16, d, rows, eps);
+        rmsnorm_generic_kernel<Epilogue, Fp16Image><<<static_cast<unsigned int>(rows), 256, 0, stream>>>(
+            x_bf16, w_bf16, z_bf16, static_cast<RmsOutput<Fp16Image>*>(out.data), d, rows, eps);
     }
 }
 
@@ -87,7 +88,11 @@ void rmsnorm_launch(const Tensor& x, const Tensor& weight, float eps, bool unit_
         ((x_addr | w_addr | z_addr | o_addr) & (alignof(__nv_bfloat162) - 1)) == 0;
 
     if (z != nullptr) {
-        launch_rmsnorm<RmsEpilogue::Gated>(x, weight, z, out, d, rows, eps, aligned2, stream);
+        if (out.dtype == DType::FP16) {
+            launch_rmsnorm<RmsEpilogue::Gated, true>(x, weight, z, out, d, rows, eps, aligned2, stream);
+        } else {
+            launch_rmsnorm<RmsEpilogue::Gated>(x, weight, z, out, d, rows, eps, aligned2, stream);
+        }
     } else if (unit_offset) {
         launch_rmsnorm<RmsEpilogue::Offset>(x, weight, nullptr, out, d, rows, eps, aligned2,
                                             stream);

@@ -21,6 +21,10 @@ SM70 NVFP4 input checks use independent host QPN encoding and FP64 logical proje
 at TP1/TP2 shapes, including QPN/wide-CUTLASS boundaries and graph replay. Run
 `ctest -R '^ninfer_nvfp4_(input_sm70|gdn_.*)_test$'` for projection, snapshot-state, masked
 record and public TP2 split checks.
+`ninfer_gdn_tp4_decode_test` additionally covers prepacked TP4 normal/fast projection at
+T=1/2/4/5/6/8 and masked record/convolution at T>=2. Its FP64 oracle applies the record
+interface's observable BF16 projection boundary; exact composed-route, read-only state,
+record/history and masked-zero checks supplement that oracle. It requires four CUDA devices.
 
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
@@ -79,6 +83,22 @@ owns deterministic payload generation, device `Weight` views, row views, and ind
 weight decoding.
 
 ## Build and run
+
+Model hot unload/load: `test_launcher_model.py` checks asynchronous control, authenticated HTTP,
+progress, busy errors and recovery without CUDA. The artifact reader fixture verifies exact packed
+bytes and aligned reads after deleting the source file. For a real QUASAR TP2/MTP4 CUDA Graph
+lifecycle (busy admission, 503 while in RAM, disk-independent reload, deterministic output,
+discarded KV/prefix cache and cumulative stats), run:
+
+```bash
+NINFER_RESIDENCY_MODEL=/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build-v100-tp4 -R '^ninfer_model_residency_real_test$' --output-on-failure
+.venv/bin/python -m unittest tests.test_launcher_model tests.test_gui_cache tests.test_ninfer_tui
+```
+
+The real-model test uses a temporary symlink, removes only that link, and never modifies the model
+artifact. Without the explicit environment variable it is skipped. It requires two free V100 GPUs
+and enough host RAM to retain the complete container.
 
 The standard-library TUI launcher checks cover admission, saved preferences, metrics and owned
 child lifetime, including an actual curses session in a pseudo-terminal with a fixture server.

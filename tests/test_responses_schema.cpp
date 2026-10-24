@@ -532,10 +532,41 @@ int test_input_tokens_schema() {
     return failures;
 }
 
+int test_output_token_cap() {
+    RequestLimits cap;
+    cap.default_max_tokens = 64;
+    cap.max_output_tokens = 64;
+    Json body = {{"model", "m"}, {"input", "hello"}};
+    int failures = 0;
+    for (int tokens : {32, 64}) {
+        body["max_output_tokens"] = tokens;
+        const auto out = parse_responses_request(body, cap);
+        failures += check(out.generation.max_tokens == tokens, "output cap rejected a supported budget");
+    }
+    body["max_output_tokens"] = 65;
+    bool rejected = false;
+    try { (void)parse_responses_request(body, cap); }
+    catch (const ApiException& error) {
+        rejected = error.error().status == 400 &&
+                   error.error().code == "max_output_tokens_exceeded" &&
+                   error.error().param == "max_output_tokens";
+    }
+    failures += check(rejected, "output cap did not reject an oversized request");
+    body.erase("max_output_tokens");
+    auto out = parse_responses_request(body, cap);
+    failures += check(out.generation.max_tokens == 64, "output cap changed the default budget");
+    cap.max_output_tokens = 0;
+    body["max_output_tokens"] = 65;
+    out = parse_responses_request(body, cap);
+    failures += check(out.generation.max_tokens == 65, "disabled output cap still limits requests");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_output_token_cap();
     failures += test_basic_request();
     failures += test_instruction_message_order();
     failures += test_preserve_thinking_options_and_inheritance();

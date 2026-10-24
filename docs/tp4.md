@@ -1,6 +1,511 @@
 # Four-card V100 / NVLink deployment
 
-These results belong to a separate four-card NVLink host. They are not local V100X2 QUASAR measurements.
+The four-card results below belong to a separate NVLink host. Local V100X2 controls are labeled
+explicitly. QUASAR and the older official NVFP4/native FP8 measurements use different artifacts
+and draft windows; keep their results separate.
+
+## v0.2.0 serving: 256K context and 128K output
+
+Use the Linux SM70 release package, or the equivalent [Docker image](docker.md).
+The following starts QUASAR TP4 Text/MTP4, enables both experimental numerical profiles,
+and defaults to non-thinking generation:
+
+```bash
+./bin/ninfer-serve /path/to/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --model-id Qwen3.8-27B --host 0.0.0.0 --port 8080 \
+  --tp 4 --devices 0,1,2,3 --max-context 262144 --kv-dtype int8 \
+  --prefill-chunk 2560 --max-concurrency 1 \
+  --spec mtp --draft-tokens 4 --lm-head-draft \
+  --volta-long-attention --volta-fast-decode \
+  --default-max-tokens 131072 --max-output-tokens 131072 --no-thinking
+```
+
+The 262144-token ceiling covers prompt plus generation. Output defaults to 131072 and
+requests above that hard ceiling return HTTP 400 before model preparation; remaining
+context can impose a smaller effective output budget. A client may explicitly enable
+thinking. These startup settings do not imply that every request reaches the greedy 85K
+benchmark rate below. Both numerical experiments can change output; no new GPQA is claimed.
+
+## Separate 300 W host: QUASAR / MTP4 (2026-10-24)
+
+The new native Linux host has four Tesla V100-SXM2 16 GB cards with all-pairwise NV2,
+an E5-2640 v4 with ten exposed CPUs, driver 550.163.01 and approximately 58 GiB RAM.
+The deployed binary is built with CUDA 12.8 for SM70. Devices 0–3 already report the
+user-authorized **300 W** limit at campaign startup; clocks are not changed. These are
+measurements of this host, not power/clock extrapolations of the 220 W host below.
+
+The existing QUASAR v3 `.ninfer` artifact is used directly from the host's model pool.
+The public Engine benchmark retains the saved prompt IDs, 180000 capacity, INT8 group-64
+KV, chunk 2560, greedy optimized MTP4, CUDA Graphs, one request, no prefix reuse and no
+extra warmup. Each row contains two cold requests, each emitting one prefill output and
+512 timed committed decode outputs. Decode is `512 / (total_seconds - first_token_seconds)`;
+loading and graph priming are excluded from request timing.
+
+| Route | Occupied input | Prefill tok/s | Committed decode wall tok/s | TTFT, s |
+|---|---:|---:|---:|---:|
+| TP4, long attention + fast decode | 3072 | 3302.15 | 250.707 | 0.9311 |
+| TP4, long attention + fast decode | 85000 | **2731.60** | **322.178** | **31.1190** |
+| TP4, both experimental profiles off | 3072 | 3287.95 | 245.697 | 0.9351 |
+| TP4, both experimental profiles off | 85000 | 2715.22 | 227.019 | 31.3068 |
+| TP2, long attention + fast decode | 3072 | 2146.37 | 188.788 | 1.4316 |
+| TP2, long attention + fast decode | 85000 | 1518.72 | 199.226 | 55.9700 |
+
+The two 85K TP4 long/fast measurements are **322.138 / 322.218 tok/s**. Each route repeats
+its complete output and MTP counters exactly. Both TP4 85K profiles also preserve their
+respective earlier 513-ID/counter fixtures. This is supplementary regression evidence,
+not proof of universal output equality or model quality; no new GPQA is run. Long attention
+and fast decode retain their existing default-off numerical qualifications.
+
+Four-rank collective checks pass before the matrix. At 1 Hz, the TP4 matrix reaches
+56°C and shows active SM samples from 1485–1530 MHz. Software power-cap activity occurs;
+no sampled hardware thermal/power-brake slowdown or nonzero volatile ECC is recorded.
+The three benchmark processes take 99.44 / 101.38 / 150.36 seconds, respectively, including
+load, graph priming and four requests per process. Durable reports and health logs are
+retained under `profiles/bench/tp4-300w-host-20261024/` locally and the matching directory
+under `~/Ninfer/profiles/` remotely.
+
+### No-NVLink traffic: forced host-staging control
+
+This is a **no-P2P / driver-staged simulation on the same cards**, not a measurement of
+direct PCIe P2P on physically unlinked cards. A measurement-only runtime interposer reports
+peer access unavailable. The Engine disables peer access and qualifies its existing CUDA UVA
+D2D staging route. No physical link, driver, clock or power setting is changed; the normal
+service does not load this interposer. NVML's per-link data Tx/Rx counters are sampled before
+and after the complete benchmark process. All **48 counters across the four cards remain
+unchanged**, both in the independent collective qualification and the TP4 whole-model run.
+The complete TP2 control also leaves every counter unchanged.
+
+| Route, both experimental profiles on | Occupied input | Prefill tok/s | Committed decode wall tok/s | Prefill loss vs NVLink | Decode loss vs NVLink |
+|---|---:|---:|---:|---:|---:|
+| TP4, forced host staging | 3072 | 456.94 | 51.585 | 86.16% | 79.42% |
+| TP4, forced host staging | 85000 | 456.09 | 72.360 | 83.30% | 77.54% |
+| TP2, forced host staging | 3072 | 1406.53 | 108.513 | 34.47% | 42.52% |
+| TP2, forced host staging | 85000 | 1122.62 | 119.234 | 26.08% | 40.15% |
+
+The TP2 process takes **198.40 seconds**. At 85K, its mean TTFT is **75.7174 s** and complete
+request time **80.0115 s**; decode measures **119.106 / 119.361 tok/s**. Both TP2 occupancies
+preserve all **513 output IDs and every MTP counter** of their respective direct-route controls.
+The TP2 staged run therefore provides a paired unchanged-continuation control. It uses the
+native-Linux default DMA fallback, not the WSL-only automatic mapped-host small-reduction route.
+
+The TP4 process takes **449.72 seconds** for loading, graph priming and four cold requests.
+At 85K, mean TTFT is **186.3711 s** and complete request time **193.4468 s**. Its two decode
+measurements are **72.391 / 72.330 tok/s**. Each repetition reproduces its output and MTP
+counters exactly. Relative to the direct route, the continuations first differ at zero-based
+output **167 / 129** for 3K/85K, respectively. At 85K, the staged route accepts **389/490**
+drafts versus direct **391/479**, with **123 versus 120** rounds. Thus the table measures
+the complete fallback implementation, including disabled peer fusions and changed reduction
+association/acceptance; it is not an isolated physical-link bandwidth penalty or an
+equal-quality claim. In particular, these losses must not be applied to the local V100X2's
+working direct PCIe P2P route.
+
+The initial whole-model probe exposed an inadmissible FP16 norm image on the staged TP4
+route. The runtime now chooses that image only when packet storage is qualified, matching
+the existing GDN output admission. Without packets it composes the established BF16 norm
+and projection. The direct route and the Op's precision/validation requirements remain intact.
+
+The forced-no-peer real-model 85K/MTP4 gate passes in **419.14 seconds**, covering
+CUDA Graph and eager execution, cold execution and two exact prefix replays per mode,
+replay logits/counters and the committed frontier. The original `ninfer-tp2` container
+is restored after testing; devices 0–3 retain the requested **300 W** limits.
+
+## QUASAR NVFP4 / MTP4 at 220 W (2026-10-23–24)
+
+Four Tesla V100-SXM2 16 GB cards, all-pairwise NV2, CUDA 12.8 / SM70. The existing
+**220 W per-card power limit and 1200 MHz SM ceiling were retained; no power or clock
+setting was changed**. The existing `gpu-guard.service` drop-in sets `PL=220` and
+`MAXCLK=1200`; its launcher applies that graphics-clock ceiling.
+The published QUASAR NVFP4 v3 artifact is registered as `qwen3.8-27b/quasar-nvfp4`.
+Deployment files are under `~/Ninfer` on the four-card host.
+
+The public `ninfer_bench` Engine route uses 180000 context capacity (180032 allocated),
+INT8 group-64 KV, chunk 2560, greedy optimized MTP4 and CUDA Graphs. Each point consists of
+two cold requests with no prefix reuse or extra warmup. Each request emits one prefill token
+and **512 committed timed decode tokens**. Loading and graph priming are outside request
+timing. Decode below is committed wall throughput, `512 / (total_seconds - first_token_seconds)`.
+
+### Existing 1Cat installation: same-host MTP4 control
+
+The control uses the host's existing **1cat-vllm 1.5.1** environment at `~/1cat/.venv`
+and existing `~/1cat/models/Qwen3.8-27B-QUASAR-NVFP4` checkpoint. Nothing was downloaded,
+installed or upgraded. Its original launcher selects DFlash2; this control explicitly selects
+greedy **MTP4** to match the requested NInfer workload.
+
+Both engines receive the same saved **85000 token IDs**, TP4, one request, 180000 maximum
+context, chunk 2560, CUDA Graphs, disabled prefix reuse, ignored model stops and 513 output
+tokens. Both measurements are in process, with load/graph initialization outside request
+timing. The first emitted chunk is verified to contain exactly one token; decode counts
+the remaining **512 committed tokens**, including host and framework overhead after that
+first token. Two complete cold requests are measured:
+
+| Existing 1Cat / TP4 / MTP4 | First request | Second request | Mean |
+|---|---:|---:|---:|
+| Committed decode wall tok/s | 98.249 | 102.509 | **100.379 ± 3.012** |
+| First token, seconds | 35.9527 | 35.9230 | **35.9378** |
+| Input tokens / first-token seconds | 2364.22 | 2366.18 | **2365.20** |
+
+1Cat's mean complete request takes **41.0408 s**, versus current NInfer long/fast's
+**38.2153 s** for this 85K-input/513-output workload. The current prefill improvements reverse
+the preceding 231-stage whole-request comparison, whose NInfer request took 50.9730 s.
+
+This is a workload-aligned control, **not equal arithmetic or equal output quality**.
+1Cat uses FP16 compute and E4M3 KV with 2048-token blocks; NInfer uses BF16 boundaries and
+INT8 group-64 KV. The existing Hugging Face checkpoint and converted QUASAR v3 container
+may also differ in auxiliary projections. Within each engine the two repetitions reproduce
+their own IDs. Across engines the first 325 output IDs agree, then continuations diverge.
+1Cat reports 124 draft rounds, 496 proposed and 390 accepted tokens per request; its metric
+accounting is retained as reported, rather than treated as NInfer's commit counters.
+
+The explicit 1Cat KV allocation is 2.5 GiB per rank, enough for the requested context. Its
+initial automatic allocation consumed 8.32 GiB per rank and left insufficient compile
+workspace; the retry changes this memory budget only. Successful control initialization
+takes 93.45 s and the complete two-request process 190.79 s. Detailed reports and health
+logs are retained in `profiles/bench/tp4-push300-20261023/` locally and
+`~/Ninfer/profiles/tp4-push300-20261023/` remotely.
+Loaded, GPU-active 1Cat samples show 1185–1200 MHz SM clocks, occasional software-power-cap
+activity and a maximum temperature of 66°C. The earlier 231.302 tok/s NInfer run stays at
+1200 MHz, reaches 69°C and records no sampled power cap. Neither run records hardware thermal slowdown,
+nonzero volatile ECC or new Xid/Oops/OOM alerts. Both retain the same 220 W limit.
+
+### Retained TP4 decode optimization
+
+The current 85K-input result is **283.118 / 283.367 committed wall tok/s**, mean
+**283.242 ± 0.176**, with both experimental profiles. The normal profile measures
+**191.997 / 192.210**, mean **192.104 ± 0.151**. These retain MTP4 and the original
+220 W / 1200 MHz limits. **300 tok/s was not reached.** The measurements do not establish
+a hardware limit or eliminate the remaining optimization directions.
+
+| TP4 implementation, same 85K fixture | Prefill tok/s | Decode wall tok/s |
+|---|---:|---:|
+| Initial normal profile | 1740.06 | 113.306 ± 0.148 |
+| Repaired activation/communication, normal | 1740.13 | 155.511 ± 0.080 |
+| Repaired activation/communication + long/fast | 1745.16 | 216.934 ± 0.154 |
+| Paired quarter-shard gate/up + four-group QPN, long/fast | 1743.29 | 231.302 ± 0.272 |
+| Same paired/QPN schedule, flags off | 1737.77 | 164.392 ± 0.150 |
+| Large collective + Split-D prefill, long/fast | 2065.01 | 231.433 ± 0.150 |
+| Projection publication, 64-pack epochs / 16-byte stores | 2258.71 | 238.454 ± 0.171 |
+| Published sum/norm, 640 threads | 2253.36 | 241.457 ± 0.185 |
+| Verify5 K/V prefetch + FP32 proposal N32768/rank | 2257.05 | 244.655 ± 0.262 |
+| Exact BF16→FP16 norm output image, long/fast | 2259.24 | 246.431 ± 0.151 |
+| Single-launch small-T GDN controls, long/fast | 2255.67 | 250.824 ± 0.208 |
+| Same GDN-controls implementation, flags off | 2246.25 | 178.525 ± 0.172 |
+| TP4 GDN projection/record/conv fusion, long/fast | 2258.49 | 258.037 ± 0.373 |
+| Same GDN fusion, flags off | 2251.22 | 182.074 ± 0.172 |
+| Split-D prefill N64, long/fast | 2336.60 | 260.133 ± 0.300 |
+| Same N64 implementation, flags off | 2328.94 | 182.133 ± 0.102 |
+| Ordered attention reducer, long/fast | 2337.35 | 262.259 ± 0.350 |
+| Same reducer + BF16-rounded SwiGLU FP16 image, long/fast | 2338.95 | 265.004 ± 0.003 |
+| Same SwiGLU image implementation, flags off | 2328.01 | 183.583 ± 0.062 |
+| GDN gated-norm BF16-rounded FP16 image, long/fast | 2335.13 | 267.487 ± 0.214 |
+| Same GDN norm-image implementation, flags off | 2327.87 | 184.815 ± 0.091 |
+| Last-CTA GDN record/norm fusion, long/fast | 2334.24 | 268.946 ± 0.079 |
+| Same GDN record/norm fusion, flags off | 2329.72 | 185.367 ± 0.094 |
+| W8 verifier FP16 input image, long/fast | 2335.07 | 270.694 ± 0.263 |
+| Same W8 input-image implementation, flags off | 2326.84 | 186.204 ± 0.124 |
+| Direct-peer four-rank argmax, long/fast | 2335.33 | 281.662 ± 0.219 |
+| Same direct argmax implementation, flags off | 2326.98 | 191.373 ± 0.132 |
+| Direct-peer small metadata broadcast, long/fast | **2334.73** | **283.242 ± 0.176** |
+| Same current implementation, flags off | **2327.73** | **192.104 ± 0.151** |
+
+Each row consists of two cold requests at the settings above. These are successive
+measurements, not independent per-mechanism speedups. Relative to the preceding paired/QPN
+stage, decode improves **22.46%** with long/fast and **16.86%** with both flags off; prefill
+improves about **34.2%**. The 244.655 binary was additionally rerun after an interrupted
+candidate cleanup and reproduces its original IDs/counters at 244.483 / 244.884 tok/s.
+The norm-image step improves that same-session control by approximately **0.71%**.
+Single-launch GDN controls subsequently improve the norm-image result by **1.78%**.
+TP4 GDN projection/record/conv fusion adds **2.88%** over that 250.824 stage;
+its normal-profile gain is **1.99%** over 178.525.
+The N64 prefill tile then adds **3.46% / 3.45%** prefill throughput in long/fast and normal.
+Its long/fast decode rate is 0.81% higher, but its changed prefill association also changes
+acceptance and the saved continuation. This is not an isolated decode-kernel speedup.
+The ordered reducer and SwiGLU image then improve the N64 result by **1.87% / 0.80%**
+in long/fast and normal, preserving each N64 fixture's complete generation and counters.
+The GDN gated-norm image adds a further **0.94% / 0.67%**, again preserving all generation
+IDs and speculative counters; no independent decode gain is claimed for its prefill variation.
+The last-CTA GDN record/norm fusion adds **0.55% / 0.30%**, followed by the W8 verifier
+input image's **0.65% / 0.45%**. Both preserve every fixture ID and speculative counter.
+
+Source mechanisms and numerical boundaries:
+
+- **1Cat-inspired large allreduce:** reduce-scatter/allgather for large payloads; narrow
+  collectives retain rank-specialized packet communication. The independent FP64 collective
+  oracle and changed-input Graph checks qualify the affected sizes.
+- **1Cat / fishlikeX Split-D prefill:** explicitly specialize TP4 D256 attention rather than
+  sharing a TP2 launch shape. All causally visible KV remains present. Split-D changes
+  floating-point association in the normal and experimental profiles; saved outputs first
+  differ from the preceding 231 stage at output **505**. Passing the attention oracle does
+  not prove unchanged logits or task accuracy. Provenance and license notices are retained.
+  The subsequent N32→N64 prefill tile uses 57856 bytes of opt-in shared memory and applies
+  only to the TP4 six-query-head geometry. Its real final chunk (2560 queries ending at
+  85000 occupied keys, fragmented pages) passes the unchanged independent FP64 criterion
+  on 18 sampled columns across all 24 heads, evaluating every visible key and dimension.
+  Exact full-width guards and cache checks also pass. The existing TP1 GPU comparator
+  fails its own oracle on this long fixture, so this fixture compares TP4 directly to FP64;
+  short fixtures retain full TP1/head-mapping controls. N64 first changes output at
+  zero-based index **504 / 505** against the preceding long/fast and normal fixtures.
+- **Projection publication and norm:** publish output contributions to the other three ranks
+  with 64-pack epochs and 16-byte volatile stores, then use a 640-thread sum/norm schedule.
+  Original NVFP4 codes, scales, FP32 divisors and the normal/fast arithmetic boundaries remain.
+- **Five-query verifier:** prefetch the next packed K/V tile to L2. FP32 proposal reduction
+  uses N32768/rank; it changes draft selection, not target sampling policy.
+- **Norm output image:** post-mixer norm writes FP16 image bytes after explicit BF16 rounding,
+  retaining **FP32→BF16→FP16**. Quarter-shard A16 gate/up consumes that image directly,
+  avoiding a standalone cast launch; there is no extra resident weight image.
+- **GDN controls:** a single 320-thread launch handles T2..8 for 12/24 value heads,
+  preserving the ten split dot products, warp reduction and split-combine order.
+  Independent decoded-input FP64 checks cover T1..9, 128 and 2560 without relaxing criteria.
+- **TP4 GDN input/record/conv:** quarter-shard NVFP4 directly writes QKV/Z at T1..8,
+  removing the packed projection and two strided copies. For multi-token verification it
+  fuses projection, BF16 record and conv/SiLU while leaving source history unchanged.
+  A decoded-code FP64 dot oracle covers T1/2/4/5/6/8 under normal and fast scaling;
+  the conv oracle applies the public record BF16 cast before its independent FP64 formula.
+  Exact composed/fused comparison, source/guard checks and newest-history snapshots
+  supplement the numerical oracle. No criterion was relaxed. The four-card operator gate
+  takes **13.91 s**.
+- **Ordered attention reducer:** the final five max/sum tree levels use warp shuffles with
+  the original paired order. Numerator loads prefetch four splits while retaining ascending
+  FP32 accumulation and the dynamic active-split count. The real 85K independent FP64
+  oracle passes verifier widths one and four through eight without relaxing its criterion.
+- **SwiGLU output image:** the explicit **FP32→BF16→FP16** boundary produces a typed
+  FP16 activation consumed directly by quarter-shard down projection, removing another
+  standalone cast. Independent FP64 SwiGLU/down oracles and exact representation checks
+  pass; no BF16 rounding boundary is removed and no extra weight copy is resident.
+- **GDN gated-norm output image:** TP4 small-T gated RMSNorm writes the explicitly
+  BF16-rounded FP16 activation consumed by the N5120/K1536 output projection. It removes
+  the separate cast without changing stored GDN state or the FP32→BF16→FP16 boundary.
+  Independent norm/projection oracles and exact representation checks pass without
+  relaxing criteria; their four-card checks take **1.41 / 15.14 s**.
+- **GDN record/norm fusion:** retain the 192-CTA Dv2/W4 recurrence schedule. Each writer
+  completes its BF16 readout/record stores before advancing a per-head completion counter;
+  the last CTA evaluates gated RMSNorm and resets that head's counter. State/record boundaries
+  and the FP32→BF16→FP16 image remain explicit. An independent FP64 recurrence/norm oracle,
+  dense/masked T2..8, exact readout/state/records, changed-input Graphs and counter reuse
+  checks pass in **3.92 s** without relaxed criteria. Each Program/rank owns its counters.
+- **W8 verifier input image:** materialize the represented FP16 `[K,T]` operands once in
+  caller-owned scratch for SM70 N62080/K5120, T3..8. Keep the existing Split4 MMA/reduction,
+  BF16 output and one resident weight image; FP16 is the same operand conversion previously
+  performed repeatedly inside the kernel. An independent decoded-weight FP64 oracle,
+  exact RowSplit controls and changed-input Graph checks pass at widths 1..9, 16 and 33
+  in **17.43 s**. This does not enable another artifact or execution domain.
+- **Direct-peer TP4 argmax:** one rank-zero kernel reads all four completed score/index
+  shards, resolves exact ties by global index before optional ID remapping, and publishes
+  the selected IDs to all ranks. Ready/completion joins protect sources and prior output
+  consumers under repeated Graph rounds. This adds **4.05% / 2.78%** over the W8-image stage.
+- **Direct-peer metadata broadcast:** SM70 TP4 I32 payloads through 4 KiB use one origin
+  publication kernel after joining every destination's preceding consumer. Other payloads
+  and non-peer domains retain DMA composition. This adds **0.56% / 0.38%** over direct argmax.
+  The combined collective suite passes in **6.48 s**, including independent exact CPU argmax
+  and relocation oracles, infinities/signed zero, mapped/unmapped T1/5/8/33/129, broadcasts
+  around the 1024-word boundary, changed-input Graphs, immediate source/output reuse and guards.
+
+The current long/fast fixture uses **120 rounds, 479 drafted / 391 accepted, one fallback**,
+accepted positions `[117, 108, 90, 76]`. The normal fixture uses **122 rounds, 486 drafted /
+390 accepted, zero fallbacks**, positions `[118, 107, 90, 75]`. Both repetitions reproduce
+their respective IDs/counters. The norm-image, GDN-control and GDN projection/record/conv steps preserve all 513 IDs and every counter
+of the qualified 244.655 stage; it does not imply output equality with the older 231 stage,
+ordinary attention, or BF16.
+
+Four-card qualification includes independent attention/collective/projection/SwiGLU oracles,
+with real quarter-shard shapes, normal/fast scaling and widths through eight where relevant.
+The norm image is checked against the independent decoded-input FP64 formula and its explicit
+BF16→FP16 representation; gate/up receives the represented FP16 values. Current normal,
+actual-85K long/fast and prefix state gates pass in **119.01 / 108.28 / 146.72 s**, respectively.
+They cover Graph/eager execution, exact replay logits/counters, speculative committed frontiers,
+append/edited/shortened prefixes and saved-frontier restoration. The normal gate additionally
+covers sampled routing, teacher-forced positions and B=2 mixed/greedy state.
+
+An earlier eager-only residual/RMSNorm trial read uninitialized scratch. Initcheck identified
+it and the branch remains removed; its real-shape residual regression passes independent
+FP64, exact Graph/eager and initcheck with zero errors. No numerical criterion was relaxed.
+Model-state checks do not establish task accuracy. **No current-combination GPQA was run.**
+
+Current long/fast mean request phases are preparation **0.000723 s**, prefill **36.4068 s**,
+first token **36.4077 s**, timed wall decode **1.80764 s**, total **38.2153 s**. The normal
+profile averages prefill **36.5162 s**, first token **36.5172 s**, total **39.1824 s**.
+The two benchmark processes take **93.05 / 94.78 s**, including load, graph priming,
+two requests and teardown. The independent prefill check takes **226.24 s**.
+Loaded GPU-active benchmark samples reach **73°C**, with 1170–1200 MHz samples and occasional
+existing software-power-cap activity. The state gates reach 74°C. No hardware thermal
+slowdown, nonzero volatile ECC or new Xid/Oops/OOM is recorded for these successful cases.
+This reduces the old 231-stage full request from **50.9730 s**. Loading and graph priming
+remain outside request timing. 1Cat's first token remains faster at **35.9378 s**; its
+complete request is **41.0408 s**. Different compute/KV representations and continuations
+prevent an equal-quality speedup claim.
+
+Directions retained for further optimization include TP4 residual/collective/RMSNorm fusion,
+activation/metadata layouts, deeper attention load overlap, QPN register/warp scheduling,
+GDN value tiling, and fixed-MTP4 proposal/tail fusion. The specific tested QPN staging and
+occupancy variants, shared-activation dual accumulators, wider W8 materialization, 64-key
+attention tile and GDN chunk64 did not demonstrate a whole-model benefit and were withdrawn.
+Register-buffered attention preload was slower; shared V-load reuse left partial-kernel
+latency essentially unchanged. A packet sentinel-polling probe saved only 0.06–0.13 µs per
+isolated collective and was not integrated. These are specific candidates, not rejected directions.
+An MTP stem sum/norm fusion preserves IDs/counters but measures 282.938 / 283.156 tok/s,
+mean 283.047 versus 283.242; no benefit is established, so it is withdrawn. A Q/K-norm/RoPE
+prototype is also withdrawn: its long-position composite oracle was not qualified and its
+frequency-override control was not bit-exact. No whole-model speed or quality claim is made
+for that prototype; fusion remains a candidate after numerical qualification.
+A token-parallel GDN record epilogue is bit-exact but slower (roughly 1–2 µs at T4/5/8),
+so that specific variant remains outside production. A private 64-key attention tile remained
+slower even after removing spills. Kernel probes do not establish end-to-end speedups.
+An INT8 shared-V / Q-reload probe lowers shared memory and admits three blocks per SM,
+but spills and extra loads outweigh the occupancy gain. Its tested loop-unroll/split variants
+are also slower; none is integrated. This does not rule out other attention schedules.
+An additional paired gate/up warp-interleaving probe preserves output bits in both numerical
+profiles at T4/5/6, but leaves the 41.984 µs T5 median unchanged and worsens the fast T6
+median to 43.008 µs. It is not integrated. A private FP16-PV attention accumulator probe,
+including packed shared V and Q-reload variants, measures 173.056–232.448 µs against the
+161.792 µs baseline at 85K/T5. Its 0.00184 output relative L2 difference is only against
+the existing implementation on the synthetic probe, not an independent oracle or a quality
+evaluation. This numerically changed, slower candidate is also excluded. These probes do
+not change the qualified 283.242 tok/s result or establish an absolute performance ceiling.
+
+Both `--volta-long-attention` and `--volta-fast-decode` remain **off by default**. The former
+changes partitioning/softmax/PV association, the latter NVFP4 scale placement and MTP
+arithmetic. They can change logits, output and acceptance. Split-D prefill also changes
+floating-point association in the normal profile; there is no new intelligence-score estimate.
+TP4 ships in release v0.2.0, separately from the earlier v0.1.2 Vision qualification.
+
+Repair-stage experimental mean request phases: preparation **0.000720 s**, prefill **48.7061 s**,
+first token **48.7071 s**, timed decode phase **2.35642 s**, total **51.0672 s**. The process
+takes **118.778 s** including load, graph priming, two requests and teardown; loading takes
+**15.486 s**, including **11.738 s** upload. The repaired normal process takes **120.935 s**;
+mean prefill is **48.8470 s**, first token **48.8479 s**, timed decode **3.28786 s**, total
+**52.1403 s**. The two repaired-stage benchmark processes total **239.713 s** (about four minutes).
+Decode wall rate includes overhead after the first token and does not count rejected drafts.
+
+During repair-stage loaded, GPU-active telemetry samples all four devices stay at **1200 MHz SM /
+877 MHz memory**, with no sampled software power cap or hardware thermal slowdown;
+maximum sampled temperature is **64°C** in the final experimental run and **62°C** in the
+normal control. Volatile corrected/uncorrected ECC counters stay zero, and the six successful
+resumed gates record no new Xid, kernel Oops or OOM in their logged intervals. The host remains
+in the same boot throughout those gates. This selection covers active work across both
+request phases, not separately aligned phase means. At the retained clock ceiling the
+repair-stage result is **1745 prefill / 217 decode tok/s**. Whole-phase linear clock scenarios
+would give about **1908 / 237** at 1312 MHz or **2225 / 277** at 1530 MHz; these are optimistic
+estimates, not measured unlocked results or achievable-clock promises. Multiplying by
+`300/220` is unjustified. No power or clock setting was changed.
+
+The CLI/server, benchmark and standard-name state test are installed in
+`~/Ninfer/bin`; the initial benchmark is retained as `ninfer_bench-initial-normal-20261023`.
+CLI, server and benchmark `--help` smoke checks pass; no service is started automatically.
+This work has not been committed or released. Retained reports, comparison and health logs
+are saved locally under `profiles/bench/tp4-prefill-decode-20261023/` and remotely under
+`~/Ninfer/profiles/tp4-prefill-decode-20261023/`; the preceding 1Cat/paired-QPN records remain in
+`profiles/bench/tp4-push300-20261023/`, and repair-stage records in
+`profiles/bench/tp4-resume-20261023/`. Reproduce the experimental benchmark on that host with:
+
+```bash
+cd ~/Ninfer
+export LD_LIBRARY_PATH="$PWD/lib:/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
+bin/ninfer_bench \
+  --weights models/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  --tp 4 --devices 0,1,2,3 --max-ctx 180000 --kv-dtype int8 \
+  --prefill-chunk 2560 --spec mtp --draft-tokens 4 --lm-head-draft \
+  --volta-long-attention --volta-fast-decode \
+  --corpus profiles/deployment/v100-code-85000-iommu-pt.ids \
+  -pg 85000,512 --warmup 0 -r 2 --capture-generation -o json \
+  --output-file profiles/tp4-resume-20261023/reproduction.json
+```
+
+### Initial normal-profile controls
+
+| Host / route | Actual input tokens | Prefill tok/s | Decode wall tok/s | Acceptance |
+|---|---:|---:|---:|---:|
+| Four-card NV2, TP4, 220 W | 3072 | 2171.72 ± 18.54 | 161.415 ± 0.163 | 83.09% |
+| Four-card NV2, TP4, 220 W | 85000 | 1740.06 ± 1.10 | 113.306 ± 0.148 | 77.71% |
+| Same remote host, TP2, 220 W | 3072 | 1822.88 ± 6.01 | 190.633 ± 0.100 | 79.39% |
+| Same remote host, TP2, 220 W | 85000 | 1267.34 ± 0.47 | 133.273 ± 0.028 | 79.02% |
+| Local PCIe PHB, TP2, 300 W | 3072 | 1753.13 ± 30.71 | 215.052 ± 0.139 | 79.39% |
+| Local PCIe PHB, TP2, 300 W | 85000 | 1333.77 ± 2.26 | 154.925 ± 0.057 | 79.02% |
+
+Mean ± sample standard deviation. These initial rows use the normal arithmetic profile,
+without `--volta-fast-decode` or `--volta-long-attention`. Different TP widths can change logits,
+continuations and MTP acceptance; a throughput ratio is not isolated TP scaling or a quality score.
+Both repetitions at each point reproduce all 513 output IDs and speculative counters without EOG.
+At 85K on the same host, TP4 is 37.30% faster in prefill and 14.98% slower in committed
+decode than TP2. Four ranks are not an automatic single-request decode win.
+
+The initial QUASAR TP4 snapshot passes direct/graph collectives, GDN/attention and SwiGLU operators,
+the exact load plan, model-state graph/eager and speculative/plain controls, 64 teacher-forced
+positions with no argmax disagreements, and B=2 mixed-sampling state controls. The prefix gate
+passes exact graph/eager output, logit, acceptance and frontier replay, including partial-round
+rollback and concurrent exact hits. That gate disables historical branch archives to isolate
+active-lane checkpoints; it is not a TP4 historical-tree or model-quality evaluation. MTP4 graph
+residency is explicitly reserved and checked per device, including the supplementary B=2 gates.
+The repaired final implementation separately passes these model-state and prefix gates,
+as well as the occupied-85K experimental state gate described above.
+
+The same remote TP2 control with both existing experimental switches enabled measures:
+
+| Actual input tokens | Prefill tok/s | Decode wall tok/s | Acceptance |
+|---:|---:|---:|---:|
+| 3072 | 1823.29 ± 11.78 | 196.099 ± 0.034 | 79.39% |
+| 85000 | 1268.73 ± 0.63 | 175.200 ± 0.026 | 79.39% |
+
+These switches change arithmetic and attention association and can change outputs and draft
+acceptance. This is a speed control, not a new quality evaluation or a TP4 experimental result.
+
+Mean 85K request phases, in seconds:
+
+| Route | Prepare | Prefill | Decode phase, 512 tokens | Total request |
+|---|---:|---:|---:|---:|
+| Remote TP4, 220 W | 0.000724 | 48.8490 | 4.5143 | 53.3687 |
+| Remote TP2, 220 W | 0.000731 | 67.0698 | 3.8386 | 70.9125 |
+| Remote TP2, experimental, 220 W | 0.000721 | 66.9962 | 2.9199 | 69.9195 |
+| Local TP2, 300 W | 0.00158 | 63.7292 | 3.3017 | 67.0359 |
+
+The remote TP4 process takes 124.09 seconds for loading, graph priming, both cold requests
+and teardown. Model loading is 15.840 seconds, including 11.816 seconds of upload; the first
+measured request starts 16.823 seconds after process launch. Saved-token preparation is not
+raw-text tokenizer latency.
+
+The six remote benchmark processes take 501.05 seconds in total (8 min 21 s), excluding
+model transfer, correctness gates and telemetry setup between processes. Each completed case
+is saved and is not repeated when the campaign resumes.
+
+### Initial controls: power-limit interpretation
+
+Read-only GPU telemetry is sampled every 0.2 seconds and aligned with each request's phase
+timers; 0.4 seconds at phase boundaries are excluded. During the TP4 85K interior windows,
+all four cards remain at **1200 MHz SM / 877 MHz memory**. Mean per-card draw is 174.52 W
+during prefill and 124.43 W during decode. No sampled software power cap or hardware thermal
+slowdown is active; maximum phase temperature is 62°C. Short spikes between samples remain
+unobserved.
+
+The same-host TP2 85K control does encounter the power cap during prefill: 47.88% of
+per-device samples report it active, with mean SM clock 1171.2 MHz and draw 211.76 W.
+Its decode stays at 1200 MHz / 177.45 W without sampled power or thermal limiting.
+If prefill were entirely SM-bound, restoring only its observed uncapped 1200 MHz would
+estimate `1267.34 * 1200/1171.2 = 1298.50 tok/s` (about +2.46%); memory/host time makes this
+an optimistic correction. This does not justify applying a 36.36% wattage ratio to either phase.
+The experimental TP2 85K decode likewise stays at 1200 MHz, averages 197.63 W and records
+no power or thermal slowdown. A whole-phase 1530/1200 frequency scenario would estimate
+223.38 tok/s for that separate profile; it is subject to the same limitations as the TP4
+frequency scenarios below.
+
+Consequently, the TP4 measurements do **not** establish a power-cap loss that can be recovered
+by multiplying throughput by `300/220`. With the same observed clocks, the evidence-supported
+estimate remains about **1740 prefill / 113 decode tok/s**. A separate optimistic clock-scaling
+scenario, assuming the frequency ceiling were relaxed and the entire phase scaled with SM
+clock, is:
+
+| Assumed SM clock | Estimated prefill tok/s | Estimated decode tok/s |
+|---:|---:|---:|
+| 1312 MHz, default application clock | 1902 | 124 |
+| 1530 MHz, advertised maximum | 2219 | 144 |
+
+These scenarios are `measured_rate * assumed_clock / 1200`, **not measured 300 W results**.
+Neither clock is attainable under the current 1200 MHz ceiling or guaranteed merely by a
+higher power limit. Unchanged memory/communication/host time reduces the benefit relative
+to this whole-phase linear assumption. No causal 220 W versus 300 W A/B was performed.
+
+Reports, exact commands, per-process elapsed times and health logs are saved locally under
+`profiles/bench/tp4-quasar-20261023/` and remotely under
+`~/Ninfer/profiles/tp4-quasar-20261023/`.
+
+## Earlier official NVFP4 / native FP8 measurements
 
 ### NVLink deployment: TP2 stage
 
@@ -176,9 +681,10 @@ output head and MTP stem remain BF16. The result is 31.30 GB (decimal). Its iden
 `qwen3.8-27b/fp8`, separate from the NVFP4 package's row-scaled FP8 projections.
 See the [native artifact contract](maintainer/qwen3.8-27b-artifact.md#native-block-128-fp8-textmtp-package).
 
-The selected TP4 domain is Qwen3.8-27B NVFP4/native FP8 Text/MTP on SM70. Native FP8 requires
-TP4; neither TP4 route admits Vision or DFlash. Its graph/eager, MTP commit, prefix-cache,
-HTTP and occupancy/capacity measurements above were obtained on the separate four-card host.
+The selected TP4 domain is Qwen3.8-27B official NVFP4, QUASAR NVFP4 and native FP8 Text/MTP
+on SM70. Native FP8 requires TP4; all three TP4 routes exclude Vision and DFlash. The older
+official NVFP4/native FP8 graph/eager, MTP commit, prefix-cache, HTTP and occupancy/capacity
+measurements in this section were obtained on the separate four-card host.
 The existing TP2 and 1Cat tables above are not relabeled as TP4 measurements.
 
 ## Request phases and qualification

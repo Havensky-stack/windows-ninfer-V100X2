@@ -44,11 +44,11 @@ def main() -> None:
     parser.add_argument('--dependency-prefix', type=Path, required=True)
     parser.add_argument('--cuda', type=Path, default=Path('/usr/local/cuda-12.8'))
     args = parser.parse_args()
+    repo = Path(__file__).resolve().parents[2]
     if platform.machine() != 'x86_64' or platform.system() != 'Linux':
         parser.error('this packager targets Linux x86_64')
-    if not re.fullmatch(r'0\.1\.\d+', args.version):
-        parser.error('this release lane packages 0.1.x; TP4 belongs to 0.2.0')
-    repo = Path(__file__).resolve().parents[2]
+    if not re.fullmatch(r'\d+\.\d+\.\d+', args.version):
+        parser.error('--version must be a numeric release version, such as 0.2.0')
     build = args.build.resolve()
     cache = (build / 'CMakeCache.txt').read_text()
     if not re.search(r'^CMAKE_CUDA_ARCHITECTURES:[^=]+=70$', cache, re.M):
@@ -79,7 +79,7 @@ def main() -> None:
     for soname, source in sorted(libraries.items()):
         shutil.copy2(source.resolve(), destination / 'lib' / soname)
     # Include the launchers and the two shipped user configurations, without model weights.
-    for file in ('ninfer_tui.py', 'ninfer_gui.py', 'gui_cache.py', 'launcher_sampling.py',
+    for file in ('ninfer_tui.py', 'ninfer_gui.py', 'gui_cache.py', 'launcher_sampling.py', 'launcher_model.py',
                  'launcher_configs.py', 'launcher_resources.py'):
         shutil.copy2(repo / 'tools/v100' / file, destination / 'tools/v100' / file)
     shutil.copytree(repo / 'tools/v100/configs', destination / 'tools/v100/configs')
@@ -95,6 +95,9 @@ def main() -> None:
             '--binary "$root/bin/ninfer-serve" "$@"\n')
     for file in ('LICENSE', 'NOTICE'):
         shutil.copy2(repo / file, destination / file)
+    (destination / 'docker').mkdir()
+    for file in ('entrypoint.py', 'Dockerfile.release'):
+        shutil.copy2(repo / 'docker' / file, destination / 'docker' / file)
     shutil.copytree(repo / 'third_party/licenses', destination / 'licenses/project-dependencies')
     # Distribution copyright files include the license and required attribution for system DSOs.
     missing_licenses = []

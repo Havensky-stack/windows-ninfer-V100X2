@@ -22,6 +22,7 @@ struct RoundStateSpec {
     std::int32_t output_rows     = 0;
     std::uint32_t batch_capacity = 1;
     std::uint32_t draft_window   = 0;
+    std::int32_t gdn_record_norm_heads = 0;
     bool enable_mtp              = false;
     bool enable_dflash           = false;
 };
@@ -149,6 +150,7 @@ struct RoundStateLayout {
     TensorRegion logits;
     TensorRegion text_kv_table_row;
     TensorRegion backend_kv_table_row;
+    std::optional<TensorRegion> gdn_record_norm_counts;
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
@@ -278,6 +280,8 @@ struct RoundState {
     Tensor logits;
     Tensor text_kv_table_row;
     Tensor backend_kv_table_row;
+    // Stream-ordered synchronization scratch, initialized once, self-reset by each record Op.
+    Tensor gdn_record_norm_counts;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

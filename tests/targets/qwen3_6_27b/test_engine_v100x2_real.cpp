@@ -1,5 +1,5 @@
-// Opt-in Qwen3.8 Q4_K_M/NVFP4 integration gate for two 16 GiB V100s. All engines
-// use TP2 and are destroyed before the next one is constructed: this artifact
+// Opt-in Qwen3.8 Q4_K_M/NVFP4 integration gate for the selected V100 TP2/TP4 domain.
+// Engines are destroyed before the next one is constructed: this artifact
 // cannot fit on one card. NINFER_V100X2_PROPOSAL_HEAD selects full (default) or
 // optimized; both run the same graph/eager and non-speculative target checks.
 //
@@ -172,8 +172,18 @@ void require_speculation(const ninfer::GenerationResult& result,
 
 void compare_rounds(const ninfer::GenerationResult& captured,
                     const ninfer::GenerationResult& eager) {
-    require(captured.generated_token_ids == eager.generated_token_ids,
-            "graph/eager speculative committed token sequences differ");
+    const auto& a_ids = captured.generated_token_ids;
+    const auto& b_ids = eager.generated_token_ids;
+    const auto mismatch = std::mismatch(a_ids.begin(), a_ids.end(), b_ids.begin(), b_ids.end());
+    if (mismatch.first != a_ids.end() || mismatch.second != b_ids.end()) {
+        const auto position = static_cast<std::size_t>(mismatch.first - a_ids.begin());
+        throw std::runtime_error(
+            "graph/eager speculative committed token sequences differ: position=" +
+            std::to_string(position) + " graph=" +
+            (mismatch.first == a_ids.end() ? "end" : std::to_string(*mismatch.first)) +
+            " eager=" +
+            (mismatch.second == b_ids.end() ? "end" : std::to_string(*mismatch.second)));
+    }
     const auto& a = captured.speculative;
     const auto& b = eager.speculative;
     require(a.rounds == b.rounds && a.drafted_tokens == b.drafted_tokens &&
@@ -267,6 +277,10 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
         for (std::size_t p = 0; p < kProbes; ++p) {
             const auto eager = generate(engine, inputs[p]);
             require_speculation(eager, profile);
+            std::cout << "eager probe=" << p << " prompt_tokens=" << inputs[p].size()
+                      << " output_tokens=" << eager.generated_token_ids.size()
+                      << " accepted=" << eager.speculative.accepted_tokens
+                      << "/" << eager.speculative.drafted_tokens << std::endl;
             compare_rounds(captured[p], eager);
         }
         compare_rounds(captured_sampled, generate_sampled(engine, inputs[0]));
@@ -357,9 +371,105 @@ int exercise(const char* artifact, ninfer::SpeculativeOptions profile) {
     return 0;
 }
 
+
+// Exercise the actual long-kernel window, rather than increasing capacity while
+// retaining a short prompt. The attention Op suite supplies the FP64 oracle;
+// this gate protects graph replay, MTP commits and exact saved frontiers.
+int exercise_long_attention(const char* artifact, ninfer::SpeculativeOptions profile,
+                            bool fast_decode) {
+    require(profile.backend == ninfer::SpeculativeBackend::Mtp && v100x2_test::pp() == 1,
+            "long attention state gate requires Text/MTP without pipeline parallelism");
+    std::array<ninfer::GenerationResult, 3> captured;
+    std::array<Logits, 3> captured_logits;
+    Tokens input;
+    for (const bool graphs : {true, false}) {
+        auto options = engine_options(artifact, true, graphs, profile);
+        options.max_context = 90000;
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(90000);
+        options.prefill_chunk = 2560;
+        options.prefix_cache_tokens = 0;
+        options.volta_long_attention = true;
+        options.volta_fast_decode = fast_decode;
+        ninfer::Engine engine(options);
+        v100x2_test::check_identity(engine);
+        engine.debug_enable_peer_egress_check(true);
+        engine.debug_enable_logit_capture(true);
+        if (input.empty()) {
+            const auto seed = prompts(engine)[1];
+            constexpr std::size_t suffix = 64;
+            for (std::size_t i = 0; i < 85000 - suffix; ++i) {
+                input.push_back(seed[i % (seed.size() - suffix)]);
+            }
+            input.insert(input.end(), seed.end() - suffix, seed.end());
+        }
+        for (std::size_t replay = 0; replay < captured.size(); ++replay) {
+            auto request = request_options(kOutputs);
+            // The empty Engine is cold; enabling reuse also captures its frontiers
+            // for subsequent requests. Disabling reuse would suppress those images.
+            request.execution.allow_prefix_reuse = true;
+            const auto before = engine.runtime_stats();
+            std::cout << "85K state graphs=" << graphs << " replay=" << replay
+                      << " begin" << std::endl;
+            auto result = engine.generate(engine.prepare_tokens(input), request);
+            const auto logits = engine.debug_last_round_logits_bf16();
+            const auto computed = engine.runtime_stats().computed_prefill_tokens -
+                                  before.computed_prefill_tokens;
+            require(result.generated_token_ids.size() == kOutputs,
+                    "long attention state gate ended before its token budget");
+            require_speculation(result, profile);
+            require(result.reused_prompt_tokens == (replay ? input.size() : 0) &&
+                    computed == (replay ? 0 : input.size()),
+                    "long attention cold/replay prefill accounting differs: graphs=" +
+                        std::to_string(graphs) + " replay=" + std::to_string(replay) +
+                        " reused=" + std::to_string(result.reused_prompt_tokens) +
+                        " computed=" + std::to_string(computed));
+            if (graphs && replay) {
+                require(captured[0].generated_token_ids == result.generated_token_ids,
+                        "long attention exact replay changed committed output");
+            }
+            std::cout << "85K state graphs=" << graphs << " replay=" << replay
+                      << " reused=" << result.reused_prompt_tokens << " computed=" << computed
+                      << " PASS" << std::endl;
+            if (graphs) {
+                captured[replay] = std::move(result);
+                captured_logits[replay] = logits;
+                if (replay == 2) {
+                    compare_rounds(captured[1], captured[2]);
+                    require(captured_logits[1] == captured_logits[2],
+                            "long attention repeated replay changed target logits");
+                }
+            } else {
+                compare_rounds(captured[replay], result);
+                require(captured_logits[replay] == logits,
+                        "long attention graph/eager target logits differ");
+            }
+        }
+        Tokens frontier = input;
+        frontier.insert(frontier.end(), captured.back().generated_token_ids.begin(),
+                        captured.back().generated_token_ids.end() - 1);
+        auto request = request_options(1);
+        request.execution.allow_prefix_reuse = true;
+        const auto resumed = engine.generate(engine.prepare_tokens(frontier), request);
+        require(resumed.reused_prompt_tokens == frontier.size() &&
+                resumed.generated_token_ids.size() == 1 &&
+                resumed.generated_token_ids.front() == captured.back().generated_token_ids.back(),
+                "long attention committed frontier did not resume exactly");
+        require((engine.memory_summary().cuda_graph_node_count > 0) == graphs,
+                "long attention graph admission differs from the selected route");
+        v100x2_test::check_peer_egress(engine, profile.backend);
+    }
+    std::cout << "85K long attention" << (fast_decode ? " + fast decode" : "")
+              << " MTP graph/eager, exact replay logits/counters and committed frontier PASS"
+              << std::endl;
+    return 0;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool long_attention = argc == 2 && std::string(argv[1]) == "--long-attention";
+    const bool long_fast = argc == 2 && std::string(argv[1]) == "--long-fast-decode";
+    if (argc != 1 && !long_attention && !long_fast) { return 2; }
     const char* artifact = std::getenv("NINFER_V100X2_ARTIFACT");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_V100X2_ARTIFACT is not set\n";
@@ -372,7 +482,9 @@ int main() {
         return 77;
     }
     try {
-        return exercise(artifact, v100x2_test::profile(ninfer::ProposalHead::Full));
+        const auto profile = v100x2_test::profile(ninfer::ProposalHead::Full);
+        return long_attention || long_fast
+            ? exercise_long_attention(artifact, profile, long_fast) : exercise(artifact, profile);
     } catch (const std::exception& error) {
         std::cerr << "V100X2 integration: " << error.what() << '\n';
         return 1;

@@ -4,6 +4,39 @@
 的 `qwen3_8_27b_nvfp4.ninfer`，完成后打开 TUI。按 `s` 加载模型并启动 API，
 再按 `s` 停止；`q` 停止服务并退出。首次下载需要足够的磁盘空间。
 
+## v0.2.0 成品镜像
+
+Release 附件包含 `ninfer-0.2.0-docker-linux-amd64.tar.gz`。下载后直接加载，无需编译：
+
+```bash
+docker load -i ninfer-0.2.0-docker-linux-amd64.tar.gz
+docker run --rm -it --gpus all --ipc=host -p 8080:8080 \
+  -v ninfer-models:/Models/ninfer-V100X2 \
+  -v ninfer-data:/data ninfer-v100:0.2.0
+```
+
+该镜像直接使用同版 Linux SM70 预编译包中的程序和依赖，默认下载 QUASAR v3 并打开 TUI。
+需要宿主机 NVIDIA 驱动与 Container Toolkit；不包含模型、驱动或 GUI 的 Qt。
+本次提供可 `docker load` 的镜像归档，不依赖登录镜像仓库。
+若已载入镜像，Compose 可直接 `docker compose run --rm --service-ports ninfer`。
+
+绕过 TUI 直接启动 TP4，256K 总上下文、128K 输出硬上限、默认关闭思考：
+
+```bash
+docker run --rm --name ninfer-tp4 --gpus '"device=0,1,2,3"' --ipc=host \
+  -p 8080:8080 -v /path/to/quasar-v3:/models:ro \
+  --entrypoint /opt/ninfer/bin/ninfer-serve ninfer-v100:0.2.0 \
+  /models/qwen3_8_27b_nvfp4.ninfer --host 0.0.0.0 --port 8080 \
+  --tp 4 --devices 0,1,2,3 --max-context 262144 --kv-dtype int8 \
+  --prefill-chunk 2560 --max-concurrency 1 \
+  --spec mtp --draft-tokens 4 --lm-head-draft \
+  --volta-long-attention --volta-fast-decode \
+  --default-max-tokens 131072 --max-output-tokens 131072 --no-thinking
+```
+
+256K 是输入与输出合计的容量；上下文剩余量仍会限制实际输出。
+两个数值实验均开启，可能改变 logits、草稿接受率和输出，未做当前组合的新 GPQA。
+
 ## 启动
 
 宿主机需要 Linux、可用的 NVIDIA 驱动、Docker Compose v2 和
@@ -22,10 +55,10 @@ Vision 和两个数值实验关闭。API 在容器内监听 `0.0.0.0:8080`，映
 无需 Compose 的等价命令：
 
 ```bash
-docker build -t ninfer:v100 .
+docker build -t ninfer-v100:0.2.0 .
 docker run --rm -it --gpus all --ipc=host -p 8080:8080 \
   -v ninfer-models:/Models/ninfer-V100X2 \
-  -v ninfer-data:/data ninfer:v100
+  -v ninfer-data:/data ninfer-v100:0.2.0
 ```
 
 构建并行度默认 2，可用 `NINFER_BUILD_JOBS=2 docker compose build` 调低；
@@ -60,7 +93,7 @@ NINFER_MODEL=https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer \
 ```bash
 docker run --rm -it --gpus all --ipc=host -p 8080:8080 \
   -v /Models/ninfer-V100X2:/Models/ninfer-V100X2 \
-  -v ninfer-data:/data ninfer:v100 \
+  -v ninfer-data:/data ninfer-v100:0.2.0 \
   --model /Models/ninfer-V100X2/qwen3_8_27b_q4_k_m.ninfer --profile q4-mtp3
 ```
 

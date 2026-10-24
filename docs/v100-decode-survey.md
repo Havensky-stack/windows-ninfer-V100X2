@@ -1,6 +1,6 @@
 # V100 decoding 优化：公开项目调研与借鉴清单
 
-调研日期：2026-10-18；源码与本机接入更新至 2026-10-19。对象是本工作区的 **2 × V100-SXM2 16 GB、CUDA 12.8、SM70、单请求 decoding**；本机使用 **PCIe P2P，没有 NVLink**。远端 TP4/NVLink 单独看待。
+调研日期：2026-10-18；源码与试验更新至 2026-10-23。对象是本工作区的 **2 × V100-SXM2 16 GB、CUDA 12.8、SM70、单请求 decoding**；本机使用 **PCIe P2P，没有 NVLink**。远端 TP4/NVLink 单独看待。
 
 本报告回答“读哪些项目、借鉴什么、落到哪里、如何判断值得保留”。它是研究结论，不修改现行产品契约，也不表示候选已经移植或在本机测得收益。检索覆盖 GitHub 仓库搜索、公开搜索引擎、上游引用及相关分支；下列为本轮能够核实的公开项目，不作全网穷尽声明。
 
@@ -21,13 +21,19 @@
 按用户当前优先级，后续实现集中在 **QUASAR NVFP4 decoding**：先研究 **长上下文 INT8 attention 的访存/归约、NVFP4 QPN 的形状专用调度**，再研究 **QUASAR 使用的 W8 词表/MTP、GDN 周边融合、通信、投机轮次成本**。Q4_K_M、普通 groupwise INT4 和原生 FP8 的专用工作保留为低优先级待引入项，暂不投入实现；QUASAR 自身使用的 W8/BF16 组件仍在范围内。这是待验证的选题顺序，不是未经 profile 就认定的瓶颈排序。
 
 本轮验收固定 **MTP4**：85000 实际输入 tokens、180000 context capacity、单请求、
-双卡 TP2、INT8 group-64 KV、CUDA Graphs，以 committed wall decode 计数；最低目标
-180 tok/s。已达 180 后，用户把当前目标提高到 **200 tok/s**，不再追 220；继续把调研清单中适用于当前
-QUASAR/MTP4 的增量对照、筛选并整合，汇报采用项、未采用原因和输出影响。不继续扩大草稿窗口或测试 DFlash。其他窗口、后端及精度的
+双卡 TP2、INT8 group-64 KV、CUDA Graphs，以 committed wall decode 计数。早期最低目标为
+180 tok/s，随后曾追求 **200 tok/s**；2026-10-22 用户取消固定速度目标，改为试验下列六个
+QUASAR/MTP4 方向，汇报采用项、未采用原因和输出影响：attention 加载重叠、MTP 尾部融合、
+TP2 通信/归一化、NVFP4 QPN 调度、GDN value tile 和固定 MTP4 历史查找。
+不继续扩大草稿窗口或测试 DFlash。其他窗口、后端及精度的
 相关机制仍留在待引入/继续优化池，但不占用本轮实现优先级。输出变化方案单独记录收益和
 质量证据，GPQA 是否运行由用户决定。
 
 ## 收尾与未完成项（用户于 2026-10-19 调整范围）
+
+2026-10-21 用户在恢复设备后重新开启 QUASAR TP2 的 prefill/decode 优化；2026-10-22
+将交付范围收敛为六项 decode 试验，继续固定 MTP4，不以达到 200 或 250 tok/s 为完成条件。
+以下停止说明记录上轮收尾；新结果见[性能记录](performance.md)。
 
 用户决定仅完成当前 MTP W8 布局/分区试验，此后停止追逐 200 tok/s；未达到不再启动下一轮优化。
 最终保留 **198.105 / 198.097 tok/s**（均值 198.101），未达 200 后按用户要求停止新候选。
@@ -37,7 +43,8 @@ QUASAR/MTP4 的增量对照、筛选并整合，汇报采用项、未采用原�
 - 完整历史 INT8 attention 的 QK/PV 分块、跨 head 复用、加载重叠和 softmax/归约布局。
 - NVFP4 QPN 的形状调度、metadata/activation 复用及 MLP epilogue；已测较慢的具体变体不等于方向封顶。
 - MTP W8 打包与小矩阵调度、共享词表/候选精确重评分、context-conditioned shortlist。
-- TP2 PCIe packet 的 producer/consumer 融合、协议和同步；MTP 冗余 token 广播及小算子融合尚未移除。
+- TP2 PCIe packet 的 producer/consumer 融合、协议和同步；本轮已移除 TP2 MTP stem 中无人读取的
+  token 广播，其他通信与小算子融合继续优化。
 - GDN 的 value tile、状态/快照及周边融合。
 - 固定 MTP4 的 lookup：此 corpus 的 16-token suffix 无命中，其他上下文策略仍待验证。
 - 草稿近似注意力：16K/32K 仅 AR 试验因接受率下降，整机均慢于完整历史，未采用；继续待优化。
@@ -46,9 +53,70 @@ QUASAR/MTP4 的增量对照、筛选并整合，汇报采用项、未采用原�
 - QUASAR TP2/MTP4 的现有完整视觉/前缀集成检查已通过（4096 容量）；视觉预设默认冷请求，可手动开启前缀。
   更长的视觉占用、视觉质量任务评分仍未测，不当作纯文本 85K 性能证据。
 
-当前交付转为：保留最佳已验证实现、实验入口显示收益和数值影响、清理确认无用的临时脚本，
+上轮交付转为：保留最佳已验证实现、实验入口显示收益和数值影响、清理确认无用的临时脚本，
 并主要适配含/不含视觉的 QUASAR NVFP4。视觉版复用已含 Vision payload 的发布 artifact，
 需通过本地视觉集成验证后再删除旧 Unsloth 派生模型。
+
+### 六项 decode 试验（2026-10-22）
+
+六项均已实现候选并进行本机 85K/MTP4 测量，详见[完整结果与验证范围](performance.md#six-quasarmtp4-decode-trials-2026-10-22)。
+本轮重新测得基线 196.938 / 197.062 tok/s；保留的 MTP argmax/remap 尾部融合为
+197.062 / 197.318，513 个输出 IDs 和全部接受计数不变，尚不能认定整机提速。
+attention 预取 188.754、TP2 packet 向量化 193.073、QPN split-4 191.874，均未采用。
+GDN 小 value tile 初测 197.308、复测 197.614 / 197.698，已与尾部融合一起保留；
+2048 decode tokens 的配对检查为 181.580 → 181.880（约 +0.16%），2049 个输出 IDs 和
+全部接受计数一致。收益很小，这些顺序测量不构成统计显著性或通用提升的证明。
+
+固定 MTP4 的八 token 后缀 lookup 提案试验为 187.220 tok/s，14 次命中仅接受 23 个草稿。
+该试验保留完整 target 验证，但仍运行 learned drafter；它验证了此提案策略接受效果不佳，
+没有验证“命中后跳过 drafter”的完整优化收益。上述具体变体已回滚，整个方向仍保留待优化。
+QPN 和 packet 变体均在第 130 个输出首次发生差异，因此也不作为无损方案推荐。
+本轮没有运行 GPQA。整数映射融合没有新增浮点运算；GDN 保留逐列 FP32 状态更新、
+归约与 BF16 边界，没有引入新的低精度配置。原有实验性 profile 的数值影响仍然存在。
+
+### TP4 源码复核（2026-10-23）
+
+本轮重新读取了 1Cat、SGLang-V100、v100-skinny、geoffwatts、Duo，另外复核
+HOOLIGAN 和 voltattn 的实际 kernel。远端现存 1Cat 启动脚本使用 QUASAR + DFlash2，
+本轮 NInfer 继续固定用户指定的 MTP4；同机现有 1Cat 1.5.1 也显式改用 MTP4 对跑，
+没有下载或重装，更没有把其原启动脚本当作同条件速度结果。
+
+| 实际源码 | TP4 可取之处 / 本地处理 |
+|---|---|
+| 1Cat `custom_all_reduce.cuh` | 固定 rank 特化和保留本地贡献；本地 BF16 packet256、逐 rank FP32 归约，固定全局顺序。普通 85K wall 从原始 113.306 提升到 145.556 tok/s |
+| 1Cat `grouped-attention.cu::GroupedVerifyTraits`、combine kernel | 打包共享 KV、按 SM 数量组织 split、合并时共享权重。TP4 每卡仅一个 KV head，测试较短分区及直接读取合并；属于 default-off long attention，分区变化会改变输出与接受率 |
+| 1Cat `nvfp4_qpn2_sm70.cu` / `nvfp4_qpn4_sm70.cu`、v100-skinny `skinny_nvfp4_qpn2` | streaming、FP16 activation 复用、按形状 split-K。TP4 的 3584/4096 输入、4352 gate/up 和 1536/4352 contraction 独立筛选；不能直接沿用 TP2 的参数 |
+| SGLang `sm70_nvfp4_moe_decode.cu` 与 MTP worker、1Cat `gdn_verify_sm70.cu` | 整轮 Graph、批量投影、窄 value tile；本地已有对应 Graph 与 FP32-state 窄 tile。保持本地 BF16 边界与 FP32 GDN 状态，继续保留融合与 tile 优化方向 |
+| geoffwatts / Duo `mtp_impl.h`、NVFP4 QPN | 复核真实验证与重对齐调度；本地已由同族路径扩展 TP4，不把同源整体当作无需继续优化 |
+| HOOLIGAN `split_decode.cu`、voltattn `voltattn.cu` | K/V 同时取数、subwarp 多请求在途和足够 split 并行度；本地长 QPN 已同时读 K/V。更深预取仍待实测，D128 专用布局不直接替代本地 D256/INT8-G64 |
+
+四卡当前保留组合在 85K 输入、MTP4、220 W / 1200 MHz 下实测 **257.773 / 258.300 wall tok/s**，
+均值 **258.037**，prefill **2258.49 tok/s**。此前配对 gate/up 与四组 QPN 调度达到 231.302；
+本轮继续引入大消息 reduce-scatter/allgather、TP4 Split-D prefill、64-pack 投影发布、640-thread
+sum/norm、verify5 下一块 K/V 预取、每 rank N32768 的 FP32 proposal 归约，以及保留
+FP32→BF16→FP16 显式舍入的 norm 输出 image，省去独立 cast；随后将 T2..8 的 GDN controls
+合为单次 launch，保留 split-10 的点积和合并顺序，相对 norm-image 阶段再提升约 1.78%，
+并通过独立 FP64 oracle。TP4 GDN projection/record/conv 随后融合为直接输出，
+保留公开 BF16 record 边界，省去中间投影副本与 launch；独立 FP64 点积/conv oracle 通过。
+相对 250.824 阶段再提升 2.88%，相对 231 阶段 decode +11.56%，prefill 约 +29.5%。这些是固定任务的顺序测量，不是各机制独立增幅。
+Split-D 会改变浮点关联，保存输出与 231 阶段在第 505 个 token 起分叉；norm-image 与后续两步 GDN 融合的全部
+513 IDs 和接受计数则与合格的 244.655 阶段相同。不能继续宣称所有阶段输出不变。
+普通模式为 **181.952 / 182.196 tok/s**，均值 **182.074**，prefill **2251.22 tok/s**；
+普通模式同样使用 Split-D prefill，不代表它与早期普通路径逐位等价。
+同机 1Cat 在相同 85000 IDs、180K capacity、chunk2560、MTP4、单请求、513 输出的两次冷请求中
+测得 **98.249 / 102.509**，均值 **100.379 wall tok/s**；首字 **35.9378 s**，本组合为
+**37.6367 s**。本组合完整请求 **39.6209 s**，1Cat 为 **41.0408 s**。1Cat 使用 FP16/E4M3 KV，
+本地使用 BF16/INT8-G64，已有对比在 325 个共享输出 IDs 后分歧；不是同精度或同质量比较。
+四卡 collective/attention/投影/SwiGLU 独立 oracle、当前普通状态、前缀及实际 85K long/fast
+Graph/eager、重放 logits/接受计数与提交前沿检查通过。旧 eager-only 未初始化残差分支已删除，
+真实形状残差回归通过 initcheck。两个实验入口默认关闭，当前组合没有 GPQA，**未达到 300 tok/s**，
+也没有证据把当前速度当作硬件极限。
+更深预取、activation/metadata 布局与 QPN 调度仍保留优化方向；本轮具体的 staging/occupancy、
+共享 activation 双 accumulator、W8 重排、64-key attention tile、GDN chunk64 变体均未证明
+整模型收益，已撤回，不能将方向整体排除。
+TP4 residual/collective/RMSNorm 融合继续列为低优先级待优化：必须使用真实 residual，且 epoch
+域与 packet256 一致，不能直接恢复被删除的试验实现。
+最终测量与数值影响以 [TP4 记录](tp4.md) 为准。算子筛选不能替代四卡整请求结果。
 
 ## 2. 本地实现读到了什么
 
@@ -67,7 +135,7 @@ QUASAR/MTP4 的增量对照、筛选并整合，汇报采用项、未采用原�
 
 量化路径必须区分：本地 **groupwise Q4、GGUF Q4_K/Q6_K、NVFP4、W8、原生 block-FP8** 不是同一个 codec。Q4_K 的 scale/minimum 仿射解码也不能直接替换成对称 INT4 解码。
 
-当前 QUASAR MTP4 保留组合实测为 **196.471 / 196.433 committed wall tok/s**（两次冷请求；85K 实际输入、180K capacity；当前组合已通过整模型 Graph/eager MTP4 状态复验），当前目标为 200。已接入 parent FP32 epilogue、输入投影 streaming、TP2 packet push、sum/RMSNorm 融合与跨层交接、MTP shortlist tiled argmax、GDN output activation staging、投影 epilogue 提前发布 packet、精确 split-10 controls 与 projection/conv/record 融合。随后又接入 packed KV vector16、输出投影 streaming、W8 byte-permute 和 FP32 proposal top-1。全部 513 输出 IDs 保持一致；FP32 proposal 将接受计数变为 390/486、122 rounds、零 fallback，此前为 389/490、123 rounds。parent epilogue 与 QPN5 会改变计算关联；组合的 25 点 default 对照为 argmax 25/25、min cosine 0.998831、max KL 0.001903，未过 near-lossless。后续精确组合保持这条测得轨迹，不能据此声称全局无损。FP32 proposal 会改变草稿选择，但不修改 target head/采样政策。W8 预转换整机 193.207，未确认收益，已恢复生产路径；该方向继续待优化。未跑新 GPQA。具体命令、证据和历史阶段见 [performance.md](performance.md)；Q4_K_M 的原对照不能用这些 QUASAR 数字替代。
+前一轮的中间组合曾测得 **196.471 / 196.433 committed wall tok/s**（两次冷请求；85K 实际输入、180K capacity；当时组合通过整模型 Graph/eager MTP4 状态复验）。已接入 parent FP32 epilogue、输入投影 streaming、TP2 packet push、sum/RMSNorm 融合与跨层交接、MTP shortlist tiled argmax、GDN output activation staging、投影 epilogue 提前发布 packet、精确 split-10 controls 与 projection/conv/record 融合。随后又接入 packed KV vector16、输出投影 streaming、W8 byte-permute 和 FP32 proposal top-1。全部 513 输出 IDs 保持一致；FP32 proposal 将接受计数变为 390/486、122 rounds、零 fallback，此前为 389/490、123 rounds。parent epilogue 与 QPN5 会改变计算关联；组合的 25 点 default 对照为 argmax 25/25、min cosine 0.998831、max KL 0.001903，未过 near-lossless。后续精确组合保持这条测得轨迹，不能据此声称全局无损。FP32 proposal 会改变草稿选择，但不修改 target head/采样政策。W8 预转换整机 193.207，未确认收益，已恢复生产路径；该方向继续待优化。未跑新 GPQA。当前结果及历史阶段见 [performance.md](performance.md)；Q4_K_M 的原对照不能用这些 QUASAR 数字替代。
 
 草稿窗口也要区分：Q4_K_M 验收配置最多三草稿；27B 产品契约上限为七，但当前工作区 [`config.h`](../src/targets/qwen3_6_27b/impl/config.h) 的 `kMaximumMtpDraftTokens` 为五。外部 q7/q15/B8 成绩不能直接当成本地可用配置。
 
@@ -194,6 +262,34 @@ QUASAR/MTP4 的增量对照、筛选并整合，汇报采用项、未采用原�
 不能因为 **IST-DASLab 的 Marlin 上游要求 SM80** 就排除 Marlin 方向。`zhinianqin/marlin_v100` 明确提供独立 SM70 dense/MoE 工作区、七字段 CTA/warp geometry、split-K、metadata cache 及独立的 repack macro-N。它适合与 QPN 比较不同 token 宽度和矩阵形状；README 列有多种 V100 模型测试，但没有足够条件在此直接推断本地 T=1..4 的收益。其 N/K tile、scale metadata 布局及 epilogue 也可独立借鉴。
 
 `haohervchb/sglang-V100` 是另一条实际存在的 Volta 引擎路线，不能只搜到 `dg1kjd/sglang-sxm2` 就停止。其 README 覆盖四张 V100-32GB/NVLink，报告原生 Qwen3.8-27B FP8 target-only 在 70K/200K 约 **59.1/49.6 tok/s**，对应 CUDA split-KV 与 fused QPN8 gate/up；还记录 DFlash2 的不同上下文结果。1Cat 的 `custom_all_reduce.cuh` 明确注明从它适配 one-shot push collective，因此通信研究应追到该源实现，而不只看下游开关。两仓库本轮均为 README/引用核实，未完整审核其 kernel。
+
+### 4.7 verssionhack / PR #3：调度与会话状态管理（2026-10-22）
+
+[PR #3](https://github.com/tuxKOH/ninfer-V100X2/pull/3) 的完整 diff 为 90 个文件、
+新增 10751 行、删除 415 行。其中测试新增 2051 行，文档新增 344 行；家族 runtime
+新增 6201 行，包含会话归档、检查点、持久化和 CPU Vision。它不只是一个调度参数，
+也没有修改 `src/ops` 下的 decode CUDA 算子。
+
+| 具体机制 | 对当前目标的作用 | 接入或研究状态 |
+|---|---|---|
+| prefill 步间执行多轮 decode | 已有流在其他请求 prefill 时得到更多输出机会 | 已接入 `--prefill-decode-rounds`，默认 1；本地 85K × 2 / MTP4 对照见下文 |
+| 有 decoder 时缩小 prefill slice，无 decoder 时恢复完整 chunk | 缩短一次 prefill 对已有流的连续阻塞；可能牺牲 prefill 和整组吞吐 | **P1 待验证**。PR 同时增加 `PrefillStepResult::service_units`，使小片段不逐次扣完整服务配额；本地接入必须与现有树检查点切分、slice/完整 chunk 切换的 admission 计费一起验证，不能只复制 `min(chunk, slice)` |
+| 合并连续物理页传输、固定页内存中转、避免恢复后立即被覆盖的 GDN 导入 | 降低归档/恢复成本，可能减少会话切换停顿 | **P2 保留参考**。本地 `transfer_kv_pages` 已合并连续页；pinned staging 尚未作本地 A/B。属于缓存路径，按用户本轮范围暂不接入 |
+| GPU 前缀页引用计数、跨 lane 共享和写时复制 | 共同前缀请求可减少重复 GPU KV 占用 | **P2 保留参考**。与本地不可变 host chunk 共享不同，不应视作树缓存已经覆盖；尚无本地单请求或总吞吐收益证据，本轮不改缓存 |
+| RAM parking、消息/tools/response 边界、取消后保留状态、落后分枝恢复 | 避免多会话或客户端重写时重复 prefill | **P2 保留参考**。本地树缓存与其中部分目标重叠，不代表所有状态场景已经等价支持；本轮不移植第二套缓存体系 |
+| 磁盘 spill、序列镜像/索引、重启恢复、后台 FIFO 写盘、启动预读/过期清理 | 扩展历史会话保存并减少同步写盘停顿 | **条件候选**。本地没有该磁盘层；PR 的磁盘读取和 GPU 恢复仍在 worker 同步执行，不能称为可与 decode 交错的分步恢复 |
+| CPU Vision、GPU Vision 临时空间按需分配、VMM 换出并恢复 KV/state | 以 CPU 工作或搬运时间换取视觉显存空间 | **低优先级保留参考**，服务于视觉/容量目标；没有证据支持纯文本稳态 decode 提速 |
+| 队列超时可禁用、prefill 进度、SSE keepalive、模型上下文公告 | 改善长请求服务体验与客户端集成 | **低优先级保留参考**，不作为 decode 算力收益 |
+
+已接入的多轮 decode 在 QUASAR TP2、MTP4、两个同时提交的冷请求（每条 85000 输入、
+2048 输出）、chunk 1024 下，把已有流在混合期间的 committed wall 输出速度从
+5.026 提高到 17.689 tok/s；该流整个 decode 区间从 22.894 提高到 24.044 tok/s。
+代价是后一个请求的 TTFT 增加 5.75 秒，整组吞吐下降约 0.5%。这不是单请求稳态
+decode 加速；两组输出 IDs 也有差异，未作无损或质量结论，未跑 GPQA。
+完整测量条件和限制见 [性能记录](performance.md#decode-service-during-another-requests-prefill-2026-10-22)。
+
+以上是源码复核和候选归纳；除多轮 decode 外，其余机制未在本地移植验证，
+不能把未测候选当成已证明无用，也不能将 PR 作者的测量直接当成本机收益。
 
 ## 5. 广覆盖项目清单
 

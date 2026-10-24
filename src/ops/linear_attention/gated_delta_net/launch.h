@@ -3,6 +3,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/tensor.h"
+#include "ninfer/ops/gated_delta_net.h"
 
 #include <cuda_runtime.h>
 
@@ -49,6 +50,13 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
                              const Tensor& valid_columns, const Tensor& initial_state_slots,
                              Tensor& key_record, Tensor& value_record, Tensor& gate_record,
                              Tensor& out, cudaStream_t stream);
+
+void launch_recurrent_record_norm(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& g, const Tensor& beta, float scale,
+                                  const Tensor& ssm_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots, Tensor& key_record,
+                                  Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                  const GdnReplayGatedNorm& norm, cudaStream_t stream);
 
 void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,
                         const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,

@@ -330,6 +330,10 @@ ninfer_add_test(ninfer_http_error_handler_test
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_error_handler_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+ninfer_add_test(ninfer_model_residency_real_test
+  SOURCES test_model_residency_real.cpp
+  LIBRARIES ninfer_serve)
+set_tests_properties(ninfer_model_residency_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp
@@ -417,6 +421,10 @@ ninfer_add_op_test(ninfer_output_head_split_test
 ninfer_add_op_test(ninfer_attention_headlocal_test
   SOURCES ops/test_attention_headlocal.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_attention_headlocal_tp4_test
+  SOURCES ops/test_attention_headlocal.cpp
+  LIBRARIES ninfer_ops)
+target_compile_definitions(ninfer_attention_headlocal_tp4_test PRIVATE NINFER_ATTENTION_TP=4)
 ninfer_add_op_test(ninfer_gdn_headsplit_test
   SOURCES ops/test_gdn_headsplit.cpp
   LIBRARIES ninfer_ops)
@@ -439,6 +447,8 @@ set_tests_properties(ninfer_ram_kv_real_test PROPERTIES TIMEOUT 1200 SKIP_RETURN
 ninfer_add_op_test(ninfer_gdn_tp4_test
   SOURCES ops/test_gdn_tp4.cpp
   LIBRARIES ninfer_ops)
+add_test(NAME ninfer_gdn_tp4_decode_test COMMAND ninfer_gdn_tp4_test --gdn-decode)
+set_tests_properties(ninfer_gdn_tp4_decode_test PROPERTIES SKIP_RETURN_CODE 77)
 # The visible-key domain past the pre-YaRN 262144 bound: its own target because it needs multi-GiB
 # KV pools and a long FP64 oracle, and skips per case when the device cannot hold one.
 ninfer_add_op_test(ninfer_gqa_attention_long_context_test

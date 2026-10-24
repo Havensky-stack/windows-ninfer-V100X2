@@ -22,7 +22,8 @@ void proposal_argmax(const Tensor& x, const Weight& w, Tensor& scratch, Tensor& 
         throw std::invalid_argument("proposal_argmax: invalid score/index output");
     }
 #ifdef NINFER_VOLTA_BUILD
-    if (device_sm == 70 && w.qtype == QType::Q4G64_F16S && w.n == 65536 && w.k == 5120 &&
+    if (device_sm == 70 && w.qtype == QType::Q4G64_F16S &&
+        (w.n == 32768 || w.n == 65536) && w.k == 5120 &&
         w.padded_shape[1] == 5120 && x.ne[1] == 1 && valid_rows == w.n) {
         detail::proposal_q4_sm70_launch(x, w, scratch, scores, indices, stream);
         return;

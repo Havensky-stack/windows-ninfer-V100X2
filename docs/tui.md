@@ -1,6 +1,6 @@
 # NInfer terminal launcher
 
-Run from a local terminal or SSH session with Python 3.11 and curses (standard library on Linux).
+Run from a local terminal or SSH session with Python 3.11+ and curses (standard library on Linux).
 No GUI, pip packages, GPU allocation or driver changes are required to open the launcher.
 
 ```bash
@@ -11,7 +11,9 @@ The default is **QUASAR NVFP4 / TP2 / MTP4 / 180K**, INT8 KV, prefill chunk 2560
 CUDA Graphs and prefix reuse enabled, 65536 default output tokens, loopback port 8080,
 one active request. It selects the existing `build-v100/apps/ninfer-serve`, or the local
 `build-v100-tp4/apps/ninfer-serve` when the first is absent. This build-directory name does
-not select TP4. Artifact paths are explicit; models are never downloaded or converted here.
+not select TP4. Artifact paths are explicit; the TUI itself does not download or convert models.
+The [Docker entrypoint](docker.md) downloads QUASAR v3 (or a custom `--model` URL), then opens
+this launcher with the downloaded path, container binary and `0.0.0.0` API listen address.
 
 ## Controls / 操作
 
@@ -28,6 +30,8 @@ not select TP4. Artifact paths are explicit; models are never downloaded or conv
 | `l` | scroll a server-log snapshot / 滚动查看服务日志 |
 | `s` | start or stop this launcher's server / 启动或停止 |
 | `r` | stop, then restart the owned child / 重启自己的服务 |
+| `u` | hot unload to host RAM, clearing KV/prefix caches / 热卸载到内存 |
+| `g` | hot load from host RAM into VRAM / 从内存热加载回显存 |
 | `q` / Esc / Ctrl-C | stop the owned server and exit / 停止自己的服务并退出 |
 
 Use a terminal at least **80 columns × 18 rows**. Settings are locked while the child runs;
@@ -38,10 +42,21 @@ sets only the server's default thinking on/off, not a universal `xhigh` request 
 Command, impact and log panels support Up/Down/PgUp/PgDn scrolling; other keys return.
 The default thinking setting follows the server (on); existing saved choices take precedence.
 
+`u` / `g` keep the owned server process and its configuration alive. The status row shows model
+residency, retained RAM size and transition progress. Unload rejects active requests rather than
+cancelling generation. On the first unload the complete original `.ninfer` container is copied to
+host RAM, then model/KV/GDN/workspace/graphs are destroyed; CUDA driver context overhead may
+remain. Allow the container's byte size plus 1 GiB available host memory. Reload uses the RAM image,
+rebuilds the runtime and retains that image for subsequent cycles. KV, prefix history and processed
+media caches are cleared, so the next request is cold. RAM-only/loading/offloading states return
+HTTP 503 for inference. Failed reload leaves the RAM image available for retry. Stop/restart releases
+the image. No power or clock setting changes. See [serving lifecycle API](serving.md#model-residency).
+
 Non-secret preferences are saved after edits and on exit to
 `${XDG_CONFIG_HOME:-~/.config}/ninfer/tui.json`. Use `--settings PATH` for a separate file or
 `--no-settings` to neither read nor save preferences. Explicit `--profile` is applied after saved
-settings, then `--binary`/`--artifact` override paths. Applying a preset clears prior experiment
+settings, then `--binary`/`--artifact` override paths. `--host` and `--log` override the API
+listen address and request JSONL path. Applying a preset clears prior experiment
 and sampling overrides. API keys are masked in the editor and command preview and are never saved.
 
 Editable service controls include KV capacity (empty = context, `auto`, or an explicit count),
@@ -73,6 +88,11 @@ budget suffices for the chart image; the bundled five-second video requires 4096
 disables prefix reuse to match the 85K timing setup. The normal MTP4 preset keeps model sampling
 defaults and prefix reuse. `i` explains the combined ~198.1 tok/s result, the final W8 step's
 ~0.84% gain, and the prior 25-point logit evidence (9/25 near-lossless, max KL 0.001903103).
+The experiment panel also reports the separate four-card 85K/MTP4 result, **231.11 / 231.49
+wall tok/s** at 220 W / 1200 MHz. Paired projection/QPN tuning is +6.62% over 216.93 with identical
+fixture IDs/counters; the underlying long/fast profiles can still change outputs.
+After removing an eager-only residual trial that read uninitialized scratch, the normal,
+prefix and actual-85K Graph/eager, replay-logit/counter and committed-frontier checks pass.
 IQ/task-accuracy impact is unknown; the current combination has no GPQA result. Gains are not
 independent per-switch ratios and do not describe Vision throughput. `Long attention (Text/Vision)`
 also supports TP2 images/video with either GPU or CPU vision encoding and complete INT8 KV;

@@ -13,7 +13,7 @@ namespace ninfer::ops {
 // Returns FP32 winning scores and I32 row indices [T]. Exact computed ties choose
 // the lower row. Near ties are qualified by the selected score profile's error and
 // oracle score deficit; unlike target argmax this Op has no semantic BF16-logit cast.
-// SM70 Q4G64 N65536/K5120/T1 retains FP32 scores through its reduction. Other routes
+// SM70 Q4G64 N32768 or N65536/K5120/T1 retains FP32 scores through its reduction. Other routes
 // compose the qualified BF16 Linear/Argmax profile. Neither route changes weights.
 // `scratch` is disjoint contiguous BF16 [N,T] storage, unspecified on return;
 // the fused route reuses its bytes for FP32/I32 reduction tiles. `workspace` supplies

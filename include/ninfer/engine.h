@@ -8,6 +8,18 @@
 
 namespace ninfer {
 
+// Original packed .ninfer container in host RAM; owns no CUDA resources or request state.
+class ModelMemory {
+public:
+    ModelMemory() = default;
+    [[nodiscard]] std::uint64_t bytes() const noexcept;
+    [[nodiscard]] explicit operator bool() const noexcept { return bytes() != 0; }
+private:
+    struct Impl;
+    std::shared_ptr<const Impl> impl_;
+    friend class Engine;
+};
+
 class PreparedPrompt {
 public:
     PreparedPrompt() noexcept;
@@ -65,6 +77,7 @@ private:
 class Engine {
 public:
     explicit Engine(EngineOptions options);
+    Engine(EngineOptions options, const ModelMemory& model);
     ~Engine();
 
     Engine(Engine&&) noexcept;
@@ -98,6 +111,8 @@ public:
                               const CancellationView& cancellation = {});
 
     [[nodiscard]] const EngineOptions& options() const;
+    // Captures original codes/scales, not live KV/GDN/prefix state. Does not unload this Engine.
+    [[nodiscard]] ModelMemory retain_model_in_memory(const LoadProgress& progress = {}) const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;

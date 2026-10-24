@@ -23,6 +23,10 @@ std::int32_t checked_i32(std::uint64_t value, const char* label) {
 }
 
 void validate_spec(const RoundStateSpec& spec) {
+    if (spec.gdn_record_norm_heads != 0 &&
+        (spec.gdn_record_norm_heads != 12 || !spec.enable_mtp)) {
+        throw std::invalid_argument("RoundState record-norm counters require MTP with 12 heads");
+    }
     if (spec.enable_mtp && spec.enable_dflash) {
         throw std::invalid_argument("RoundState speculative extensions are mutually exclusive");
     }
@@ -75,6 +79,10 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     layout.logits     = add_tensor(builder, DType::BF16, {spec.output_rows, 1}, "step logits");
     layout.text_kv_table_row    = add_tensor(builder, DType::I32, {1}, "step Text KV table row");
     layout.backend_kv_table_row = add_tensor(builder, DType::I32, {1}, "step backend KV table row");
+    if (spec.gdn_record_norm_heads != 0) {
+        layout.gdn_record_norm_counts = add_tensor(
+            builder, DType::I32, {spec.gdn_record_norm_heads}, "GDN record-norm completion counts");
+    }
     return layout;
 }
 
@@ -349,6 +357,9 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     logits               = layout.logits.bind(backing);
     text_kv_table_row    = layout.text_kv_table_row.bind(backing);
     backend_kv_table_row = layout.backend_kv_table_row.bind(backing);
+    if (layout.gdn_record_norm_counts) {
+        gdn_record_norm_counts = layout.gdn_record_norm_counts->bind(backing);
+    }
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }
     if (layout.mtp_decode) {

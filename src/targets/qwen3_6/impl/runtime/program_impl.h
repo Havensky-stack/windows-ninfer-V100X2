@@ -240,6 +240,10 @@ PeerRuntime::PeerRuntime(DeviceContext& peer_device, const LoadedModelData& peer
         replay_records.emplace(backing, *plan.persistent.replay_records);
     }
     io             = qwen3_6::RoundState(backing, plan.persistent.round);
+    if (io.gdn_record_norm_counts.data != nullptr) {
+        CUDA_CHECK(cudaMemsetAsync(io.gdn_record_norm_counts.data, 0,
+                                   io.gdn_record_norm_counts.bytes(), device.stream));
+    }
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     token_counts   = plan.persistent.token_counts.bind(backing);
 }
@@ -359,6 +363,10 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in,
     }
 
     io = qwen3_6::RoundState(backing, plan.persistent.round);
+    if (io.gdn_record_norm_counts.data != nullptr) {
+        CUDA_CHECK(cudaMemsetAsync(io.gdn_record_norm_counts.data, 0,
+                                   io.gdn_record_norm_counts.bytes(), device.stream));
+    }
     if (io.mtp.has_value() != (speculative_backend == SpeculativeBackend::Mtp)) {
         throw std::logic_error("round-state MTP extension does not match the sequence plan");
     }

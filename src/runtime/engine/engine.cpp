@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "artifact/reader.h"
 
 #include "core/device.h"
 #include "runtime/contract/sampling.h"
@@ -207,6 +208,14 @@ GenerationResult GenerationHandle::wait(OutputSink* sink, const CancellationView
     return impl->wait(sink, cancellation);
 }
 
+struct ModelMemory::Impl {
+    std::shared_ptr<const std::vector<std::byte>> image;
+};
+
+std::uint64_t ModelMemory::bytes() const noexcept {
+    return impl_ ? impl_->image->size() : 0;
+}
+
 class Engine::Impl {
 public:
     using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
@@ -214,11 +223,12 @@ public:
     using Executor =
         std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
 
-    explicit Impl(EngineOptions engine_options)
+    explicit Impl(EngineOptions engine_options,
+                  std::shared_ptr<const std::vector<std::byte>> image = {})
         : options(std::move(engine_options)),
           execution(resolve_execution_device_ids(options), options.storage_device) {
         DeviceContext& device = execution.primary();
-        auto constructed      = targets::construct_target(options, execution);
+        auto constructed      = targets::construct_target(options, execution, std::move(image));
         active                = std::move(constructed.active);
         load                  = std::move(constructed.load);
         sampling_defaults     = constructed.sampling_defaults;
@@ -258,6 +268,26 @@ public:
 };
 
 Engine::Engine(EngineOptions options) : impl_(std::make_shared<Impl>(std::move(options))) {}
+
+Engine::Engine(EngineOptions options, const ModelMemory& model) {
+    if (!model) { throw std::invalid_argument("no model retained in host RAM"); }
+    impl_ = std::make_shared<Impl>(std::move(options), model.impl_->image);
+}
+
+ModelMemory Engine::retain_model_in_memory(const LoadProgress& progress) const {
+    if (!impl_) { throw std::logic_error("Engine is moved from"); }
+    artifact::Reader reader(impl_->options.artifact_path);
+    if (reader.identity().model_id != impl_->load.model_id ||
+        reader.identity().weights_id != impl_->load.weights_id) {
+        throw std::runtime_error("artifact identity changed since model load");
+    }
+    ModelMemory result;
+    result.impl_ = std::make_shared<ModelMemory::Impl>(reader.retain_in_memory(
+        [&](std::uint64_t done, std::uint64_t total) {
+            if (progress.callback) { progress.callback("retain_host", done, total); }
+        }));
+    return result;
+}
 
 Engine::~Engine()                            = default;
 Engine::Engine(Engine&&) noexcept            = default;

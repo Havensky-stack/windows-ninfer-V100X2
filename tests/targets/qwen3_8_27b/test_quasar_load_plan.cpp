@@ -58,70 +58,102 @@ void verify(const char* path) {
     require(reader.identity().model_id == "qwen3.8-27b" &&
                 reader.identity().weights_id == "quasar-nvfp4", "QUASAR identity was not retained");
     require(reader.objects().size() == 1334, "QUASAR projected inventory is incomplete");
-    for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp,
-                               ninfer::SpeculativeBackend::DFlash}) {
-        Binder binder(reader, 2);
-        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
-            {.speculative = backend}, 2);
-        int projections = 0;
-        const auto check = [&](const WeightPlan& weight, const std::string& divisor) {
-            const auto& descriptor = std::get<TensorDescriptor>(binder.descriptor(weight.object));
-            const auto& original = stored.at(descriptor.name);
-            require(weight.format == NumericFormat::NVFP4 && original.at("format") == "nvfp4",
-                    descriptor.name + ": wrong weight format");
-            const auto payload = reader.payload(descriptor);
-            require(payload.absolute_offset == payload_start + original.at("offset").get<std::uint64_t>() &&
-                        payload.data.size() == original.at("bytes").get<std::uint64_t>(),
-                    descriptor.name + ": not the exact original packed payload range");
-            const auto elements = descriptor.shape[0] * descriptor.shape[1];
-            // All registered shapes have aligned code planes; stored E2M1/E4M3 words are
-            // followed by one FP32 weight divisor. Read it directly from the original file.
-            const auto expected_weight = scalar(original.at("offset").get<std::uint64_t>() +
-                                                elements / 2 + elements / 16);
-            const auto expected_input = scalar(stored.at(divisor).at("offset").get<std::uint64_t>());
-            require(weight.weight_scale_divisor_bits == expected_weight &&
-                        weight.input_scale_divisor_bits == expected_input,
-                    descriptor.name + ": scale pairing differs from source FP32 words");
-            ++projections;
-        };
-        for (std::size_t layer = 0; layer < plan.bindings.text_layers.size(); ++layer) {
-            const auto& weights = plan.bindings.text_layers[layer];
-            const auto prefix = "text/layers/" + std::to_string(layer) + "/";
-            if (weights.is_full_attention) {
-                check(std::get<FusedAttentionProjectionPlan>(weights.attention.projection).query_key_gate_value,
-                      prefix + "attention/input_projection/input_scale_divisor");
-                check(weights.attention.output, prefix + "attention/output_projection/input_scale_divisor");
-            } else {
-                check(std::get<FusedGdnInputProjectionPlan>(weights.gdn.input_projection).query_key_value_z,
-                      prefix + "gdn/input_projection/input_scale_divisor");
-                check(weights.gdn.output, prefix + "gdn/output_projection/input_scale_divisor");
-                require(std::get<FusedGdnControlProjectionPlan>(weights.gdn.control_projection)
-                            .a_b_projection.format == NumericFormat::BF16,
-                        "QUASAR GDN controls lost the artifact's BF16 boundary");
+    for (const int tp : {2, 4}) {
+        for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp,
+                                   ninfer::SpeculativeBackend::DFlash}) {
+            if (tp == 4 && backend == ninfer::SpeculativeBackend::DFlash) { continue; }
+            Binder binder(reader, tp);
+            const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+                {.speculative = backend,
+                 .proposal_head = backend == ninfer::SpeculativeBackend::Mtp
+                     ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full}, tp);
+            int projections = 0;
+            const auto check = [&](const WeightPlan& weight, const std::string& divisor) {
+                const auto& descriptor = std::get<TensorDescriptor>(binder.descriptor(weight.object));
+                const auto& original = stored.at(descriptor.name);
+                require(weight.format == NumericFormat::NVFP4 && original.at("format") == "nvfp4",
+                        descriptor.name + ": wrong weight format");
+                const auto payload = reader.payload(descriptor);
+                require(payload.absolute_offset == payload_start + original.at("offset").get<std::uint64_t>() &&
+                            payload.data.size() == original.at("bytes").get<std::uint64_t>(),
+                        descriptor.name + ": not the exact original packed payload range");
+                const auto elements = descriptor.shape[0] * descriptor.shape[1];
+                // All registered shapes have aligned code planes; stored E2M1/E4M3 words are
+                // followed by one FP32 weight divisor. Read it directly from the original file.
+                const auto expected_weight = scalar(original.at("offset").get<std::uint64_t>() +
+                                                    elements / 2 + elements / 16);
+                const auto expected_input = scalar(stored.at(divisor).at("offset").get<std::uint64_t>());
+                require(weight.weight_scale_divisor_bits == expected_weight &&
+                            weight.input_scale_divisor_bits == expected_input,
+                        descriptor.name + ": scale pairing differs from source FP32 words");
+                ++projections;
+            };
+            for (std::size_t layer = 0; layer < plan.bindings.text_layers.size(); ++layer) {
+                const auto& weights = plan.bindings.text_layers[layer];
+                const auto prefix = "text/layers/" + std::to_string(layer) + "/";
+                if (weights.is_full_attention) {
+                    check(std::get<FusedAttentionProjectionPlan>(weights.attention.projection).query_key_gate_value,
+                          prefix + "attention/input_projection/input_scale_divisor");
+                    check(weights.attention.output, prefix + "attention/output_projection/input_scale_divisor");
+                } else {
+                    check(std::get<FusedGdnInputProjectionPlan>(weights.gdn.input_projection).query_key_value_z,
+                          prefix + "gdn/input_projection/input_scale_divisor");
+                    check(weights.gdn.output, prefix + "gdn/output_projection/input_scale_divisor");
+                    require(std::get<FusedGdnControlProjectionPlan>(weights.gdn.control_projection)
+                                .a_b_projection.format == NumericFormat::BF16,
+                            "QUASAR GDN controls lost the artifact's BF16 boundary");
+                }
+                check(weights.mlp.gate_up, prefix + "mlp/gate_up_projection/input_scale_divisor");
+                check(weights.mlp.down, prefix + "mlp/down_projection/input_scale_divisor");
             }
-            check(weights.mlp.gate_up, prefix + "mlp/gate_up_projection/input_scale_divisor");
-            check(weights.mlp.down, prefix + "mlp/down_projection/input_scale_divisor");
+            require(projections == 256 && plan.bindings.token_embedding.format == NumericFormat::W8G32_F16S &&
+                        plan.bindings.output_head.format == NumericFormat::W8G32_F16S &&
+                        plan.bindings.mtp_format == NumericFormat::W8G32_F16S,
+                    "QUASAR storage profile is incomplete");
+            int mtp_objects = 0;
+            std::array<int, 4> dflash_objects{};
+            std::array<int, 4> output_heads{};
+            std::array<int, 4> mtp_heads{};
+            for (const auto& placement : plan.materialization.device_objects) {
+                const auto name = object_name(binder.descriptor(placement.object));
+                require(!name.starts_with("vision/"),
+                        "text-only QUASAR uploaded a Vision object to a GPU");
+                if (name.starts_with("dflash/")) { ++dflash_objects.at(placement.device); }
+                if (name.starts_with("mtp/")) { ++mtp_objects; }
+                if (name == "text/output_head") { ++output_heads.at(placement.device); }
+                if (name == "text/draft_head") { ++mtp_heads.at(placement.device); }
+            }
+            require(backend == ninfer::SpeculativeBackend::Mtp ? mtp_objects > 0 : mtp_objects == 0,
+                    "MTP startup selection is incorrect");
+            require(dflash_objects == (backend == ninfer::SpeculativeBackend::DFlash
+                        ? std::array{66, 66, 0, 0} : std::array{0, 0, 0, 0}),
+                    "DFlash startup selection is incorrect");
+            for (int rank = 0; rank < tp; ++rank) {
+                require(output_heads.at(rank) == 1 &&
+                            mtp_heads.at(rank) == (backend == ninfer::SpeculativeBackend::Mtp ? 1 : 0),
+                        "vocabulary/proposal head residency is incomplete");
+            }
+            require(plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,
+                    "QUASAR DFlash projections lost their W8 format");
         }
-        require(projections == 256 && plan.bindings.token_embedding.format == NumericFormat::W8G32_F16S &&
-                    plan.bindings.output_head.format == NumericFormat::W8G32_F16S &&
-                    plan.bindings.mtp_format == NumericFormat::W8G32_F16S,
-                "QUASAR storage profile is incomplete");
-        int mtp_objects = 0;
-        std::array<int, 2> dflash_objects{};
-        for (const auto& placement : plan.materialization.device_objects) {
-            const auto name = object_name(binder.descriptor(placement.object));
-            require(!name.starts_with("vision/"),
-                    "text-only QUASAR uploaded a Vision object to a GPU");
-            if (name.starts_with("dflash/")) { ++dflash_objects.at(placement.device); }
-            if (name.starts_with("mtp/")) { ++mtp_objects; }
-        }
-        require(backend == ninfer::SpeculativeBackend::Mtp ? mtp_objects > 0 : mtp_objects == 0,
-                "MTP startup selection is incorrect");
-        require(dflash_objects == (backend == ninfer::SpeculativeBackend::DFlash
-                    ? std::array{66, 66} : std::array{0, 0}),
-                "DFlash startup selection is incorrect");
-        require(plan.bindings.dflash.projection_format == NumericFormat::W8G32_F16S,
-                "QUASAR DFlash projections lost their W8 format");
+    }
+    for (int mode = 0; mode < 2; ++mode) {
+        Binder binder(reader, 4);
+        bool rejected = false;
+        try {
+            (void)bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+                {.vision = mode == 0, .volta_fast_decode = false,
+                 .speculative = mode == 1 ? ninfer::SpeculativeBackend::DFlash
+                                          : ninfer::SpeculativeBackend::Mtp}, 4);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected, "unsupported TP4 Vision/DFlash combination admitted");
+    }
+    {
+        Binder binder(reader, 4);
+        const auto plan = bind_artifact(binder, WeightsProfile::Qwen38QuasarNvfp4,
+            {.volta_fast_decode = true, .speculative = ninfer::SpeculativeBackend::Mtp}, 4);
+        require(plan.bindings.features.volta_fast_decode,
+                "TP4 experimental fast-decode profile was not selected");
     }
     for (const auto device : {ninfer::VisionDevice::Gpu, ninfer::VisionDevice::Cpu}) {
     for (const auto backend : {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp}) {
@@ -171,7 +203,7 @@ int main() {
     if (!path || !*path) { std::cout << "SKIP: set NINFER_QUASAR_ARTIFACT\n"; return 77; }
     try {
         verify(path);
-        std::cout << "OK QUASAR exact packed ranges, 256 scale pairs, TP2 None/MTP/DFlash placement "
+        std::cout << "OK QUASAR exact packed ranges, 256 scale pairs, TP2/TP4 None/MTP placement, TP2 DFlash "
                      "zero Text GPU Vision objects, TP2 Vision placement and experimental admission\n";
         return 0;
     } catch (const std::exception& error) {

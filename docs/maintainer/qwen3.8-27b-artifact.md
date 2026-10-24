@@ -168,7 +168,8 @@ four-partition QPN association, and wider calls decode the same packed planes in
 MMA staging tiles. No second resident weight copy or request-time repacking is added.
 
 The trial admits SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP,
-and experimental TP1/PP2 Text/None/MTP. Standalone TP1 and TP4 are rejected. Vision excludes
+experimental TP4 Text/None/MTP, and experimental TP1/PP2 Text/None/MTP. Standalone TP1 is
+rejected. TP4 excludes Vision, DFlash and both experimental decode switches. Vision excludes
 DFlash, PP2 and both experimental decode switches. Its 333 stored Vision objects (295,711,648
 bytes) are uploaded only to the primary device when enabled; Text-only loading validates
 them without allocating GPU storage. The same published v3 file supports both startup modes;
@@ -182,9 +183,10 @@ DFlash2 objects retain W8 projections and BF16 auxiliaries, use the same text-on
 as the official v3 package, and become resident only when DFlash is selected. MTP and DFlash
 are mutually exclusive; the DFlash window is at most seven.
 The host-only `ninfer_quasar_load_plan_test` checks every NVFP4 parent's original file range,
-all 256 exact FP32 scale pairs, None/MTP/DFlash residency and zero Vision objects uploaded to
-either GPU. Vision remains validation-only in the original file; removing its disk payload
-would not reduce this text-only profile's GPU memory. The public-Engine state gate and trial
+all 256 exact FP32 scale pairs, TP2/TP4 None/MTP placement, TP2 DFlash residency,
+per-rank vocabulary/proposal-head placement and zero Vision objects uploaded in Text mode.
+It also checks TP4 Vision/DFlash/fast-decode rejection and TP2 Vision placement. Removing the
+Vision disk payload would not reduce the text-only profile's GPU memory. The public-Engine state gate and trial
 measurements are separate evidence; neither proves BF16-equivalent model quality.
 
 The fixed target facts below also apply to this checkpoint; Section 3's mixed FP8/NVFP4

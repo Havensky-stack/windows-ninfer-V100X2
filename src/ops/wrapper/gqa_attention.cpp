@@ -330,13 +330,16 @@ VoltaFlashWorkspace allocate_volta_flash_workspace(Allocator& workspace, std::in
     const std::int32_t n_kv =
         ((visible + detail::kVoltaFlashKeyPad - 1) / detail::kVoltaFlashKeyPad) *
         detail::kVoltaFlashKeyPad;
-    const std::int32_t tokens   = std::min(width, detail::kVoltaFlashQBlockTokens);
+    const std::int32_t tokens = q_heads == 6 ? width :
+        std::min(width, detail::kVoltaFlashQBlockTokens);
 
     return {
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
         workspace.alloc(DType::FP16, {kHeadDim, kv_heads, n_kv, 1}),
-        workspace.alloc(DType::FP16, {n_kv, tokens + detail::kVoltaFlashMaskRowPad, 1, 1}),
-        workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
+        q_heads == 6 ? Tensor{} :
+            workspace.alloc(DType::FP16, {n_kv, tokens + detail::kVoltaFlashMaskRowPad, 1, 1}),
+        workspace.alloc(q_heads == 6 ? DType::FP16 : DType::FP32,
+                        {kHeadDim, q_heads, q_heads == 6 ? (tokens + 63) / 64 * 64 : tokens, 1}),
         workspace.alloc(DType::FP32, {kHeadDim, q_heads, tokens, 1}),
         workspace.alloc(DType::FP32,
                         {2, static_cast<std::int32_t>(

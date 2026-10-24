@@ -220,8 +220,12 @@ constexpr std::int32_t kShardIntermediate = kShardGateUpRows / 2; // 8704
 void validate_swiglu_column_rank_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                            LinearPolicy policy, int tp) {
     validate_policy(policy);
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("linear_swiglu column-parallel: x/out must be BF16");
+    const bool fp16_image = tp == 4 && x.ne[1] >= 1 && x.ne[1] <= 8 &&
+        policy == LinearPolicy::A16Only && w.qtype == QType::NVFP4 &&
+        w.layout == QuantLayout::VoltaQpnPrepacked;
+    if ((x.dtype != DType::BF16 && !(fp16_image && x.dtype == DType::FP16)) ||
+        (out.dtype != DType::BF16 && !(fp16_image && out.dtype == DType::FP16))) {
+        throw std::invalid_argument("linear_swiglu column-parallel: invalid x/output dtype");
     }
     const std::int32_t t = x.ne[1];
     const std::int32_t shard_rows = 34816 / tp;
@@ -298,18 +302,21 @@ void validate_swiglu_split_pair(std::span<const Tensor> x, std::span<const Weigh
         throw std::invalid_argument("linear_swiglu: input/weight width must equal TP width");
     }
     for (int rank = 1; rank < ec.device_count; ++rank) {
-    if (x[0].ne[1] != x[rank].ne[1]) {
-        throw std::invalid_argument(
-            "linear_swiglu column-parallel: both ranks must carry the same token count");
-    }
-    if (w[0].qtype != w[rank].qtype || w[0].layout != w[rank].layout) {
-        throw std::invalid_argument(
-            "linear_swiglu column-parallel: both ranks must carry the same weight format");
-    }
-    if (w[0].k != w[rank].k) {
-        throw std::invalid_argument(
-            "linear_swiglu column-parallel: both ranks must consume the same input extent K");
-    }
+        if (x[0].dtype != x[rank].dtype) {
+            throw std::invalid_argument("linear_swiglu column-parallel: input dtypes disagree");
+        }
+        if (x[0].ne[1] != x[rank].ne[1]) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel: all ranks must carry the same token count");
+        }
+        if (w[0].qtype != w[rank].qtype || w[0].layout != w[rank].layout) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel: all ranks must carry the same weight format");
+        }
+        if (w[0].k != w[rank].k) {
+            throw std::invalid_argument(
+                "linear_swiglu column-parallel: all ranks must consume the same input extent K");
+        }
     }
 }
 

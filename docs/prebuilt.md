@@ -1,14 +1,15 @@
 # Linux V100 prebuilt package
 
-The v0.1.2 release includes an optional Linux x86_64 / `sm_70` / CUDA 12.8 binary package.
-It targets V100, including the tested two-card 16 GB QUASAR configuration. Model weights,
-the NVIDIA driver, Python and Qt are not included. This does not qualify the TP4 candidate;
-TP4 work remains assigned to v0.2.0.
+The v0.2.0 release includes a Linux x86_64 / `sm_70` / CUDA 12.8 binary package.
+It supports the qualified V100 TP2 routes and QUASAR TP4 Text/MTP, including both optional
+experimental profiles. Model weights, the NVIDIA driver, Python and Qt are not included.
+See [TP4 measurements and limits](tp4.md); TP4 Vision/DFlash remain unsupported.
 
 Use Ubuntu 22.04 or newer, or a compatible Linux distribution whose glibc meets the exact
 `minimum_glibc` in `manifest.json`. A working NVIDIA driver is required; use driver 570 or newer
-for the CUDA 12.8 build. Older CUDA 12.x drivers may depend on minor-version compatibility and
-are not the release's tested baseline. The CUDA Toolkit, nvcc and system FFmpeg development
+for the CUDA 12.8 build. The separate native Linux TP4 host also passes real serving on
+driver 550.163.01 through CUDA minor-version compatibility; this is a measured configuration,
+not qualification of every older driver or deployment. The CUDA Toolkit, nvcc and system FFmpeg development
 packages are unnecessary when using this package. The package bundles its CUDA runtime,
 FFmpeg/curl dependencies, C++ runtime and license notices; it uses the host's glibc and NVIDIA
 driver. CPU Vision uses statically linked single-threaded OpenBLAS.
@@ -42,11 +43,11 @@ GPU; only BF16 visual embeddings are uploaded. CPU and GPU visual arithmetic are
 bit-identical. Long attention also changes floating-point association, so both can change
 logits or generated output. No new GPQA score or losslessness claim is made.
 
-To reproduce the package after a release build with the private dependency prefix:
+To reproduce the v0.2.0 package after building with the private dependency prefix:
 
 ```bash
-.venv/bin/python3 tools/release/package_linux.py --build build-v100 \
-  --output dist --version 0.1.2 --dependency-prefix build/_deps/install
+.venv/bin/python3 tools/release/package_linux.py --build build-v100-tp4 \
+  --output dist --version 0.2.0 --dependency-prefix build/_deps/install
 ```
 
 The packager checks transitive library resolution, glibc symbols, dependency license files and

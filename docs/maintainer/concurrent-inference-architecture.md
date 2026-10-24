@@ -61,6 +61,21 @@ Engine lane and does not introduce request-time TP/PP migration.
 
 ### 1.3 Required sequence-state substrate
 
+Serving additionally owns explicit `gpu → offloading → ram → loading → gpu` residency control.
+It is admitted only with zero request-lifetime reservations, including preparation, queued work,
+response consumers and their owning generation handles. `PreparedRequest` destroys its handle
+before releasing the reservation. The transition closes ingress; racing requests receive 503,
+and competing transitions/active requests produce 409. Count-token operations hold the same
+reservation while accessing the Engine frontend. Status/stats queries serialize against the
+transition boundary; completed execution counters accumulate across Engine reconstructions.
+
+`artifact::Reader` supplies immutable original container bytes in host RAM. The public Engine can
+retain this image and reconstruct through the same registry/materialization path; serving never
+owns target-private tensor layout or GPU transfer logic. Successful offload destroys the executor,
+Program and loaded model. No request/KV/GDN/prefix/processed-media state survives, no mutable
+Program bytes are shared, and a failed reload leaves the RAM image available for another attempt.
+This is not sequence swapping, preemption, or pause/resume. Startup configuration is unchanged.
+
 并发引擎要求下层提供 concurrent-capable sequence-state substrate，并以该 contract 已满足为前提。
 该 substrate 必须提供：
 
@@ -825,23 +840,27 @@ boundary 最多发布一个新 admitted request。
 
 ### 7.3 Decode/prefill policy
 
-调度策略为：
+当有 prefill owner 时，调度策略为：
 
 ```text
-if the completed unit was a DecodeRound and a prefill owner exists:
-    run one latency-bounded PrefillChunk
-else if one or more requests are DECODE_READY:
+if DECODE_READY is nonempty and rounds_since_prefill < prefill_decode_rounds:
     run one DecodeRound containing all of them
-else if a prefill owner exists:
-    run the next PrefillChunk
+    increment rounds_since_prefill
 else:
-    remain idle
+    run one latency-bounded PrefillChunk
+    reset rounds_since_prefill
 ```
 
-因此 decode 和 prefill 同时持续 runnable 时：
+`EngineOptions::prefill_decode_rounds` / `--prefill-decode-rounds` 启动时固定为 `1..64`，
+默认 `1` 保持原交替顺序。实验性增大该值会给已有输出流更多 decode 服务，代价是新请求的
+prefill 墙钟时间和 TTFT 增加。它不缩小 prefill step，也不改变 admission 的 service-work 计费。
+每轮仍重新处理 cancellation、构建包含全部 ready lanes 的 compact batch 并完成 publication；
+burst 不持有跨轮 membership，也不延迟这些 boundary 操作。
+
+因此 decode 和 prefill 同时持续 runnable 时（`N=prefill_decode_rounds`）：
 
 ```text
-DecodeRound -> PrefillChunk -> DecodeRound -> PrefillChunk -> ...
+PrefillChunk -> N DecodeRounds -> PrefillChunk -> N DecodeRounds -> ...
 ```
 
 没有 decode-ready request 时，prefill chunks 连续执行；没有 prefill owner 时，decode rounds 连续执行。
@@ -849,7 +868,7 @@ DecodeRound -> PrefillChunk -> DecodeRound -> PrefillChunk -> ...
 当没有 prefill owner 而 ordered pending queue 非空时，§5 选中的 head 或 backfill request 占用下一次
 prefill/finalization opportunity：GPU idle 时可以立即 admission；已有 decode-ready rows 时，先完成一个
 DecodeRound，再 admission selected request 并执行它的 first prefill/finalization unit。若该 unit 未完成，
-它成为唯一 prefill owner并进入上述交替；若它完成，request 在下一 boundary 加入 decode batch。持续
+它成为唯一 prefill owner，计数归零并进入上述顺序；若它完成，request 在下一 boundary 加入 decode batch。持续
 ingress 因此不能在两个 donor progress rounds 之间连续 admission 多个 requests，也不能无限延迟 frozen
 frontier 的 decode progress。
 

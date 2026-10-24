@@ -15,10 +15,10 @@ void gqa_attention_single_qpn_volta_launch(
     const GqaSmallTInvocation& invocation, std::int32_t logical_capacity,
     bool long_profile, std::int32_t splits, Tensor& partial_acc, Tensor& partial_m,
     Tensor& partial_l, cudaStream_t stream) {
-    const auto launch = [&]<bool MultiBatch, bool Masked, typename CacheInput>(CacheInput input) {
+    const auto launch = [&]<typename Geometry, bool MultiBatch, bool Masked, typename CacheInput>(CacheInput input) {
         const auto profile = [&]<bool LongProfile>() {
-            gqa_attention_single_qpn_volta_partial_i8_kernel<MultiBatch, Masked, CacheInput, LongProfile>
-                <<<dim3(Gqa27Tp2Geometry::KVHeads, splits, invocation.batch_size), 256, 0, stream>>>(
+            gqa_attention_single_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput, LongProfile>
+                <<<dim3(Geometry::KVHeads, splits, invocation.batch_size), 256, 0, stream>>>(
                     static_cast<const __nv_bfloat16*>(q.data), input,
                     static_cast<const std::int32_t*>(positions.data),
                     static_cast<std::int8_t*>(cache.k_pages.data),
@@ -38,17 +38,24 @@ void gqa_attention_single_qpn_volta_launch(
         else { profile.template operator()<false>(); }
         CUDA_CHECK(cudaGetLastError());
     };
-    const auto dispatch = [&]<typename CacheInput>(CacheInput input) {
+    const auto dispatch_geometry = [&]<typename Geometry, typename CacheInput>(CacheInput input) {
         if (invocation.batch_size == 1) {
             if (invocation.valid_columns != nullptr) {
-                launch.template operator()<false, true>(input);
+                launch.template operator()<Geometry, false, true>(input);
             } else {
-                launch.template operator()<false, false>(input);
+                launch.template operator()<Geometry, false, false>(input);
             }
         } else if (invocation.valid_columns != nullptr) {
-            launch.template operator()<true, true>(input);
+            launch.template operator()<Geometry, true, true>(input);
         } else {
-            launch.template operator()<true, false>(input);
+            launch.template operator()<Geometry, true, false>(input);
+        }
+    };
+    const auto dispatch = [&]<typename CacheInput>(CacheInput input) {
+        if (q.ne[1] == Gqa27Tp4Geometry::QHeads) {
+            dispatch_geometry.template operator()<Gqa27Tp4Geometry>(input);
+        } else {
+            dispatch_geometry.template operator()<Gqa27Tp2Geometry>(input);
         }
     };
     if (new_k != nullptr) { dispatch(GqaAppendInput{new_k, new_v}); }
@@ -61,13 +68,13 @@ void gqa_attention_verify_qpn_volta_launch(
     const GqaSmallTInvocation& invocation, std::int32_t logical_capacity,
     std::int32_t splits, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
     cudaStream_t stream) {
-    const auto launch = [&]<bool MultiBatch, bool Masked, typename CacheInput>(CacheInput input) {
+    const auto launch = [&]<typename Geometry, bool MultiBatch, bool Masked, typename CacheInput>(CacheInput input) {
         const auto issue = [&](auto kernel, int dynamic_bytes) {
             if (dynamic_bytes != 0) {
                 ensure_func_attr_per_device(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                              dynamic_bytes);
             }
-            kernel<<<dim3(Gqa27Tp2Geometry::KVHeads, splits, invocation.batch_size),
+            kernel<<<dim3(Geometry::KVHeads, splits, invocation.batch_size),
                        256, dynamic_bytes, stream>>>(
                 static_cast<const __nv_bfloat16*>(q.data), input,
                 static_cast<const std::int32_t*>(positions.data),
@@ -85,24 +92,31 @@ void gqa_attention_verify_qpn_volta_launch(
                 static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
         };
         if (invocation.width == 5) {
-            issue(gqa_attention_verify5_qpn_volta_partial_i8_kernel<MultiBatch, Masked, CacheInput>, 0);
+            issue(gqa_attention_verify5_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput>, 0);
         } else {
-            issue(gqa_attention_verify_qpn_volta_partial_i8_kernel<MultiBatch, Masked, CacheInput>,
+            issue(gqa_attention_verify_qpn_volta_partial_i8_kernel<Geometry, MultiBatch, Masked, CacheInput>,
                   kGqaVerifyQpnDynamicBytes);
         }
         CUDA_CHECK(cudaGetLastError());
     };
-    const auto dispatch = [&]<typename CacheInput>(CacheInput input) {
+    const auto dispatch_geometry = [&]<typename Geometry, typename CacheInput>(CacheInput input) {
         if (invocation.batch_size == 1) {
             if (invocation.valid_columns != nullptr) {
-                launch.template operator()<false, true>(input);
+                launch.template operator()<Geometry, false, true>(input);
             } else {
-                launch.template operator()<false, false>(input);
+                launch.template operator()<Geometry, false, false>(input);
             }
         } else if (invocation.valid_columns != nullptr) {
-            launch.template operator()<true, true>(input);
+            launch.template operator()<Geometry, true, true>(input);
         } else {
-            launch.template operator()<true, false>(input);
+            launch.template operator()<Geometry, true, false>(input);
+        }
+    };
+    const auto dispatch = [&]<typename CacheInput>(CacheInput input) {
+        if (q.ne[1] == Gqa27Tp4Geometry::QHeads) {
+            dispatch_geometry.template operator()<Gqa27Tp4Geometry>(input);
+        } else {
+            dispatch_geometry.template operator()<Gqa27Tp2Geometry>(input);
         }
     };
     if (new_k != nullptr) {

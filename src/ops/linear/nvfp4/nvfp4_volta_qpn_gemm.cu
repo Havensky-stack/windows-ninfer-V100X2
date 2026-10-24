@@ -25,7 +25,8 @@ bool nvfp4_volta_qpn_precast_supported(std::int32_t n, std::int32_t k,
                                       std::int32_t tokens) noexcept {
     const bool gdn_output = n == 5120 && k == 3072 && tokens >= 1 && tokens <= 8;
     return gdn_output || ((tokens >= 4 && tokens <= 6) &&
-           ((k == 5120 && (n == 7168 || n == 8192)) || (n == 5120 && k == 8704)));
+           ((k == 5120 && (n == 3584 || n == 4096 || n == 7168 || n == 8192)) ||
+            (n == 5120 && (k == 1536 || k == 4352 || k == 8704))));
 }
 
 std::size_t nvfp4_volta_qpn_precast_workspace_bytes(std::int32_t n, std::int32_t k,

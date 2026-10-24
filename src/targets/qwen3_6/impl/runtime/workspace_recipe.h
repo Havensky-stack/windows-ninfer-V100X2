@@ -138,8 +138,9 @@ Tensor gdn_recurrent_output(Allocator& allocator, std::int32_t tokens, std::int3
 }
 
 template <class Config, class Allocator>
-Tensor gdn_normalized_output(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1) {
-    return matrix(allocator, DType::BF16, Config::value_dim / tp, tokens);
+Tensor gdn_normalized_output(Allocator& allocator, std::int32_t tokens, std::int32_t tp = 1,
+                             DType dtype = DType::BF16) {
+    return matrix(allocator, dtype, Config::value_dim / tp, tokens);
 }
 
 template <class Config, class Allocator>

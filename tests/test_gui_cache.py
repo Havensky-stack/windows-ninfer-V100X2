@@ -167,6 +167,39 @@ class GuiCacheDisplay(unittest.TestCase):
         self.gui._poll_cache()
         self.assertEqual(self.gui.cache_monitor.requests, 2)
 
+    def test_model_residency_controls_and_progress(self):
+        from tools.v100.launcher_model import ModelControl
+        from unittest.mock import Mock
+        self.assertFalse(self.gui.offload_button.isEnabled())
+        self.assertFalse(self.gui.load_button.isEnabled())
+        process = object()
+        self.gui.process = process
+        self.gui.server_listening = True
+        model = ModelControl('http://127.0.0.1:1')
+        model.poll = Mock()
+        self.gui.model_control = model
+        try:
+            for state, unload, load in [('gpu', True, False), ('ram', False, True),
+                                        ('offloading', False, False), ('loading', False, False)]:
+                model.state = state
+                model.retained_host_bytes = 2 * 1024**3
+                model.done, model.total = 40, 100
+                self.gui._poll_model()
+                self.assertEqual(self.gui.offload_button.isEnabled(), unload)
+                self.assertEqual(self.gui.load_button.isEnabled(), load)
+                self.assertIn('2.00 GiB', self.gui.status.text())
+                if state in ('loading', 'offloading'):
+                    self.assertEqual(self.gui.load_progress.value(), 400)
+            model.state = 'gpu'
+            model.active_requests = 1
+            self.gui._poll_model()
+            self.assertFalse(self.gui.offload_button.isEnabled())
+            self.gui.server_stopping = True
+            self.gui._poll_model()
+            self.assertFalse(self.gui.offload_button.isEnabled())
+        finally:
+            self.gui.process = None
+
     def test_copied_command_does_not_depend_on_gui_temporary_log(self):
         self.gui.api_key.setText("private-key-must-not-be-copied")
         self.gui.copy_command()
@@ -201,13 +234,16 @@ class GuiCacheDisplay(unittest.TestCase):
             command = self.gui._command()
             self.assertEqual(command[command.index('--prefix-cache-tokens') + 1], str(budget))
         self.gui.volta_long_attention.setChecked(True)
-        for concurrency in (1, 2, 4, 8):
-            self.gui.max_concurrency.setValue(concurrency)
-            self.assertIsNone(self.gui._validate())
+        for tp in (2, 4):
+            self.gui.tp.setCurrentText(str(tp))
+            self.gui.devices.setText(",".join(map(str, range(tp))))
+            for concurrency in (1, 2, 4, 8):
+                self.gui.max_concurrency.setValue(concurrency)
+                self.assertIsNone(self.gui._validate())
 
     def test_experimental_attention_rejects_incompatible_configuration(self):
         initial = self.gui.configuration()
-        for name, value in (("tp", "4"), ("tp", "1"), ("kv_dtype", "bf16"),
+        for name, value in (("tp", "1"), ("kv_dtype", "bf16"),
                             ("spec", "dflash")):
             with self.subTest(name=name, value=value):
                 self.gui.apply_configuration(initial)

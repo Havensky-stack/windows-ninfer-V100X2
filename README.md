@@ -1,6 +1,6 @@
 # NInfer V100X2
 
-[中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
+[中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
 
 **Compared with the decode implementation before v0.1.0, committed throughput on the same 85K-token
 code task increased from 143.46 to 198.10 tok/s — about 38.1% faster.** Both measurements
@@ -8,6 +8,19 @@ use two V100 16 GB cards, 180K capacity, TP2/MTP4, INT8 KV, CUDA Graphs and gree
 The current result enables both experimental long attention and fast decode; output can
 change, and the current combination has no GPQA result.
 [Current result](docs/performance.md#quasar-v3-mtp4-retained-decode-profile-2026-10-19) · [Previous version](docs/performance.md#quasar-v3-final-long-context-decode-evaluation).
+
+The earlier 220 W host's four-card NVLink optimization measures **283.118 / 283.367 committed wall tok/s** at
+85K input with QUASAR/MTP4 and both experimental flags, mean **283.242 ± 0.176**, retaining
+**220 W / 1200 MHz** limits. Prefill averages **2334.73 tok/s**, up from 1743 after adapting
+1Cat's collective and Split-D mechanisms. The same host's existing 1Cat 1.5.1 measures **98.25 / 102.51 tok/s** on the
+same 85K/MTP4 workload, with faster first token but different compute/KV precision and
+continuations. These are workload-aligned results, not an equal-quality comparison.
+TP4 normal, prefix and actual-85K Graph/eager state checks pass. Split-D and the experimental
+profiles can change output; no current-combination GPQA was run. On the separate **300 W** host,
+the same 85K/MTP4 fixture now measures **322.138 / 322.218 tok/s** (mean **322.178**), with
+**2731.60 tok/s prefill**. This is a new host/power measurement, not an isolated software gain.
+These TP4 changes ship in **v0.2.0**, alongside Linux SM70 prebuilt and Docker image archives.
+[Method and results](docs/tp4.md).
 
 Fast single-request Qwen3.8-27B inference on **2 × Tesla V100-SXM2 16 GB**, CUDA 12.8 / SM70.
 The local cards use PCIe P2P through SXM2-to-PCIe adapters, **without NVLink**.
@@ -19,6 +32,21 @@ Maintainer's personal experience: “It feels in the same tier as FP8.”
 The authors report GPQA-D 90.91% versus BF16 91.41%, and AIME'26 100% for both.
 These are external source-checkpoint results, not our V100 conversion scores or proof of
 losslessness. [Sources, independent comparison and limitations](docs/model-quality.md).
+
+## v0.2.0: TP4, hot model residency and packaged Docker
+
+QUASAR TP4 Text/MTP4 now includes qualified long attention and fast decode, both default-off.
+The 300 W four-V100 host measures **322.18 committed tok/s at 85K occupied input**, with
+**2731.60 tok/s prefill**. The same-host TP2 control measures 199.23 tok/s; this changes parallel
+width and is not an equal-output or isolated software comparison. The earlier 220 W host measures
+283.24 tok/s. [Workload, numerical qualifications and no-P2P controls](docs/tp4.md).
+
+GUI/TUI support hot unloading to host RAM and reloading to GPU while idle; weights stay in RAM,
+but KV/prefix/media caches are cleared. The experimental WSL2 TP2 transport is also included.
+Release assets include source, the [Linux SM70 package](docs/prebuilt.md), a
+[loadable Docker image](docs/docker.md), checksums and the bundled FFmpeg runtime source.
+The Docker image uses the same prebuilt binaries and defaults to model download plus TUI.
+Serving adds `--max-output-tokens` for an optional hard output ceiling across all three APIs.
 
 ## v0.1.2: visual long attention and optional CPU Vision
 
@@ -40,8 +68,9 @@ and opening TUI; its model URL is configurable.
 Experimental long attention now supports **1–8 active requests** with TP2/MTP4.
 The shared KV capacity still limits how many requests can execute together; excess requests
 queue. The 2K / 16K / 85K input throughput matrix reports both total committed decode and
-actual batch size. **10/12 cases completed**; GPU 0 fell off the PCIe bus (Xid 79) during
-85K/c4, leaving 85K/c4 and c8 unavailable. No additional single-request speedup over
+actual batch size. **All 12 cases have been measured**; at 85K, c4 and c8 queue in
+two-request waves under the shared-KV limit and measure 192.50 / 192.95 decode tok/s. No
+additional single-request speedup over
 v0.1.0 is claimed. [Measurements and method](docs/performance.md#experimental-long-context-concurrency-2026-10-20).
 
 ![Concurrent decode throughput and actual batch](docs/assets/quasar-concurrency.svg)
@@ -133,6 +162,17 @@ tok/s LM Studio. [Full tables and comparison conditions](docs/llama-comparison.m
 
 ## Build and launch
 
+Docker downloads QUASAR NVFP4 v3 on first launch and opens the TUI by default:
+
+```bash
+docker compose build
+docker compose run --rm --service-ports ninfer
+```
+
+Press `s` to load the model and start the API. Models and settings persist in named volumes.
+Use `--model HF_URL` to download another supported `.ninfer` artifact.
+Requires NVIDIA Container Toolkit; [Docker setup and options](docs/docker.md).
+
 Linux, CUDA 12.8, NVIDIA driver, CMake 3.28+, C++20 compiler, Ninja, pkg-config,
 FFmpeg development libraries, libcurl and LP64 BLAS (OpenBLAS recommended) are required. The dependency script builds a local
 prefix when system versions are too old.
@@ -207,7 +247,7 @@ eight-card host. With `CUDA_VISIBLE_DEVICES=4,6`, use logical devices `0,1`.
 
 | Document | Scope |
 |---|---|
-| [TP4 / NVLink](docs/tp4.md) | separate four-card host, official NVFP4/native FP8, API and 1Cat controls |
+| [TP4 / NVLink](docs/tp4.md) | four-card hosts, QUASAR/official NVFP4/native FP8 and matched TP2 controls |
 | [Other V100 measurements](docs/performance-v100.md) | official NVFP4, Q4_K_M, P2P/staging controls and prefix tests |
 | [RAM-KV / PP2 experiments](docs/experiments.md) | approximate retrieval and startup-fixed layer pipeline |
 | [Alternative models / Vision](docs/alternatives.md) | Q4_K_M conversion and QUASAR image/video support |
@@ -225,9 +265,11 @@ V100X2 implementation work builds on [Neroued/ninfer](https://github.com/Neroued
 RTX 3060 TP2 fork, and [geoffwatts/ninfer-v100](https://github.com/geoffwatts/ninfer-v100).
 Volta NVFP4 and TP2 behavior was cross-checked against
 [plus1998/Ninfer-V100-Duo](https://github.com/plus1998/Ninfer-V100-Duo).
-The TP2 BF16 packet-push collective adapts the two-epoch transport in
+The TP2/TP4 BF16 packet-push collectives adapt the two-epoch transport in
 [1CatAI/1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM), which credits
 [haohervchb/sglang-V100](https://github.com/haohervchb/sglang-V100).
+TP4 direct attention combine also follows 1Cat's grouped-combine design; projection tuning
+references its QPN kernels and [v100-skinny](https://github.com/dnv2003/v100-skinny).
 [Source-level decode survey and integration status](docs/v100-decode-survey.md).
 DFlash2 follows
 [Inco AI's implementation](https://inco.ai/blog/dflash2/) and its
@@ -238,6 +280,9 @@ attention is approximate and explicitly opt-in. The default profile retains full
 
 [Li3age](https://github.com/Li3age) contributed TP2 Vision and the configurable visual-token
 budget in [PR #1](https://github.com/tuxKOH/ninfer-V100X2/pull/1).
+The optional decode-round burst between prefill steps adapts the scheduling policy from
+[verssionhack](https://github.com/verssionhack)'s
+[PR #3](https://github.com/tuxKOH/ninfer-V100X2/pull/3).
 
 The measured models derive from [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B).
 The NVFP4 artifact uses the mixed FP8/NVFP4 weights from

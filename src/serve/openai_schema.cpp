@@ -576,6 +576,9 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
         out.max_tokens     = limits.default_max_tokens;
         out.max_tokens_set = false;
     }
+    validate_output_token_limit(out.max_tokens, limits,
+        body.contains("max_completion_tokens") && !body.at("max_completion_tokens").is_null()
+            ? "max_completion_tokens" : "max_tokens");
     return out;
 }
 

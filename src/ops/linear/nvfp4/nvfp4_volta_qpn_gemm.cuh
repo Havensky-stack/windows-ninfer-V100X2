@@ -293,7 +293,7 @@ __global__ __launch_bounds__(
 // This is v100-skinny's QPN2 main loop: no activation PRMTs and one scale byte per group.
 template <int kTiles, int SPLITK, int NACC, class OutputPolicy, class Activation,
           bool PairedProjection = false, bool Streaming = false, bool ColumnOutput = false,
-          bool Fp32Scale = true>
+          bool Fp32Scale = true, int GroupUnroll = (PairedProjection ? 8 : 2)>
 __global__ __launch_bounds__(
     SPLITK * 32 * (PairedProjection ? 2 : 1),
     (kTiles == 1 ? 32 : kTiles == 2 ? 16 : 4) / (SPLITK * (PairedProjection ? 2 : 1)) < 1
@@ -334,9 +334,10 @@ void nvfp4_volta_qpn_prepacked_kernel(const std::uint8_t* __restrict__ codes,
         }
     }
 
-    // Paired TP2 gate/up overlaps eight groups; MMA and K reduction
-    // associations stay intact. The unpaired route retains two-group scheduling.
-#pragma unroll (PairedProjection ? 8 : 2)
+    // TP4 streaming projections overlap four groups, including paired gate/up.
+    // TP2 pairs retain eight, and other unpaired projections retain two. MMA
+    // and K-reduction associations stay intact.
+#pragma unroll GroupUnroll
     for (int group = g0; group < gend; ++group) {
         const std::int64_t packed_index = tile_base + static_cast<std::int64_t>(group) * 32;
         const auto* code_pointer = reinterpret_cast<const uint2*>(codes + packed_index * 8);
@@ -494,7 +495,15 @@ void launch_nvfp4_qpn_schedule(bool prepacked, dim3 grid, const std::uint8_t* co
                                bool fp32_scale, cudaStream_t stream) {
     if (prepacked) {
         auto launch = [&]<bool Fp32Scale>() {
-            if constexpr (kTiles == 1 && SPLITK == 8) {
+            if constexpr (kTiles == 1) {
+                if ((k == 5120 && (n == 3584 || n == 4096 || n == 4352)) ||
+                    (n == 5120 && (k == 1536 || k == 4352))) {
+                    nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC, OutputPolicy,
+                                                    Activation, false, true, false, Fp32Scale, 4>
+                        <<<grid, SPLITK * 32, 0, stream>>>(codes, scales, x, n, k, t,
+                                                           inverse_weight_divisor, output);
+                    return;
+                }
                 if ((k == 5120 && (n == 7168 || n == 8192)) ||
                     (n == 5120 && k == 3072)) {
                     nvfp4_volta_qpn_prepacked_kernel<kTiles, SPLITK, NACC, OutputPolicy,
@@ -563,6 +572,13 @@ template <class OutputPolicy>
 void launch_nvfp4_volta_qpn_with_output(const Tensor& x, const Weight& w, OutputPolicy output,
                                         std::int32_t n, float inverse_weight_divisor,
                                         cudaStream_t stream) {
+    // The admitted TP4 down projection can consume SwiGLU's BF16-rounded FP16
+    // image at every decode width, independently of the BF16 precast schedule.
+    if (x.dtype == DType::FP16) {
+        launch_nvfp4_volta_qpn_with_activation(
+            x, w, static_cast<const half*>(x.data), output, n, inverse_weight_divisor, stream);
+        return;
+    }
     launch_nvfp4_volta_qpn_with_activation(
         x, w, static_cast<const __nv_bfloat16*>(x.data), output, n, inverse_weight_divisor,
         stream);
@@ -581,6 +597,11 @@ template <class OutputPolicy>
 void launch_nvfp4_volta_qpn_with_precast_output(const Tensor& x, const Weight& w,
                                                 OutputPolicy output, std::int32_t n,
                                                 WorkspaceArena& workspace, cudaStream_t stream) {
+    if (x.dtype == DType::FP16) {
+        launch_nvfp4_volta_qpn_with_fp16_activation(x, w, static_cast<const half*>(x.data),
+            output, n, 1.0F / w.weight_scale_divisor, stream);
+        return;
+    }
     auto scope = workspace.scope();
     Tensor activation = workspace.alloc(DType::FP16, {x.ne[0], x.ne[1]});
     nvfp4_volta_qpn_cast_activation(x, activation, stream);

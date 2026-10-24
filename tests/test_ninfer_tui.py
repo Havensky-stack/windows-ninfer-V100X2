@@ -81,9 +81,13 @@ class LaunchContract(unittest.TestCase):
         self.assertEqual(self.settings.prefix_cache_tokens, 384000)
         self.settings.prefix_cache_tokens = 123456
         self.settings.long_attention = True
-        for concurrency in (1, 2, 4, 8):
-            self.settings.max_concurrency = concurrency
-            self.settings.validate()
+        for tp in (2, 4):
+            self.settings.tp = tp
+            self.settings.devices = ','.join(map(str, range(tp)))
+            for concurrency in (1, 2, 4, 8):
+                self.settings.max_concurrency = concurrency
+                self.settings.validate()
+            self.assertIn('--volta-long-attention', self.settings.command())
         path = Path(self.directory.name) / 'history.json'
         self.settings.save(path)
         restored = Settings(binary='', artifact='')

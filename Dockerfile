@@ -33,7 +33,7 @@ RUN rm -rf /usr/local/cuda-12.8/compat /usr/local/cuda/compat
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
 WORKDIR /opt/ninfer
-COPY tools/v100/ninfer_tui.py tools/v100/gui_cache.py tools/v100/launcher_sampling.py ./tools/v100/
+COPY tools/v100/ninfer_tui.py tools/v100/gui_cache.py tools/v100/launcher_sampling.py tools/v100/launcher_model.py ./tools/v100/
 COPY docker/entrypoint.py ./docker/entrypoint.py
 COPY LICENSE NOTICE ./
 

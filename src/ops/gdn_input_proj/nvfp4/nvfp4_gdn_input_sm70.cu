@@ -13,8 +13,9 @@
 namespace ninfer::ops::detail {
 namespace {
 
-// TP2 narrow record route. Projection still materializes the same BF16
+// Narrow column-shard record route. Projection still materializes the same BF16
 // values, but its shared column tile also supplies the chronological convolution.
+template <class Geometry>
 struct Nvfp4GdnConvRecordOutput {
     __nv_bfloat16* record;
     __nv_bfloat16* z;
@@ -29,7 +30,9 @@ struct Nvfp4GdnConvRecordOutput {
 
     template <int Tokens>
     __device__ __forceinline__ void store(int row, const float (&projected)[Tokens]) const {
-        constexpr int Channels = 5120, QueryRows = 1024, ValueRows = 3072;
+        using Sections = Nvfp4GdnInputSections<Geometry>;
+        constexpr int QueryRows = Sections::kKeyRows, ValueRows = Sections::kValueRows;
+        constexpr int Channels = 2 * QueryRows + ValueRows;
         if (row >= Channels) {
 #pragma unroll
             for (int token = 0; token < Tokens; ++token) {
@@ -116,14 +119,14 @@ void launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
     }
 }
 
-} // namespace
-
-void nvfp4_gdn_input_sm70_record_launch(
+template <class Geometry>
+void launch_record(
     const Tensor& x, const Weight& weight, const Tensor& conv_weight, const Tensor& state,
     const Tensor& valid_columns, const Tensor& initial_slots, Tensor& record, Tensor& query,
     Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
     auto scope = workspace.scope();
-    const Nvfp4GdnConvRecordOutput output{
+    using Output = Nvfp4GdnConvRecordOutput<Geometry>;
+    const Output output{
         static_cast<__nv_bfloat16*>(record.data), static_cast<__nv_bfloat16*>(z.data),
         static_cast<const __nv_bfloat16*>(conv_weight.data),
         static_cast<const __nv_bfloat16*>(state.data),
@@ -132,9 +135,11 @@ void nvfp4_gdn_input_sm70_record_launch(
         static_cast<__nv_bfloat16*>(query.data), static_cast<__nv_bfloat16*>(key.data),
         static_cast<__nv_bfloat16*>(value.data), x.ne[1]};
     auto launch_profile = [&]<class Activation, bool Fp32Scale>(const Activation* input) {
-        nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4GdnConvRecordOutput,
-                                        Activation, false, true, true, Fp32Scale>
-            <<<256, 256, 0, stream>>>(static_cast<const std::uint8_t*>(weight.qdata),
+        constexpr int GroupUnroll = Geometry::kOutputRows == 4096 ? 4 : 2;
+        nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Output,
+                                        Activation, false, true, true, Fp32Scale, GroupUnroll>
+            <<<Geometry::kOutputRows / 32, 256, 0, stream>>>(
+                static_cast<const std::uint8_t*>(weight.qdata),
                 static_cast<const std::uint8_t*>(weight.scales), input, weight.n, weight.k,
                 x.ne[1], 1.0F / weight.weight_scale_divisor, output);
     };
@@ -155,6 +160,21 @@ void nvfp4_gdn_input_sm70_record_launch(
     CUDA_CHECK(cudaGetLastError());
 }
 
+} // namespace
+
+void nvfp4_gdn_input_sm70_record_launch(
+    const Tensor& x, const Weight& weight, const Tensor& conv_weight, const Tensor& state,
+    const Tensor& valid_columns, const Tensor& initial_slots, Tensor& record, Tensor& query,
+    Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (weight.n == Nvfp4GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch_record<Nvfp4GdnInputTp4ColumnGeometry>(x, weight, conv_weight, state,
+            valid_columns, initial_slots, record, query, key, value, z, workspace, stream);
+    } else {
+        launch_record<Nvfp4GdnInputTp2ColumnGeometry>(x, weight, conv_weight, state,
+            valid_columns, initial_slots, record, query, key, value, z, workspace, stream);
+    }
+}
+
 std::size_t nvfp4_gdn_input_sm70_workspace_bytes(int rows, int tokens) {
     if (tokens < 128) { return nvfp4_volta_qpn_precast_workspace_bytes(rows, 5120, tokens); }
     WorkspaceLayoutBuilder layout;
@@ -167,6 +187,8 @@ void nvfp4_gdn_input_sm70_launch(const Tensor& x, const Weight& weight, Tensor& 
                                 Tensor& z, WorkspaceArena* workspace, cudaStream_t stream) {
     if (weight.n == Nvfp4GdnInputGeometry::kOutputRows) {
         launch<Nvfp4GdnInputGeometry>(x, weight, qkv, z, workspace, stream);
+    } else if (weight.n == Nvfp4GdnInputTp4ColumnGeometry::kOutputRows) {
+        launch<Nvfp4GdnInputTp4ColumnGeometry>(x, weight, qkv, z, workspace, stream);
     } else {
         launch<Nvfp4GdnInputTp2ColumnGeometry>(x, weight, qkv, z, workspace, stream);
     }

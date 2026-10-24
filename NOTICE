@@ -58,12 +58,33 @@ artifact conversion and execution, Volta long-context INT8 attention,
 verified two-device transport, and the corresponding validation and tools.
 The integration is distributed under the Apache License, Version 2.0.
 
-The SM70 TP2 packet-push collective in src/ops/kernel/allreduce.cuh uses
+The SM70 TP2/TP4 packet-push collectives in src/ops/kernel/allreduce.cuh use
 the two-epoch/sentinel transport design from 1CatAI/1Cat-vLLM's
 csrc/custom_all_reduce.cuh, which credits haohervchb/sglang-V100 for its
 one-shot push collective. Both projects distribute that implementation
 under Apache-2.0. This adaptation uses BF16 packets, keeps the local
-contribution in registers, and has fixed per-Program startup storage.
+contribution in registers, and has fixed per-Program startup storage. TP4
+uses separate source channels and a fixed global-rank FP32 summation order.
+
+The TP4 long-attention direct split combine also uses 1Cat's grouped-attention
+combine as a design reference. This adaptation retains NInfer's packed INT8
+group-64 KV, BF16 partials, FP32 split summation order and denominator.
+
+The TP4 wide-message reduce-scatter/allgather in src/ops/common/allreduce.cu
+uses 1Cat's cross_device_reduce_2stage as a reference. Projection epilogues in
+src/ops/linear_add/nvfp4 publish represented BF16 contributions directly to
+the same packet mailboxes before the fused sum/RMSNorm consumer. These
+adaptations preserve fixed global-rank FP32 summation and one BF16 sum store.
+
+The SM70 D256 Split-D prefill implementation in
+src/ops/launcher/gqa_attention_volta_splitd.cu adapts the core of 1Cat-vLLM's
+csrc/attention/sm70_v37/tail.cu (Copyright 2026 1CatAI, Apache-2.0). Its MMA
+layout and online-softmax helpers derive from zhinianqin/flash-attention-v100,
+revision c2eda5e6115b98c3ba4bfd181570668742eece22, csrc/flash_attn/src/{utils,
+kernel_traits,softmax,mask}.h (Copyright 2023-2024 Tri Dao, BSD-3-Clause).
+The complete BSD license and authors are retained under
+third_party/flash_attention_sm70/. NInfer supplies native buffers, explicit
+causal positions, padded tails and the original INT8/BF16 cache boundaries.
 
 Model artifacts
 ---------------

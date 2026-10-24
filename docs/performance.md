@@ -9,7 +9,7 @@ Local hardware: 2 × Tesla V100-SXM2 16 GB, SXM2-to-PCIe adapters, PCIe 3.0 ×16
 This release adds Vision to the default-off long-attention profile and optionally moves the
 visual tower to CPU RAM. It does not introduce a new text decode kernel or claim another
 pure-text speedup over v0.1.1. Fast decode remains incompatible with Vision. QUASAR TP4
-qualification is assigned to v0.2.0.
+qualification and measurements ship in v0.2.0; see [TP4](tp4.md).
 
 The qualification below uses the same local two V100s, driver 580.178.04, CUDA 12.8, QUASAR v3,
 TP2, MTP4 with optimized proposals, complete INT8 group-64 KV, CUDA Graphs, chunk 1024,
@@ -58,6 +58,149 @@ prompt, both omit one scene (CPU describes the red circle, GPU the blue square).
 probe verifies that both temporal segments are usable; it does not establish general video
 description accuracy. CPU visual arithmetic remains an opt-in numerical profile.
 
+## Remote TP4 QUASAR/MTP4 (2026-10-23–24)
+
+The separate four-card NV2 V100 host measures **283.118 / 283.367 committed wall tok/s**
+at **85000 occupied input tokens**, mean **283.242 ± 0.176**, with the original
+**220 W / 1200 MHz** limits retained. QUASAR v3, 180K capacity, complete INT8 group-64 KV,
+chunk 2560, optimized MTP4, CUDA Graphs and both experimental long/fast flags; two cold
+requests, 512 timed committed decode tokens each. Prefill averages **2334.73 tok/s**,
+first token **36.4077 s**, and the full request **38.2153 s**.
+
+The normal profile, with both experimental flags off, measures **191.997 / 192.210**
+wall tok/s (mean **192.104 ± 0.151**), **2327.73 prefill tok/s** and **36.5172 s** first token.
+Relative to the preceding paired-QPN stage, long/fast decode improves **22.46%** from 231.302,
+and normal decode **16.86%** from 164.392. Prefill improves about **34.2%** from 1743.29.
+These are two-request observations on one saved code task, not general speedup guarantees.
+
+Retained mechanisms include 1Cat-inspired large allreduce reduce-scatter/allgather and TP4
+Split-D prefill, 64-pack projection publication, fused sum/norm scheduling, five-query K/V
+prefetch, the wider FP32 proposal reduction, and a norm output image that preserves explicit
+FP32→BF16→FP16 rounding while avoiding a separate cast launch, and single-launch small-T GDN
+controls that retain the split-10 arithmetic order. The GDN step improves the preceding
+246.431 tok/s norm-image result by 1.78% and passes the independent FP64 control oracle.
+TP4 GDN projection/record/conv fusion then improves 250.824 to 258.037 tok/s (+2.88%);
+the normal profile improves 178.525 to 182.074 (+1.99%). Its independent decoded-code
+FP64 dot/conv oracle respects the public BF16 record boundary without relaxed criteria.
+Split-D changes floating-point
+association: the saved continuation first differs from the preceding 231 stage at output 505.
+The later norm-image, GDN-control and GDN projection/record/conv steps preserve all 513 IDs and MTP counters of the qualified 244.655
+stage. Neither statement establishes general output or quality equivalence.
+The subsequent TP4-only N64 prefill tile improves prefill by **3.46% / 3.45%** over
+N32 in long/fast and normal. It passes the unchanged independent FP64 attention criterion
+at the real final 85K chunk. Its saved continuations first differ at zero-based output
+**504 / 505** from N32; the long/fast run also changes draft acceptance. Its 0.81% higher
+decode rate is therefore not an isolated decode-kernel speedup.
+The subsequent ordered split reducer preserves reduction order, while prefetching four
+numerators and finishing the shared tree with warp shuffles. Together with an explicitly
+typed BF16-rounded FP16 SwiGLU output image, it raises N64's **260.133 / 182.133** to the
+intermediate **265.004 / 183.583** (+1.87% / +0.80%). SwiGLU still rounds FP32→BF16→FP16;
+down projection reads those represented FP16 values directly. Independent decoded-input
+FP64 SwiGLU/down oracles pass without relaxing criteria. Both 85K repetitions retain all
+513 output IDs and every speculative counter from their respective N64 profiles.
+The GDN gated-norm image then produces **267.487 / 184.815** (+0.94% / +0.67%), with
+the same complete IDs/counters. Its N5120/K1536 projection consumes FP16 values after
+explicit FP32→BF16→FP16 rounding; independent norm/projection oracles pass unchanged.
+Last-CTA GDN record/norm fusion and a caller-owned W8 verifier FP16 input image then
+produce **270.694 / 186.204**, preserving explicit state/rounding boundaries and passing
+independent FP64 oracles. Direct-peer four-rank argmax advances this to **281.662 / 191.373**
+(+4.05% / +2.78%); one origin kernel publishes the exact global tie-broken/mapped winner.
+Small I32 broadcasts through 4 KiB then produce **283.242 / 192.104** (+0.56% / +0.38%).
+Exact CPU argmax/relocation oracles, changed-input Graphs, immediate source/output reuse
+and guards pass. Every later step retains all 513 IDs and all speculative counters.
+
+Four-rank attention, collective, projection/SwiGLU numerical oracles pass. The current normal,
+prefix and actual-85K long/fast state gates pass Graph/eager, replay logits/counters and
+committed-frontier checks. The earlier uninitialized-scratch residual trial remains removed;
+its real-shape regression passes initcheck. No current-combination GPQA was run.
+**300 tok/s was not reached; this result is not a measured hardware limit.**
+
+The same host's existing **1cat-vllm 1.5.1**, using the same 85K token IDs, MTP4, output
+budget and single-request settings, measures **98.249 / 102.509**, mean **100.379 ± 3.012**
+committed wall tok/s. Its first token averages **35.9378 s**, versus NInfer's **36.4077 s**;
+its whole request averages **41.0408 s**. It uses FP16/E4M3 KV, versus BF16/INT8 group-64
+here; the captured comparison diverges after 325 shared output IDs. These are aligned
+workload measurements, not equal-precision or equal-quality results. Its original launcher
+uses DFlash2; this control explicitly uses MTP4.
+[Implementation, controls, timing and power interpretation](tp4.md#retained-tp4-decode-optimization).
+
+## Six QUASAR/MTP4 decode trials (2026-10-22)
+
+The user requested these six trials without a fixed throughput target. Each uses the public
+Engine route on the local two-card PCIe host: QUASAR NVFP4 v3, TP2, **85000 occupied input
+tokens**, 180000 capacity, complete INT8 group-64 KV, chunk 2560, greedy optimized-head
+**MTP4**, CUDA Graphs and both `--volta-long-attention --volta-fast-decode`. Each cold request
+produces 513 outputs; committed wall rate is `512 / (total_seconds - first_token_seconds)`.
+Load and Graph priming are outside timing. These are short decode measurements on one saved
+code corpus, not a general workload speedup or a new quality evaluation.
+
+The fresh baseline is **196.938 / 197.062 tok/s**. Tail fusion alone measures
+**197.062 / 197.318 tok/s**; the roughly 0.10% mean difference does **not** establish an
+end-to-end gain. Every other candidate below was measured separately on top of that fusion.
+The retained combination adds the smaller GDN record tile and measures **197.614 / 197.698**.
+The 2026-10-19 release's 198.105 / 198.097 remains historical evidence, rather than a matched
+control for this campaign.
+
+| Direction | Concrete trial | Committed wall tok/s | Decision |
+|---|---|---:|---|
+| INT8 attention load overlap | Keep next packed K/V tile and scales in registers while processing current QK/PV | 188.754 | Reverted; slower |
+| MTP tail fusion | Map shortlist winner inside the TP2 argmax collective, after tie-breaking | 197.062 / 197.318 | Retained; removes launches, speed gain unproven |
+| TP2 communication/norm | 128-thread, 128-bit packet polling/loads instead of 512-thread scalar pairs | 193.073 | Reverted; slower and changed output |
+| Paired NVFP4 QPN scheduling | Four K partitions / 256 threads instead of eight / 512 | 191.874 | Reverted; slower and changed output |
+| GDN verifier value tile | Eight value rows per CTA instead of sixteen, record path only | 197.308 initially; 197.614 / 197.698 repeat | Retained; small observed gain |
+| Verified history lookup | Latest matching eight-token suffix supplies four observed draft tokens | 187.220 | Proposal screen rejected; see scope below |
+
+The retained fusion preserves the original score comparison and global shortlist-index tie
+policy, then applies the immutable rank-zero token map and publishes the mapped ID to both
+ranks. It removes up to four separate remap launches per full MTP4 round. DMA fallback still
+composes merge, map and broadcast. Independent exact collective checks cover a nonmonotonic
+ID permutation, mapped/unmapped results on both ranks, direct and forced-DMA transport,
+infinities, signed zero, ties, changed-input Graph replay, source reuse, map immutability and
+guards. The retained run matches all **513 baseline output IDs** and every speculative counter:
+123 rounds, 389/490 drafts accepted (79.388%), positions `[119,108,89,73]`, zero fallback.
+
+The smaller GDN tile retains four warps, reduces each warp from four independent value columns
+to two, and doubles the record grid's value-axis CTA count. Each column keeps its previous
+FP32 transition, warp reduction, BF16 output/record boundaries and immutable source state.
+Snapshot and fold keep their previous tile. All three 512-token measurements match the baseline
+IDs and counters. A longer paired check of **2048 timed decode tokens** measures **181.580**
+for tail fusion alone and **181.880** with the smaller tile, an observed **+0.16%**. All 2049
+outputs and counters match: 534 rounds, 1514/2136 drafts accepted (70.880%), positions
+`[472,407,343,292]`, zero fallback. The longer continuation's lower acceptance accounts for
+its lower rate; it is not comparable to a 512-token measurement as a speedup ratio. These few
+sequential measurements support retaining a modest candidate, not statistical significance or
+a general speedup claim.
+
+Attention prefetch also matches the 513 baseline IDs and counters. Numerical
+checks use the independent attention FP64 oracle and GDN state/record and fold oracles,
+respectively. QPN scheduling passes decoded-weight FP64 checks at real TP2 N8704/K5120,
+widths 4/5/6 and both numerical profiles; packet vectorization passes collective numerical,
+epoch-reuse and Graph checks. Nevertheless, both first differ from baseline at output **130**.
+QPN changes K-reduction association; packet norm changes the RMS reduction tree. Passing
+operator tolerances does not imply unchanged model output or task accuracy. Neither is shipped.
+
+The lookup trial retains normal target verification and commit/rollback with four drafts.
+It finds 14 matches in 129 rounds and accepts only 23 drafts at those matches (1.64 per hit);
+overall acceptance falls to 383/514 (74.514%), versus 389/490 for learned MTP. All 513 output
+IDs still match baseline. This is a **proposal feasibility screen**: learned next-proposal
+computation was still performed, so 187.220 tok/s does not measure a complete implementation
+that skips the drafter on hits. Offline causal screens of suffix lengths 4/6/8/12/16 also
+show weak continuations on this corpus. This particular proposer is removed; better lookup
+selection and skipping drafter work remain candidates, without a claimed negative result for
+the whole direction.
+
+All discarded source variants are restored. Local reports, commands, captured output IDs and
+detailed GPU/host health logs are under `profiles/bench/quasar-six-20261022/`. Three early
+mixed-build pilots were excluded and their QPN/packet/lookup cases rerun with isolated builds.
+The final retained CLI, server and benchmark build passes, as do the exact argmax collective,
+GDN record and GDN fold tests. The discarded attention-prefetch variant also passes the full
+head-local INT8 85K independent FP64 oracle suite, including fragmented, masked and batched
+cases. Valid timed runs record GPU temperatures of at most 53 °C;
+the longer paired controls reach 50/51 °C GPU and 58/59 °C memory, with no hardware,
+thermal or power-brake slowdown recorded in either control.
+No new GPQA was run. The retained changes introduce no new reduced-precision profile;
+the existing two experimental profiles retain their previously documented numerical caveats.
+
 ## Experimental long-context concurrency (2026-10-20)
 
 Long attention admits startup-fixed **1–8 active requests** on SM70 27B TP2
@@ -92,14 +235,12 @@ These are single measurements, without confidence intervals or a steady-state lo
 | 16384 | 8 | 209.31 | 4.35 | 102.01 | 40.15 |
 | 85000 | 1 | 198.32 | 1.00 | 71.33 | 7.18 |
 | 85000 | 2 | 193.26 | 1.21 | 142.77 | 7.17 |
-| 85000 | 4 | — | — | — | — |
-| 85000 | 8 | — | — | — | — |
+| 85000 | 4 | 192.50 | 1.20 | 284.74 | 7.19 |
+| 85000 | 8 | 192.95 | 1.20 | 571.62 | 7.17 |
 
-**10/12 cases completed.** During 85K/c4, GPU 0 at `0000:03:00.0` encountered
-unrecoverable PCIe AER and Xid 79 (fallen off the bus), followed by Xid 154
-(GPU reset required). That group produced no valid measurement; c8 was not started.
-The cause remains unconfirmed. Interrupted work contributes no result. Device recovery is
-required before resuming the missing cases; the table does not establish 85K/c4 or c8 performance.
+**All 12 cases completed.** At 85K, the 180K shared KV pool admits two full requests at
+a time, so c4 and c8 proceed in queued two-request waves. Their mean decode batches remain
+near 1.20, while whole-group time scales with the queued waves.
 
 Configured concurrency is an upper bound. Each active request reserves its own full prompt
 and output entitlement in the shared KV pool: two 85K requests fit at 180K capacity,
@@ -130,9 +271,62 @@ cmake --build build-v100-tp4 --target ninfer_v100_concurrency_bench -j8
 The runner saves each completed case and detailed GPU/host health logs, and resumes only
 missing cases. [Compact measurements and draft counters](assets/quasar-concurrency.json)
 accompany the chart; full local reports retain request-level counts and scheduler samples.
-To render the saved incomplete matrix, add
-`--incomplete-reason 'GPU 0 Xid 79; device recovery required'` to the plot command.
-Without that option, missing cases are an error.
+
+### Decode service during another request's prefill (2026-10-22)
+
+The experimental `--prefill-decode-rounds N` policy gives existing streams up to `N`
+decode rounds between prefill steps. Default `1` retains alternation; `4` favors streams
+already producing output. This changes scheduling, with the same decode operators and
+1024-token prefill chunk. It has no effect on a single active request.
+
+This comparison uses the same QUASAR/TP2/MTP4, INT8 group-64 KV, Graph, greedy,
+long-attention and fast-decode settings as the matrix above, with **two cold 85000-token
+requests and 2048 outputs each**, 180000 shared capacity, no prefix reuse, and no model
+stop tokens. Loading and a short graph-path warmup are outside timing. Each setting has
+one measured group. Detailed GPU/host health logs were retained; neither run recorded
+hardware thermal slowdown.
+
+| Metric | 1 round | 4 rounds |
+|---|---:|---:|
+| Existing stream during concurrent prefill, committed wall tok/s | 5.026 | 17.689 |
+| Tokens committed during that overlap | 352 | 1336 |
+| Overlap wall seconds | 70.038 | 75.527 |
+| Existing stream, all time after first token, wall tok/s | 22.894 | 24.044 |
+| New request TTFT, including queue time, seconds | 138.193 | 143.944 |
+| Whole-group seconds | 159.484 | 160.290 |
+| Whole-group output tok/s, including prefill | 25.683 | 25.554 |
+| Aggregate decode-round tok/s, excluding prefill | 177.347 | 174.667 |
+
+Overlap wall time includes prefill stalls. It is sampled from public Engine counters while
+one request is prefilling and another is decode-ready, at nominal 10 ms intervals (maximum
+observed interval 10.32 ms). The all-time stream rate is `(2048 - 1) / (total - TTFT)` from
+the Engine's request timings. Both groups completed all 4096 outputs, with 4094 committed
+decode tokens after excluding the two first tokens.
+
+Four rounds improved output service during overlap by **3.52×**, and the existing stream's
+whole decode interval by about **5.0%**. The new request waited **5.75 seconds longer** for
+its first token, and whole-group throughput was about **0.5% lower**. This supports an
+optional responsiveness tradeoff, without establishing a single-request or aggregate
+throughput improvement. Default remains `1`.
+
+The schedules produce different batch membership over time. Greedy generated IDs differed:
+the first differences occurred at output positions 671 and 1513 in the two requests
+(one-based). Drafts/accepted drafts were `2117/1517`, `2151/1509` at one round and
+`2209/1493`, `2156/1508` at four. This is speed and scheduling evidence, **not a losslessness
+or quality result**; no GPQA was run. The existing experimental numerical profiles were
+enabled in both cases.
+
+The probe accepts an optional final round count:
+
+```bash
+cmake --build build-v100-tp4 --target ninfer_v100_concurrency_bench -j8
+LD_LIBRARY_PATH="$PWD/build/_deps/install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  build-v100-tp4/bench/ninfer_v100_concurrency_bench \
+  /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  profiles/bench/v100-code-85000-iommu-pt.ids 85000 2 2048 /tmp/scheduling-r4.json 4
+```
+
+Local reports and health logs: `profiles/bench/quasar-scheduling-20261022/`.
 
 ## QUASAR v3: saved-configuration MTP4 speed matrix (2026-10-19)
 
@@ -162,9 +356,7 @@ isolate one optimization. Native rows below show means and sample decode standar
 other rows are single measurements. Output counts include the first output and terminating
 token. Answers are not graded.
 
-Two earlier attempts encountered GPU `0000:03:00.0` Xid 79 and unrecoverable PCIe AER errors.
-The cause remains unconfirmed. After device recovery, only missing cases were resumed;
-interrupted requests contribute no measurement. Following the user's interval changes, the first
+Following the user's interval changes, the first
 36 V measurements had no interval, the last four V measurements and first five T measurements
 had 30 seconds between requests, and subsequent T requests used no interval below 65536 input
 tokens and 30 seconds at 65536/85000, including warmup-to-measurement transitions. Rest is
@@ -344,7 +536,7 @@ After these checks the replaced `/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer`
 
 ## QUASAR v3: MTP4 retained decode profile (2026-10-19)
 
-The latest retained combination measures **198.105 / 198.097 committed wall tok/s**
+The 2026-10-19 retained combination measures **198.105 / 198.097 committed wall tok/s**
 in two cold public-Engine requests. Public operator qualification and full85K
 MTP4 Graph/eager state qualification pass. The earlier norm-handoff combination measured
 180.410 / 180.566 in two requests. These use 85000 actual input tokens, 180000
@@ -352,7 +544,8 @@ capacity, complete INT8 group-64 KV, TP2, greedy optimized-head **MTP4**, CUDA G
 a 2560-token prefill chunk and `--volta-long-attention --volta-fast-decode`. Each request produces one
 prefill token and 512 timed committed decode tokens. Rate is
 `512 / (total_seconds - first_token_seconds)`; model load and graph priming are excluded.
-The user stopped the performance search after the final W8 trial. **200 tok/s was not reached**; no further candidate sweep is part of this handoff.
+The user stopped that campaign after the final W8 trial. **200 tok/s was not reached**.
+The later six-direction trial above has no fixed speed target.
 
 | Retained combination, added in order | Wall tok/s | Output comparison |
 |---|---:|---|
@@ -999,20 +1192,11 @@ MTP reserves 8.66 GiB weights per card, DFlash 10.36 GiB. At this capacity the r
 KV/workspace reservations are 1.64/0.74 GiB for MTP and 1.625/0.727 GiB for DFlash; these
 figures are GPU arenas, not process RSS or aggregate two-card memory.
 
-Three unexpected host resets interrupted this campaign. Completed results survived and only
-missing repetitions were resumed. The final continuation uses 600-second active windows with
-a 120-second next-request margin and **180-second idle periods**, at completed-request boundaries
-and between backends. Observed DFlash active blocks before rest were 505.27 / 487.91 / 553.25 s.
-Rest does not enter request times. The third reset still occurred after the three-minute-rest
-policy, during the last logic measurement's prefill; cooldown is not a demonstrated reset fix.
-The last saved samples showed 54/59°C and zero corrected/uncorrected GPU ECC, with no recorded
-collector error or kernel Xid explaining the reset. Root cause remains undetermined; completed
-measurements do not establish sustained hardware stability.
-
 Reports and corpus remain local under `profiles/bench/quasar-qpn-projections/{all-mtp3,
 all-dflash7,matrix-summary}.json` and `profiles/bench/other_inputs_20261001/cases.json`.
 The read-only health logs preserve 200 ms GPU samples, per-second host/process/thread and Engine
-progress, request/phase/cooldown timestamps, PCIe AER/EDAC and kernel events with synced writes.
+progress, request/phase/cooldown timestamps, device/host health counters and kernel events with
+synced writes.
 No power limits, clocks or system settings were changed. Reproduction uses the public
 [`ninfer_v100_task_bench`](../bench/README.md#stop-aware-v100-task-probes); raw outputs, telemetry,
 model files and the local filming demo are not committed.

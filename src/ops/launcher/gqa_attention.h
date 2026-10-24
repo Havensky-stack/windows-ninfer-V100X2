@@ -71,7 +71,7 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
 // Q-block width. Bounds mask memory, which is O(tokens * visible_keys): a full
 // 12K prompt mask would be 288 MB and grows quadratically, one Q-block's is
 // ~25 MB at that length. Phase 4 sweeps this.
-inline constexpr std::int32_t kVoltaFlashQBlockTokens = 1024;
+inline constexpr std::int32_t kVoltaFlashQBlockTokens = 640;
 
 // Below this width the chunked route's smaller fixed cost wins, and the staging
 // buffers are not worth allocating.

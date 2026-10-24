@@ -769,10 +769,41 @@ int test_cache_usage_serialization() {
     return failures;
 }
 
+int test_output_token_cap() {
+    RequestLimits cap;
+    cap.default_max_tokens = 64;
+    cap.max_output_tokens = 64;
+    Json body = {{"model", "m"}, {"messages", Json::array({{{"role", "user"}, {"content", "hello"}}})}};
+    int failures = 0;
+    for (int tokens : {32, 64}) {
+        body["max_tokens"] = tokens;
+        const auto out = parse_messages_request(body, cap);
+        failures += check(out.max_tokens == tokens, "output cap rejected a supported budget");
+    }
+    body["max_tokens"] = 65;
+    bool rejected = false;
+    try { (void)parse_messages_request(body, cap); }
+    catch (const ApiException& error) {
+        rejected = error.error().status == 400 &&
+                   error.error().code == "max_output_tokens_exceeded" &&
+                   error.error().param == "max_tokens";
+    }
+    failures += check(rejected, "output cap did not reject an oversized request");
+    body.erase("max_tokens");
+    auto out = parse_messages_request(body, cap);
+    failures += check(out.max_tokens == 64, "output cap changed the default budget");
+    cap.max_output_tokens = 0;
+    body["max_tokens"] = 65;
+    out = parse_messages_request(body, cap);
+    failures += check(out.max_tokens == 65, "disabled output cap still limits requests");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_output_token_cap();
     failures += test_parse_basic_and_system();
     failures += test_parse_system_array_and_blocks();
     failures += test_ordered_system_messages();

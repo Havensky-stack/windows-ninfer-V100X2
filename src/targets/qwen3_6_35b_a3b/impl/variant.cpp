@@ -3,6 +3,7 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/sparse_moe.h"
 
@@ -382,6 +383,14 @@ void Variant::gdn_control_projection(std::span<const Tensor>,
                                      std::span<WorkspaceArena* const>,
                                      const ExecutionContext&) {
     reject_tensor_parallel("gdn_control_projection");
+}
+
+DType Variant::gdn_output_input_dtype(const Weight&, int, int) {
+    return DType::BF16;
+}
+
+DType Variant::post_mixer_input_dtype(const PostMixerWeights&, int, int) {
+    return DType::BF16;
 }
 
 void Variant::post_mixer(std::span<const Tensor>,

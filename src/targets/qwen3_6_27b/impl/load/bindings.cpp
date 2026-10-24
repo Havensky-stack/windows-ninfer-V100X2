@@ -934,9 +934,10 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     if (tp != 1 && tp != 2 && tp != 4) {
         throw std::invalid_argument("qwen3_6_27b: tp must be 1, 2 or 4");
     }
-    if (tp == 4 && weights_profile != WeightsProfile::Qwen38Nvfp4 &&
+    if (tp == 4 && weights_profile != WeightsProfile::Qwen38QuasarNvfp4 &&
+        weights_profile != WeightsProfile::Qwen38Nvfp4 &&
         weights_profile != WeightsProfile::Qwen38Fp8) {
-        throw std::invalid_argument("TP4 requires Qwen3.8-27B NVFP4 or native FP8");
+        throw std::invalid_argument("TP4 requires Qwen3.8-27B NVFP4, QUASAR NVFP4 or native FP8");
     }
     if (features.vision && features.dflash()) {
         throw std::invalid_argument("DFlash does not support Vision");
@@ -947,11 +948,15 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                     (weights_profile != WeightsProfile::Qwen38Nvfp4 && !quasar))) {
         throw std::invalid_argument("PP2 currently supports Qwen3.8 NVFP4/QUASAR Text/None/MTP only");
     }
-    if (quasar && (tp != 2 && pp != 2)) {
-        throw std::invalid_argument("QUASAR requires TP2 or text-only PP2 (DFlash is TP2 only)");
+    if (quasar && (tp != 2 && tp != 4 && pp != 2)) {
+        throw std::invalid_argument("QUASAR requires TP2, text-only TP4 or text-only PP2 (DFlash is TP2 only)");
     }
-    if (features.volta_fast_decode && (!quasar || tp != 2 || pp != 1 || features.vision || features.dflash())) {
-        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2 Text/None/MTP");
+    if (tp == 4 && features.vision) {
+        throw std::invalid_argument("qwen3_6_27b: TP4 does not support Vision");
+    }
+    if (features.volta_fast_decode && (!quasar || (tp != 2 && tp != 4) || pp != 1 ||
+                                       features.vision || features.dflash())) {
+        throw std::invalid_argument("volta_fast_decode requires QUASAR SM70 TP2/TP4 Text/None/MTP");
     }
     if (native_fp8 && (tp != 4 || features.vision || features.dflash())) {
         throw std::invalid_argument("qwen3.8-27b/fp8 supports TP4 Text/MTP only");

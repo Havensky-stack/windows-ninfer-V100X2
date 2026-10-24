@@ -147,6 +147,7 @@ using Nvfp4Residual6144Tp2RowGeometry     = Nvfp4GemvGeometry<5120, 3072>;
 using Nvfp4Residual17408Tp2RowGeometry    = Nvfp4GemvGeometry<5120, 8704>;
 
 #ifdef NINFER_VOLTA_BUILD
+using Nvfp4GdnInputTp4ColumnGeometry = Nvfp4GemvGeometry<4096, 5120>;
 using Nvfp4MlpGateUpTp4ColumnGeometry = Nvfp4GemvGeometry<8704, 5120>;
 // The registered four-way 27B shapes use the runtime-dimensioned SM70 QPN/CUTLASS leaf,
 // not an unqualified A4 or portable SIMT instantiation. This is a finite shape profile;

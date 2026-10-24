@@ -26,11 +26,13 @@ if __package__:
     from .gui_cache import CacheMonitor
     from .launcher_sampling import validate_sampling
     from .launcher_configs import ConfigurationLibrary
+    from .launcher_model import ModelControl
     from .launcher_resources import GIB, LoadStage, MemoryOptions, estimate_memory, query_gpu_memory
 else:
     from gui_cache import CacheMonitor
     from launcher_sampling import validate_sampling
     from launcher_configs import ConfigurationLibrary
+    from launcher_model import ModelControl
     from launcher_resources import GIB, LoadStage, MemoryOptions, estimate_memory, query_gpu_memory
 
 
@@ -122,6 +124,8 @@ class NInferGui(QWidget):
         self.artifact_override = artifact or os.environ.get("NINFER_GUI_ARTIFACT", "")
         self.process: QProcess | None = None
         self.health_in_flight = False
+        self.model_control: ModelControl | None = None
+        self.model_view_state = 'unknown'
         self.health_results: queue.Queue[tuple[str, object, bool, str]] = queue.Queue()
         self.settings = settings or QSettings("NInfer", "V100X2Server")
         self.output_decoder = codecs.getincrementaldecoder("utf-8")("replace")
@@ -161,6 +165,7 @@ class NInferGui(QWidget):
         self.queue_timer.timeout.connect(self._drain_health_results)
         self.queue_timer.timeout.connect(self._poll_cache)
         self.queue_timer.timeout.connect(self._drain_resource_results)
+        self.queue_timer.timeout.connect(self._poll_model)
         self.queue_timer.start()
         self.resource_timer = QTimer(self)
         self.resource_timer.setInterval(5000)
@@ -308,14 +313,16 @@ class NInferGui(QWidget):
                                "本配置无确定速度/GPQA数据；RAM archive 预算不等于进程 RSS 限制。\n"
                                "KV 容量启用时自动等于 GPU window。与视觉、DFlash、TP4、长注意力互斥。")
         self.volta_fast_decode.setToolTip(
-            "对应 --volta-fast-decode；QUASAR / SM70 / TP2 / 纯文本 None/MTP。\n"
+            "对应 --volta-fast-decode；QUASAR / SM70 / TP2/TP4 / 纯文本 None/MTP。\n"
             "NVFP4 FP32 末尾缩放、MTP W8 重排与归约；可能改变 logits、草稿接受和输出。\n"
-            "与长注意力组合：85K / MTP4 约 198.1 tok/s；最后 W8 步骤比 196.5 约 +0.8%。\n"
+            "85K / MTP4 组合：本机 TP2 约 198.1 tok/s；远端 TP4 / 220 W 约 267.5 tok/s。\n"
+            "TP4 比 231.3 组合约 +12.46%；prefill 约 2337 tok/s，Split-D 可能改变输出。\n"
+            "TP4 普通、前缀及实际 85K Graph/eager 状态检查均通过；不代表质量无损。\n"
             "不是单开关独立增幅。前序组合25点最大 KL 0.001903、最小 cosine 0.998831；\n"
             "前序近无损界限仅9/25点通过；当前组合GPQA未跑，智力影响未知。\n"
             "默认关闭，需重启 API。")
         self.volta_long_attention.setToolTip(
-            "对应 --volta-long-attention；SM70 27B / TP2 / INT8 KV / 并发1–8 / 文本或视觉 None/MTP。\n"
+            "对应 --volta-long-attention；SM70 27B / TP2/TP4（视觉仅 TP2）/ INT8 KV / 并发1–8 / 文本或视觉 None/MTP。\n"
             "保留全部历史 KV，改变 softmax/PV 累加顺序；可能改变输出。\n"
             "纯文本与快速数值路径组合约 198.1 tok/s，不代表视觉或此开关单项收益；当前组合 GPQA 未测。\n"
             "默认关闭，需重启 API；不能与 DFlash 或 RAM-KV 一起使用；视觉可用，快速数值路径仍仅限文本。")
@@ -436,17 +443,26 @@ class NInferGui(QWidget):
         self.start_button.setObjectName('primary')
         self.stop_button = QPushButton("停止")
         self.restart_button = QPushButton("重启")
+        self.offload_button = QPushButton("卸载到内存")
+        self.load_button = QPushButton("加载回显存")
+        self.offload_button.setToolTip("保留原始模型在系统内存，释放显存；KV/前缀缓存会清空")
+        self.load_button.setToolTip("从系统内存恢复模型到显存；重新创建推理缓存和 CUDA Graph")
+        self.offload_button.setEnabled(False)
+        self.load_button.setEnabled(False)
         self.stop_button.setEnabled(False)
         self.restart_button.setEnabled(False)
         self.start_button.clicked.connect(self.start_server)
         self.stop_button.clicked.connect(self.stop_server)
         self.restart_button.clicked.connect(self.restart_server)
+        self.offload_button.clicked.connect(lambda: self._model_action('offload'))
+        self.load_button.clicked.connect(lambda: self._model_action('load'))
         header = QHBoxLayout()
         header.addWidget(title)
         header.addSpacing(16)
         header.addWidget(self.status)
         header.addStretch(1)
-        for button in (self.start_button, self.stop_button, self.restart_button):
+        for button in (self.start_button, self.stop_button, self.restart_button,
+                       self.offload_button, self.load_button):
             header.addWidget(button)
 
         self.config_selector = QComboBox()
@@ -857,13 +873,13 @@ class NInferGui(QWidget):
                         spec == "dflash" or self.volta_fast_decode.isChecked() or self.volta_long_attention.isChecked()):
             return "实验 PP2 要求 TP1、两卡、并发1、NVFP4/QUASAR 纯文本 None/MTP；关闭两个数值实验"
         if self.volta_long_attention.isChecked() and (
-                tp != 2 or self.kv_dtype.currentText() != "int8" or
+                tp not in (2, 4) or self.kv_dtype.currentText() != "int8" or
                 self.ram_kv.isChecked() or spec not in {"none", "mtp"}):
-            return ("实验性长上下文注意力要求 TP2、INT8 KV、并发 1–8、后端为 none 或 mtp、支持视觉；"
+            return ("实验性长上下文注意力要求 TP2/TP4、INT8 KV、并发 1–8、后端为 none 或 mtp、视觉仅支持 TP2；"
                     "请调整配置或取消勾选该开关。硬件和模型还须为 SM70 27B。")
-        if self.volta_fast_decode.isChecked() and (tp != 2 or self.vision.isChecked() or
+        if self.volta_fast_decode.isChecked() and (tp not in (2, 4) or self.vision.isChecked() or
                                                     spec not in {"none", "mtp"}):
-            return "实验性快速数值路径要求 QUASAR / SM70 / TP2 / 纯文本 None 或 MTP"
+            return "实验性快速数值路径要求 QUASAR / SM70 / TP2/TP4 / 纯文本 None 或 MTP"
         if self.vision.isChecked() and (tp != 2 or spec == "dflash"):
             return "视觉要求 TP2，后端为 none 或 mtp；不能与 DFlash 一起使用"
         if self.vision.isChecked() and artifact.name in {"qwen3_8_27b_q4_k_m.ninfer", "qwen3_8_27b_fp8.ninfer"}:
@@ -1174,6 +1190,8 @@ class NInferGui(QWidget):
             return
         self._append_log("stopping server…")
         self.server_stopping = True
+        self.offload_button.setEnabled(False)
+        self.load_button.setEnabled(False)
         self.status.setText("停止中…")
         self.load_stage.label, self.load_stage.percent = '停止中', None
         self._render_load_progress()
@@ -1217,6 +1235,10 @@ class NInferGui(QWidget):
         self._append_log(f"server exited with code {exit_code}")
         process = self.process
         self.process = None
+        self.model_control = None
+        self.model_view_state = 'unknown'
+        self.offload_button.setEnabled(False)
+        self.load_button.setEnabled(False)
         if process:
             process.deleteLater()
         self.start_button.setEnabled(True)
@@ -1308,6 +1330,47 @@ class NInferGui(QWidget):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _model_action(self, action: str) -> None:
+        if self.model_control and not self.server_stopping:
+            self.model_control.action(action)
+            self._poll_model()
+
+    def _poll_model(self) -> None:
+        if self.process is None or self.server_stopping or not self.server_listening:
+            return
+        if self.model_control is None:
+            self.model_control = ModelControl(self._health_url().removesuffix('/health'), self.api_key.text())
+        model = self.model_control
+        model.poll()
+        if model.state != self.model_view_state:
+            self.model_view_state = model.state
+            self._query_resources()
+            if model.state == 'ram':
+                self.throughput_live.setText('实时吞吐：模型已卸载到内存')
+                self.draft_live.setText('实时草稿接受率：暂停')
+            elif model.state == 'gpu':
+                self.throughput_live.setText('实时吞吐：等待请求')
+                self.draft_live.setText('实时草稿接受率：—')
+        self.offload_button.setEnabled(model.state == 'gpu' and not model.busy and model.active_requests == 0)
+        self.load_button.setEnabled(model.state == 'ram' and not model.busy)
+        if model.state != 'unknown':
+            self.status.setText(model.label)
+            self.status.setStyleSheet('color: #188038; font-weight: bold' if model.state == 'gpu'
+                                     else 'color: #b06a00; font-weight: bold')
+            if model.busy or model.state in ('offloading', 'loading'):
+                phases = {'retain_host': '保留权重到内存', 'release_gpu': '释放显存',
+                          'weights': '上传权重', 'load_host': '从内存读取模型'}
+                self.load_stage.label = phases.get(model.phase, model.phase or model.label)
+                self.load_stage.percent = model.done / model.total * 100 if model.total else None
+            else:
+                self.load_stage.label = '已卸载到内存 · KV/前缀缓存已清空' if model.state == 'ram' else '就绪'
+                self.load_stage.percent = 100
+            self._render_load_progress()
+        if model.error:
+            error, model.error = model.error, ''
+            self._append_log('model residency: ' + error)
+            QMessageBox.warning(self, '模型切换失败', error)
+
     def _check_health(self, force: bool = False) -> None:
         if force:
             self._poll_health()
@@ -1319,6 +1382,8 @@ class NInferGui(QWidget):
             return
         self.health_in_flight = False
         if url != self._health_url() or process is not self.process or self.server_stopping:
+            return
+        if self.process is not None and self.model_control and self.model_control.state != 'unknown':
             return
         if self.process is not None and not self.server_listening:
             self.status.setText("模型加载中…（等待 API 监听）")

@@ -1,4 +1,4 @@
-// Opt-in TP2 prefix-state gate on real Qwen3.8 Q4_K_M/NVFP4 artifacts.
+// Opt-in prefix-state gate on real Qwen3.8 Q4_K_M/NVFP4 artifacts.
 // Defaults to optimized MTP3; NINFER_V100X2_SPEC=dflash selects full-head DFlash7.
 // Exact token/state replay is the behavioral oracle; the independent numerical
 // Op oracles live in the GGML_K, GDN, and attention tests. Prefix vs cold prefill
@@ -52,6 +52,9 @@ ninfer::EngineOptions engine_options(const char* artifact, bool graphs) {
     options.prefill_chunk = 256;
     options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
     options.use_cuda_graph = graphs;
+    // Exercise active-lane checkpoints without historical branches overriding
+    // the resident append/reset paths asserted below. History has its own gate.
+    options.prefix_cache_tokens = 0;
     options.speculative = v100x2_test::profile(ninfer::ProposalHead::Optimized);
     return options;
 }

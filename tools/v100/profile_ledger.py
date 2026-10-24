@@ -16,7 +16,7 @@ import sqlite3
 
 
 def category(short, full):
-    if short.startswith("allreduce_peer_sum_"):
+    if short.startswith(("allreduce_peer_sum_", "allreduce_packet_")):
         return "communication.peer_sum"
     if "argmax" in short:
         return "token_decision.argmax"
@@ -37,11 +37,12 @@ def category(short, full):
         return "projection.weight_decode"
     if "scale_rows" in short or "scale_gate_up" in short:
         return "projection.row_scale"
-    if "bf16_to_fp16" in short:
+    if "bf16_to_fp16" in short or short == "qpn_cast_activation":
         return "projection.activation_cast"
     if "flash_attn_ext" in short:
         return "attention.prefill_core"
-    if "gqa_attention_small_t_tc" in short or "attention_decode_i8_tiled" in short:
+    if ("gqa_attention_small_t_tc" in short or "attention_decode_i8_tiled" in short
+            or ("gqa_attention_" in short and "partial_i8" in short)):
         return "attention.decode_partial"
     if "attention_small_t_reduce" in short or "flash_attn_stream_k_fixup" in short:
         return "attention.reduce"

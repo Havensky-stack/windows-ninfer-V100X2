@@ -1,8 +1,11 @@
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/gated_rmsnorm.h"
+#include "core/device.h"
 
 #include "ops/gdn_criteria.h"
 #include "ops/gdn_ref.h"
 #include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
 
 #include <algorithm>
 #include <bit>
@@ -41,7 +44,8 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 }
 
 int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width,
-             std::int32_t batch, std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
+             std::int32_t batch, std::vector<std::int32_t> valid_columns, std::uint32_t seed,
+             bool fused_norm = false) {
     const std::int32_t kQkHeads = qk_heads;
     const bool dense            = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
@@ -53,7 +57,7 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
     const std::size_t state_elements =
         static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * slots;
 
-    const std::vector<std::uint16_t> q_bits = make_bf16(qk_elements, seed);
+    std::vector<std::uint16_t> q_bits = make_bf16(qk_elements, seed);
     std::vector<std::uint16_t> k_bits       = make_bf16(qk_elements, seed + 1);
     std::vector<std::uint16_t> v_bits       = make_bf16(value_elements, seed + 2);
     std::vector<float> g(gate_elements);
@@ -118,11 +122,57 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
     Tensor gate_record_tensor(gate_record.p, DType::FP32, {2, value_heads, width, batch});
 
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
+    const auto norm_weight_bits = make_bf16(128, seed + 10);
+    const auto norm_z_bits = make_bf16(value_elements, seed + 11);
+    DeviceBuffer norm_weight = to_device(norm_weight_bits);
+    DeviceBuffer norm_z = to_device(norm_z_bits);
+    DeviceBuffer norm_out(value_elements * 2), norm_reference(value_elements * 2);
+    DeviceBuffer counters(12 * sizeof(std::int32_t));
+    counters.fill();
+    const ops::GdnReplayGatedNorm epilogue{
+        Tensor(norm_weight.p, DType::BF16, {128}),
+        Tensor(norm_z.p, DType::BF16, {128, value_heads, width, batch}), 1.0e-6F,
+        Tensor(norm_out.p, DType::FP16, {128, value_heads, width, batch}),
+        Tensor(counters.p, DType::I32, {12})};
+    const auto record = [&](cudaStream_t stream) {
+        if (fused_norm) {
+            ops::gated_delta_net_replay_record(
+                q, k, v, g_tensor, beta_tensor, kScale, record_states, valid, initial,
+                key_record_tensor, value_record_tensor, gate_record_tensor, record_output,
+                epilogue, stream);
+        } else {
+            ops::gated_delta_net_replay_record(
+                q, k, v, g_tensor, beta_tensor, kScale, record_states, valid, initial,
+                key_record_tensor, value_record_tensor, gate_record_tensor, record_output, stream);
+        }
+    };
+    record(nullptr);
+    cuda_synchronize();
+    if (fused_norm) {
+        cudaStream_t stream;
+        cudaGraph_t graph;
+        cudaGraphExec_t executable;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        record(stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, 0));
+        for (int repeat = 0; repeat < 4; ++repeat) {
+            q_bits = make_bf16(qk_elements, seed + 20 + repeat);
+            device_q.copy_from_host(q_bits.data(), device_q.bytes);
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (from_device<std::int32_t>(counters, 12) != std::vector<std::int32_t>(12, 0)) {
+                std::cerr << "record-norm counters did not reset\n";
+                return 1;
+            }
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
     ops::gated_delta_net_snapshot(q, k, v, g_tensor, beta_tensor, kScale, true, snapshot_states,
                                   valid, initial, bases, snapshot_output, nullptr);
-    ops::gated_delta_net_replay_record(q, k, v, g_tensor, beta_tensor, kScale, record_states, valid,
-                                       initial, key_record_tensor, value_record_tensor,
-                                       gate_record_tensor, record_output, nullptr);
     cuda_synchronize();
 
     int failures             = 0;
@@ -135,6 +185,32 @@ int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width
         from_device<std::uint16_t>(record_out, value_elements);
     failures +=
         verify_equal("replay record output" + suffix, snapshot_output_bits, record_output_bits);
+    if (fused_norm) {
+        const auto image = from_device<std::uint16_t>(norm_out, value_elements);
+        std::vector<double> actual(value_elements), expected(value_elements);
+        for (std::size_t base = 0; base < value_elements; base += 128) {
+            double sum = 0.0;
+            for (int dim = 0; dim < 128; ++dim) {
+                const double x = bf16_to_f32(record_output_bits[base + dim]);
+                sum += x * x;
+            }
+            const double inv = 1.0 / std::sqrt(sum / 128.0 + epilogue.eps);
+            for (int dim = 0; dim < 128; ++dim) {
+                const double z = bf16_to_f32(norm_z_bits[base + dim]);
+                expected[base + dim] = bf16_to_f32(record_output_bits[base + dim]) * inv *
+                    bf16_to_f32(norm_weight_bits[dim]) * z / (1.0 + std::exp(-z));
+                actual[base + dim] = quantized_weight::detail::f16_to_f32(image[base + dim]);
+            }
+        }
+        failures += verify_reduction("record-norm FP64 oracle" + suffix, actual, expected,
+                                       {1.85e-3, 4.5e-5, 2.8e-3});
+        Tensor normalized(norm_reference.p, DType::FP16, {128, value_heads, width, batch});
+        ops::gated_rmsnorm(record_output, epilogue.weight, epilogue.z, epilogue.eps,
+                           normalized, nullptr);
+        cuda_synchronize();
+        failures += verify_equal("record-norm BF16-rounded image" + suffix, image,
+                                   from_device<std::uint16_t>(norm_reference, value_elements));
+    }
 
     const std::vector<std::uint16_t> key_bits_after =
         from_device<std::uint16_t>(key_record, qk_elements);
@@ -292,19 +368,35 @@ std::vector<double> run_record(std::int32_t qk_heads, std::int32_t value_heads,
     Tensor gate_tensor(gate_record.p, DType::FP32, {2, value_heads, width, 1});
 
     constexpr float kScale = 1.0F / std::sqrt(128.0F);
-    ops::gated_delta_net_replay_record(q_tensor, k_tensor, v_tensor, g_tensor, beta_tensor, kScale,
-                                       states, Tensor{}, slots_tensor, key_tensor, value_tensor,
-                                       gate_tensor, output, nullptr);
+    if (qk_heads == 4 && value_heads == 12 && width <= 8) {
+        auto weight = to_device(make_bf16(128, 2211U));
+        auto z = to_device(make_bf16(value_elements, 2212U));
+        DeviceBuffer normalized(value_elements * 2), counters(12 * 4);
+        counters.fill();
+        const ops::GdnReplayGatedNorm norm{
+            Tensor(weight.p, DType::BF16, {128}),
+            Tensor(z.p, DType::BF16, {128, 12, width, 1}), 1e-6F,
+            Tensor(normalized.p, DType::FP16, {128, 12, width, 1}),
+            Tensor(counters.p, DType::I32, {12})};
+        ops::gated_delta_net_replay_record(
+            q_tensor, k_tensor, v_tensor, g_tensor, beta_tensor, kScale, states, Tensor{},
+            slots_tensor, key_tensor, value_tensor, gate_tensor, output, norm, nullptr);
+        cuda_synchronize();
+    } else {
+        ops::gated_delta_net_replay_record(q_tensor, k_tensor, v_tensor, g_tensor, beta_tensor, kScale,
+                                           states, Tensor{}, slots_tensor, key_tensor, value_tensor,
+                                           gate_tensor, output, nullptr);
+    }
     cuda_synchronize();
     return to_doubles(from_device<std::uint16_t>(out, value_elements));
 }
 
-int oracle_shard_case(std::int32_t width, std::uint32_t seed) {
+int oracle_shard_case(std::int32_t width, std::uint32_t seed, std::int32_t ranks = 2) {
     constexpr std::int32_t kGlobalQk    = 16;
     constexpr std::int32_t kGlobalValue = 48;
-    constexpr std::int32_t kRanks       = 2;
-    constexpr std::int32_t kLocalQk     = kGlobalQk / kRanks;
-    constexpr std::int32_t kLocalValue  = kGlobalValue / kRanks;
+    const std::int32_t kRanks       = ranks;
+    const std::int32_t kLocalQk     = kGlobalQk / kRanks;
+    const std::int32_t kLocalValue  = kGlobalValue / kRanks;
     const std::string tag = "replay record oracle T=" + std::to_string(width);
 
     const std::size_t qk_elements    = static_cast<std::size_t>(kStateDim) * kGlobalQk * width;
@@ -380,10 +472,8 @@ int oracle_shard_case(std::int32_t width, std::uint32_t seed) {
     const gdn_ref::Inputs whole = make_inputs(kGlobalQk, kGlobalValue, q, k, v, g, beta, state);
     const gdn_ref::Result whole_reference =
         gdn_ref::evaluate(whole, kScaleDouble, /*normalize_qk=*/true);
-    const OracleLeg parent =
-        leg(tag + " tp1 out vs oracle",
-            run_record(kGlobalQk, kGlobalValue, width, q, k, v, g, beta, state),
-            whole_reference.out);
+    const auto parent_output = run_record(kGlobalQk, kGlobalValue, width, q, k, v, g, beta, state);
+    const OracleLeg parent = leg(tag + " tp1 out vs oracle", parent_output, whole_reference.out);
 
     int failures = 0;
     const auto& criterion = gated_delta_net_output_bf16_criterion();
@@ -409,6 +499,15 @@ int oracle_shard_case(std::int32_t width, std::uint32_t seed) {
         const gdn_ref::Result shard_reference =
             gdn_ref::evaluate(shard_inputs, kScaleDouble, /*normalize_qk=*/true);
         const std::string name = tag + " rank " + std::to_string(rank);
+        // Compare this shard to the same parent heads, rather than to an aggregate over
+        // unrelated heads whose RMS error can be smaller by sampling alone.
+        std::vector<double> parent_slice(static_cast<std::size_t>(width) * kLocalValue * 128);
+        for (int token = 0; token < width; ++token) {
+            std::copy_n(parent_output.begin() + (token * kGlobalValue + rank * kLocalValue) * 128,
+                        kLocalValue * 128, parent_slice.begin() + token * kLocalValue * 128);
+        }
+        const OracleLeg parent_heads = leg(name + " parent heads vs oracle", parent_slice,
+                                             shard_reference.out);
         const OracleLeg shard =
             leg(name + " out vs oracle",
                 run_record(kLocalQk, kLocalValue, width, q_shard, k_shard, v_shard, g_shard,
@@ -425,15 +524,15 @@ int oracle_shard_case(std::int32_t width, std::uint32_t seed) {
             ++failures;
         }
         constexpr double kSlack = 1.02;
-        if (shard.relative_l2 > parent.relative_l2 * kSlack) {
+        if (shard.relative_l2 > parent_heads.relative_l2 * kSlack) {
             std::cerr << name << ": shard relative_l2 " << shard.relative_l2
-                      << " is worse than the tp1 geometry's " << parent.relative_l2
+                      << " is worse than the tp1 geometry's " << parent_heads.relative_l2
                       << " on the same data\n";
             ++failures;
         }
-        if (shard.gross > parent.gross * kSlack) {
+        if (shard.gross > parent_heads.gross * kSlack) {
             std::cerr << name << ": shard max-absolute error " << shard.gross
-                      << " is worse than the tp1 geometry's " << parent.gross
+                      << " is worse than the tp1 geometry's " << parent_heads.gross
                       << " on the same data\n";
             ++failures;
         }
@@ -464,8 +563,15 @@ int main() {
     failures += run_case(4, 12, 2, 1, {}, 1781U);
     failures += run_case(4, 12, 4, 1, {3}, 1782U);
     failures += run_case(4, 12, 6, 8, {6, 4, 3, 2, 1, 5, 6, 2}, 1783U);
+    for (int width = 2; width <= 8; ++width) {
+        failures += run_case(4, 12, width, 1, {}, 1900U + width, true);
+        failures += run_case(4, 12, width, 1, {width - 1}, 1920U + width, true);
+    }
     failures += oracle_shard_case(6, 1801U);
     failures += oracle_shard_case(4, 1811U);
+    failures += oracle_shard_case(2, 1821U, 4);
+    failures += oracle_shard_case(5, 1831U, 4);
+    failures += oracle_shard_case(8, 1841U, 4);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

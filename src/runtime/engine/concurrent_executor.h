@@ -46,10 +46,12 @@ public:
         : instance_(instance), device_(device.device), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
+          prefill_decode_rounds_(options.prefill_decode_rounds),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            options.max_pending_requests == 0 || pending_timeout_.count() <= 0 ||
+            prefill_decode_rounds_ == 0 || prefill_decode_rounds_ > 64) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
         }
         if (admission_capacity_.active_lanes != max_concurrency_ ||
@@ -1229,6 +1231,7 @@ private:
 
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
+        std::uint32_t decode_rounds_since_prefill = 0;
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
@@ -1257,11 +1260,14 @@ private:
                 const RoundMembership membership = build_round_membership();
 
                 if (prefill_lane_) {
-                    if (!membership.empty() && !previous_unit_was_decode) {
+                    if (!membership.empty() &&
+                        decode_rounds_since_prefill < prefill_decode_rounds_) {
                         run_decode_round(membership);
+                        ++decode_rounds_since_prefill;
                         previous_unit_was_decode = true;
                     } else {
                         run_prefill_step();
+                        decode_rounds_since_prefill = 0;
                         previous_unit_was_decode = false;
                     }
                     continue;
@@ -1270,6 +1276,7 @@ private:
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
                     const AdmissionProgress progress = try_admit_one();
                     if (progress == AdmissionProgress::RanGpuUnit) {
+                        decode_rounds_since_prefill = 0;
                         previous_unit_was_decode = false;
                         continue;
                     }
@@ -1303,6 +1310,7 @@ private:
     const int device_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
+    const std::uint32_t prefill_decode_rounds_;
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
 

@@ -121,9 +121,10 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__ void gqa_attention_small_t_tc_
     constexpr int DChunksLocal  = DSlice / 8;       // this warp's resident accumulator chunks
     constexpr int PageIds       = 64;
     constexpr int Groups        = D / kGqaKvQuantGroup; // quant groups per key row
-    constexpr bool InlineQK = Geometry::QHeads == 12 && TokenTile == 5 &&
+    constexpr bool InlineQK = (Geometry::QHeads == 12 || Geometry::QHeads == 6) && TokenTile == 5 &&
                               SharedSoftmax && !Fp32Pv;
-    constexpr bool PrefetchKv = Geometry::QHeads == 12 && TokenTile == 5 && WarpsPerCta == 8;
+    constexpr bool PrefetchKv = (Geometry::QHeads == 12 || Geometry::QHeads == 6) &&
+                              TokenTile == 5 && WarpsPerCta == 8;
     constexpr int KvChunks = Bc * (D / 8) / Threads;
     constexpr float Log2E       = 1.4426950408889634074f;
     constexpr unsigned FullMask = 0xffffffffu;

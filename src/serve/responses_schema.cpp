@@ -766,6 +766,7 @@ ResponsesRequest parse_request_impl(const Json& body, const RequestLimits& limit
         out.generation.max_tokens     = limits.default_max_tokens;
         out.generation.max_tokens_set = false;
     }
+    validate_output_token_limit(out.generation.max_tokens, limits, "max_output_tokens");
     out.generation.messages = out.input_turns;
     return out;
 }

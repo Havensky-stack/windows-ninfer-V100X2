@@ -33,3 +33,6 @@ models
 *.qus
 *.safetensors
 *.sqlite
+
+# Generated release packages and Docker exports
+dist/

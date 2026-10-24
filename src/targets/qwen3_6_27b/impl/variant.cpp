@@ -70,12 +70,14 @@ constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
 QType tp4_projection_type(WeightsProfile profile) {
     switch (profile) {
+    case WeightsProfile::Qwen38QuasarNvfp4:
+        return QType::NVFP4;
     case WeightsProfile::Qwen38Nvfp4:
         return QType::FP8_E4M3FN_ROW_BF16S;
     case WeightsProfile::Qwen38Fp8:
         return QType::FP8_E4M3FN_BLOCK128_BF16S;
     default:
-        throw std::invalid_argument("TP4 text projection requires Qwen3.8 NVFP4 or native FP8");
+        throw std::invalid_argument("TP4 text projection requires Qwen3.8 NVFP4, QUASAR NVFP4 or native FP8");
     }
 }
 
@@ -893,6 +895,19 @@ void Variant::gdn_control_projection(std::span<const Tensor> hidden,
         workspace, g, beta, ec);
 }
 
+DType Variant::gdn_output_input_dtype(const Weight& w, int tp, int tokens) {
+    return tp == 4 && tokens >= 1 && tokens <= 8 && w.qtype == QType::NVFP4 &&
+           w.layout == QuantLayout::VoltaQpnPrepacked && w.n == 5120 && w.k == 1536
+               ? DType::FP16 : DType::BF16;
+}
+
+DType Variant::post_mixer_input_dtype(const PostMixerWeights& w, int tp, int tokens) {
+    return tp == 4 && tokens >= 1 && tokens <= 8 &&
+           w.gate_up.qtype == QType::NVFP4 &&
+           w.gate_up.layout == QuantLayout::VoltaQpnPrepacked &&
+           w.gate_up.n == 8704 && w.gate_up.k == 5120 ? DType::FP16 : DType::BF16;
+}
+
 void Variant::post_mixer(std::span<const Tensor> hidden,
                          std::span<const PostMixerWeights* const> w,
                          std::span<const Tensor> residual,
@@ -911,8 +926,15 @@ void Variant::post_mixer(std::span<const Tensor> hidden,
     std::array<Tensor, kMaximumExecutionDevices> activation{};
     auto scopes = workspace_scopes(workspace);
     for (std::size_t rank = 0; rank < ec.device_count; ++rank) {
+        const bool fp16_activation = norm && norm->weight.size() == 4 &&
+            norm->output.size() == 4 && ev.packet_storage(0) &&
+            post_mixer_input_dtype(*w[rank], ec.device_count, hidden[rank].ne[1]) == DType::FP16 &&
+            w[rank]->down.qtype == QType::NVFP4 &&
+            w[rank]->down.layout == QuantLayout::VoltaQpnPrepacked &&
+            w[rank]->down.n == 5120 && w[rank]->down.k == 4352;
+        const auto activation_dtype = fp16_activation ? DType::FP16 : DType::BF16;
         activation[rank] =
-            workspace[rank]->alloc(DType::BF16, {shard_intermediate, hidden[0].ne[1]});
+            workspace[rank]->alloc(activation_dtype, {shard_intermediate, hidden[0].ne[1]});
     }
     ops::linear_swiglu_column_parallel(hidden, active(weight_shards(w, &PostMixerWeights::gate_up, ec), ec), active(activation, ec),
                                        text_policy(w[0]->gate_up), workspace, ec);

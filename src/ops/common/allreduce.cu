@@ -24,7 +24,9 @@
 #include "ninfer/ops/allreduce.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/argmax.h"
+#include "ninfer/ops/speculative_round.h"
 #include <cmath>
+#include <cstring>
 
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 #include "ops/launcher/allreduce.h"
@@ -33,6 +35,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <limits>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -399,17 +402,55 @@ bool enable_peer_access(const ExecutionContext& ec) {
     }
 }
 
-PeerEvents::PeerEvents(const ExecutionContext& ec, bool direct_peer_access)
+PeerEvents::PeerEvents(const ExecutionContext& ec, bool direct_peer_access, HostPackets host_packets)
     : direct_peer_access_(direct_peer_access), ranks_(ec.device_count) {
     require_collective_devices(ec, "PeerEvents: requires two or four distinct devices");
     const CurrentDeviceGuard guard;
-    if (ec.device_count == 2 && direct_peer_access && ec.dev[0]->sm() == 70 && ec.dev[1]->sm() == 70) {
+    bool packet_transport = direct_peer_access;
+    for (int rank = 0; rank < ec.device_count; ++rank) {
+        packet_transport &= ec.dev[rank]->sm() == 70;
+    }
+    std::string kernel_release;
+    if (host_packets == HostPackets::Auto) {
+        std::ifstream release("/proc/sys/kernel/osrelease");
+        std::getline(release, kernel_release);
+    }
+    const bool want_host_packets = host_packets == HostPackets::Required ||
+        (host_packets == HostPackets::Auto && kernel_release.find("WSL2") != std::string::npos);
+    if (want_host_packets && !direct_peer_access && ec.device_count == 2 &&
+        ec.dev[0]->sm() == 70 && ec.dev[1]->sm() == 70) {
         for (int rank = 0; rank < 2; ++rank) {
             CurrentDeviceGuard::set(ec.dev[rank]->device);
-            packets_[rank] = DeviceBuffer(2 * kPacketMaxBytes + kPacketBlocks * sizeof(unsigned));
-            CUDA_CHECK(cudaMemsetAsync(packets_[rank].p, 0xff, 2 * kPacketMaxBytes,
+            cudaDeviceProp properties{};
+            startup_check(cudaGetDeviceProperties(&properties, ec.dev[rank]->device), "host packet properties");
+            require(properties.canMapHostMemory && properties.unifiedAddressing,
+                    "mapped host packets require mapped host memory and UVA");
+            host_packets_[rank] = std::make_unique<PinnedHostBuffer>(2 * kPacketMaxBytes);
+            std::memset(host_packets_[rank]->data(), 0xff, 2 * kPacketMaxBytes);
+            host_packet_epochs_[rank] = DeviceBuffer(kPacketBlocks * sizeof(unsigned));
+            CUDA_CHECK(cudaMemsetAsync(host_packet_epochs_[rank].p, 0,
+                kPacketBlocks * sizeof(unsigned), ec.dev[rank]->stream));
+        }
+        for (int rank = 0; rank < 2; ++rank) {
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            for (int owner = 0; owner < 2; ++owner) {
+                startup_check(cudaHostGetDevicePointer(&host_packet_aliases_[rank][owner],
+                    host_packets_[owner]->data(), 0), "host packet mapping");
+            }
+        }
+        std::fprintf(stderr, "[ninfer] TP2 small reductions use mapped-host packets (320 KiB pinned RAM)\n");
+    } else {
+        require(host_packets != HostPackets::Required,
+                "mapped host packets require SM70 TP2 with direct P2P disabled");
+    }
+    if (packet_transport) {
+        const std::size_t payload_bytes = 2 * kPacketMaxBytes * (ec.device_count == 4 ? 4 : 1);
+        for (int rank = 0; rank < ec.device_count; ++rank) {
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            packets_[rank] = DeviceBuffer(payload_bytes + kPacketBlocks * sizeof(unsigned));
+            CUDA_CHECK(cudaMemsetAsync(packets_[rank].p, 0xff, payload_bytes,
                                        ec.dev[rank]->stream));
-            CUDA_CHECK(cudaMemsetAsync(byte_offset(packets_[rank].p, 2 * kPacketMaxBytes),
+            CUDA_CHECK(cudaMemsetAsync(byte_offset(packets_[rank].p, payload_bytes),
                                        0, kPacketBlocks * sizeof(unsigned), ec.dev[rank]->stream));
         }
     }
@@ -463,9 +504,13 @@ PeerEvents::~PeerEvents() {
 PeerEvents::PeerEvents(PeerEvents&& other) noexcept
     : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_),
       packets_(std::move(other.packets_)),
+      host_packets_(std::move(other.host_packets_)),
+      host_packet_aliases_(other.host_packet_aliases_),
+      host_packet_epochs_(std::move(other.host_packet_epochs_)),
       direct_peer_access_(other.direct_peer_access_), ranks_(other.ranks_) {
     other.inputs_ready_ = {};
     other.pull_done_    = {};
+    other.host_packet_aliases_ = {};
     other.direct_peer_access_ = false;
     other.ranks_ = 0;
 }
@@ -476,13 +521,17 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     inputs_ready_.swap(other.inputs_ready_);
     pull_done_.swap(other.pull_done_);
     packets_.swap(other.packets_);
+    host_packets_.swap(other.host_packets_);
+    host_packet_aliases_.swap(other.host_packet_aliases_);
+    host_packet_epochs_.swap(other.host_packet_epochs_);
     std::swap(direct_peer_access_, other.direct_peer_access_);
     std::swap(ranks_, other.ranks_);
     return *this;
 }
 
-void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> staging,
-                   const ExecutionContext& ec, const PeerEvents& events) {
+namespace {
+void validate_sum(std::span<const Tensor> buffer, std::span<const Tensor> staging,
+                  const ExecutionContext& ec, const PeerEvents& events) {
     require_collective_devices(ec, "allreduce_sum: requires two or four distinct devices");
     require(buffer.size() == static_cast<std::size_t>(ec.device_count) && staging.size() == buffer.size(),
             "allreduce_sum: tensor spans must have one entry per active rank");
@@ -509,7 +558,6 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
     require(events.live() && events.ranks() == ec.device_count, "allreduce_sum: events must match active ranks");
 
     const std::size_t bytes = buffer[0].bytes();
-    if (bytes == 0) { return; }
 
 #ifndef NDEBUG
     for (int rank = 0; rank < ec.device_count; ++rank) {
@@ -522,18 +570,93 @@ void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> stagi
     }
 #endif
 
+}
+} // namespace
+
+void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> staging,
+                   const ExecutionContext& ec, const PeerEvents& events) {
+    validate_sum(buffer, staging, ec, events);
+    const std::size_t bytes = buffer[0].bytes();
+    if (bytes == 0) { return; }
     const CurrentDeviceGuard guard;
 
-    const auto addresses = reinterpret_cast<std::uintptr_t>(buffer[0].data) |
-                           reinterpret_cast<std::uintptr_t>(buffer[1].data);
-    if (events.packet_storage(0) != nullptr && bytes <= PeerEvents::kPacketMaxBytes &&
+    std::uintptr_t addresses = 0;
+    for (const auto& tensor : buffer) {
+        addresses |= reinterpret_cast<std::uintptr_t>(tensor.data);
+    }
+    if (events.host_packets() && bytes <= PeerEvents::kPacketMaxBytes &&
         bytes % 16 == 0 && (addresses & 15U) == 0) {
         for (int rank = 0; rank < 2; ++rank) {
             const auto& local = *ec.dev[rank];
             CurrentDeviceGuard::set(local.device);
-            detail::allreduce_packet_sum_launch(buffer[rank], buffer[rank],
-                events.packet_storage(rank), events.packet_storage(1 - rank),
-                PeerEvents::kPacketMaxBytes, local.stream);
+            detail::allreduce_host_packet_sum_launch(buffer[rank], buffer[rank],
+                events.host_packet_storage(rank, rank), events.host_packet_storage(rank, 1-rank),
+                events.host_packet_epochs(rank), PeerEvents::kPacketMaxBytes, local.stream);
+        }
+        return;
+    }
+    if (events.packet_storage(0) != nullptr && bytes <= PeerEvents::kPacketMaxBytes &&
+        bytes % 16 == 0 && (addresses & 15U) == 0) {
+        const std::array<void*, 4> storage{events.packet_storage(0), events.packet_storage(1),
+                                         events.packet_storage(2), events.packet_storage(3)};
+        for (int rank = 0; rank < ec.device_count; ++rank) {
+            const auto& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            if (ec.device_count == 4) {
+                detail::allreduce_packet_sum4_launch(buffer[rank], storage, rank,
+                    PeerEvents::kPacketMaxBytes, local.stream);
+            } else {
+                detail::allreduce_packet_sum_launch(buffer[rank], buffer[rank],
+                    storage[rank], storage[1 - rank], PeerEvents::kPacketMaxBytes, local.stream);
+            }
+        }
+        return;
+    }
+
+    // 1Cat's wide-message reduce-scatter/allgather schedule assigns each rank one
+    // quarter of the sum. Keep our canonical FP32 rank order and event-owned
+    // lifetimes: all input reads retire before any original buffer is overwritten.
+    // The next call's inputs-ready waits also retire this call's gathers before
+    // a rank can overwrite the same staging storage.
+    if (ec.device_count == 4 && events.direct_peer_access() &&
+        bytes >= 262144 && bytes % 64 == 0 && (addresses & 15U) == 0 &&
+        buffer[0].numel() / 4 <= std::numeric_limits<std::int32_t>::max()) {
+        const std::size_t part_bytes = bytes / 4;
+        const auto part_elements = static_cast<std::int32_t>(buffer[0].numel() / 4);
+        for (int rank = 0; rank < 4; ++rank) {
+            const auto& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
+        }
+        for (int rank = 0; rank < 4; ++rank) {
+            const auto& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            for (int source = 0; source < 4; ++source) {
+                if (source != rank) {
+                    CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(source), 0));
+                }
+            }
+            std::array<Tensor, 4> inputs;
+            for (int source = 0; source < 4; ++source) {
+                inputs[source] = Tensor(byte_offset(buffer[source].data, rank * part_bytes),
+                                        DType::BF16, {part_elements});
+            }
+            Tensor partial(staging[rank].data, DType::BF16, {part_elements});
+            detail::allreduce_sum4_launch(inputs, partial, local.stream);
+            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+        }
+        for (int rank = 0; rank < 4; ++rank) {
+            const auto& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            for (int source = 0; source < 4; ++source) {
+                if (source != rank) {
+                    CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(source), 0));
+                }
+            }
+            for (int source = 0; source < 4; ++source) {
+                CUDA_CHECK(pull_peer(byte_offset(buffer[rank].data, source * part_bytes),
+                                     staging[source].data, part_bytes, local.stream));
+            }
         }
         return;
     }
@@ -642,6 +765,74 @@ void validate_sum_to(std::span<const Tensor> input, std::span<const Tensor> outp
 }
 } // namespace
 
+static void sum_rmsnorm(std::span<const Tensor> buffer, std::span<const Tensor> staging,
+                        const ReplicatedRmsNorm& norm, const ExecutionContext& ec,
+                        const PeerEvents& events, bool published) {
+    validate_sum(buffer, staging, ec, events);
+    require(norm.weight.size() == buffer.size() && norm.output.size() == buffer.size() &&
+            std::isfinite(norm.eps) && norm.eps > 0.f, "collective norm: invalid profile");
+    std::uintptr_t addresses = 0;
+    for (int rank = 0; rank < ec.device_count; ++rank) {
+        const auto& w = norm.weight[rank];
+        const auto& n = norm.output[rank];
+        require(w.dtype == DType::BF16 &&
+                (n.dtype == DType::BF16 || n.dtype == DType::FP16) &&
+                n.dtype == norm.output[0].dtype && w.data && n.data &&
+                w.is_contiguous() && n.is_contiguous() && w.numel() == buffer[0].ne[0],
+                "collective norm: invalid weight/output");
+        for (int d = 0; d < 4; ++d) require(n.ne[d] == buffer[0].ne[d],
+            "collective norm: output shape mismatch");
+        addresses |= reinterpret_cast<std::uintptr_t>(buffer[rank].data) |
+                     reinterpret_cast<std::uintptr_t>(w.data) |
+                     reinterpret_cast<std::uintptr_t>(n.data);
+#ifndef NDEBUG
+        require_resident_on(w.data, ec.dev[rank]->device, "collective norm weight residency");
+        require_resident_on(n.data, ec.dev[rank]->device, "collective norm output residency");
+        require_disjoint(n.data, n.bytes(), buffer[rank].data, buffer[rank].bytes(),
+                         "collective norm sum overlap");
+        require_disjoint(n.data, n.bytes(), staging[rank].data, staging[rank].bytes(),
+                         "collective norm staging overlap");
+#endif
+    }
+    if (published && ec.device_count == 4 && events.packet_storage(0) && buffer[0].ne[0] == 5120 &&
+        buffer[0].ne[1] >= 1 && buffer[0].ne[1] <= 8 && buffer[0].ne[2] == 1 &&
+        buffer[0].ne[3] == 1 && (addresses & 15U) == 0) {
+        const CurrentDeviceGuard guard;
+        const std::array<void*, 4> storage{events.packet_storage(0), events.packet_storage(1),
+                                         events.packet_storage(2), events.packet_storage(3)};
+        for (int rank = 0; rank < 4; ++rank) {
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            detail::allreduce_packet_sum4_rmsnorm_launch(buffer[rank], norm.weight[rank],
+                norm.output[rank], norm.eps, norm.unit_offset, storage, rank,
+                PeerEvents::kPacketMaxBytes, ec.dev[rank]->stream, published);
+        }
+        return;
+    }
+    require(!published, "published TP4 collective requires qualified packet norm geometry");
+    require(norm.output[0].dtype == DType::BF16,
+            "collective FP16 norm image requires published TP4 D5120 T1..8");
+    allreduce_sum(buffer, staging, ec, events);
+    const CurrentDeviceGuard guard;
+    for (int rank = 0; rank < ec.device_count; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        Tensor normalized = norm.output[rank];
+        rmsnorm(buffer[rank], norm.weight[rank], norm.eps, norm.unit_offset, normalized,
+                ec.dev[rank]->stream);
+    }
+}
+
+void allreduce_sum_rmsnorm(std::span<const Tensor> buffer, std::span<const Tensor> staging,
+                          const ReplicatedRmsNorm& norm,
+                          const ExecutionContext& ec, const PeerEvents& events) {
+    sum_rmsnorm(buffer, staging, norm, ec, events, false);
+}
+
+void detail::allreduce_published_sum_rmsnorm(std::span<const Tensor> buffer,
+    std::span<const Tensor> staging, const ReplicatedRmsNorm& norm,
+    const ExecutionContext& ec, const PeerEvents& events) {
+    sum_rmsnorm(buffer, staging, norm, ec, events, true);
+}
+
 void allreduce_sum_to(std::span<const Tensor> input, std::span<const Tensor> output,
                       const ExecutionContext& ec, const PeerEvents& events) {
     validate_sum_to(input, output, ec, events);
@@ -652,6 +843,17 @@ void allreduce_sum_to(std::span<const Tensor> input, std::span<const Tensor> out
                            reinterpret_cast<std::uintptr_t>(input[1].data) |
                            reinterpret_cast<std::uintptr_t>(output[0].data) |
                            reinterpret_cast<std::uintptr_t>(output[1].data);
+    if (events.host_packets() && bytes <= PeerEvents::kPacketMaxBytes &&
+        bytes % 16 == 0 && (addresses & 15U) == 0) {
+        for (int rank = 0; rank < 2; ++rank) {
+            const auto& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            detail::allreduce_host_packet_sum_launch(input[rank], output[rank],
+                events.host_packet_storage(rank, rank), events.host_packet_storage(rank, 1-rank),
+                events.host_packet_epochs(rank), PeerEvents::kPacketMaxBytes, local.stream);
+        }
+        return;
+    }
     if (events.packet_storage(0) != nullptr && bytes <= PeerEvents::kPacketMaxBytes &&
         bytes % 16 == 0 && (addresses & 15U) == 0) {
         for (int rank = 0; rank < 2; ++rank) {
@@ -924,7 +1126,8 @@ void gather_columns_rank0(const Tensor& destination, std::span<const Tensor> par
 void allreduce_argmax(std::span<const Tensor> values, std::span<const Tensor> indices,
                        std::span<const Tensor> output, Tensor& gathered_values,
                        Tensor& gathered_indices, std::int32_t shard_rows,
-                       const ExecutionContext& ec, const PeerEvents& events) {
+                       const ExecutionContext& ec, const PeerEvents& events,
+                       const std::int32_t* id_map) {
     require_collective_devices(ec, "allreduce_argmax: requires two or four distinct devices");
     const auto ranks = static_cast<std::size_t>(ec.device_count);
     require(values.size() == ranks && indices.size() == ranks && output.size() == ranks &&
@@ -944,18 +1147,26 @@ void allreduce_argmax(std::span<const Tensor> values, std::span<const Tensor> in
                     shape_ok(output[rank], DType::I32, columns, 1),
                 "allreduce_argmax: invalid tensors");
     }
-    if (ec.device_count == 2 && events.direct_peer_access()) {
+    if (events.direct_peer_access()) {
         const CurrentDeviceGuard guard;
-        for (int rank = 0; rank < 2; ++rank) {
+        for (int rank = 0; rank < ec.device_count; ++rank) {
             CurrentDeviceGuard::set(ec.dev[rank]->device);
             CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), ec.dev[rank]->stream));
         }
         CurrentDeviceGuard::set(ec.dev[0]->device);
-        CUDA_CHECK(cudaStreamWaitEvent(ec.dev[0]->stream, events.inputs_ready(1), 0));
-        detail::allreduce_argmax_tp2_launch(values, indices, output, shard_rows, ec.dev[0]->stream);
+        for (int rank = 1; rank < ec.device_count; ++rank) {
+            CUDA_CHECK(cudaStreamWaitEvent(ec.dev[0]->stream, events.inputs_ready(rank), 0));
+        }
+        if (ec.device_count == 2) {
+            detail::allreduce_argmax_tp2_launch(values, indices, output, shard_rows, id_map, ec.dev[0]->stream);
+        } else {
+            detail::allreduce_argmax_tp4_launch(values, indices, output, shard_rows, id_map, ec.dev[0]->stream);
+        }
         CUDA_CHECK(cudaEventRecord(events.pull_done(0), ec.dev[0]->stream));
-        CurrentDeviceGuard::set(ec.dev[1]->device);
-        CUDA_CHECK(cudaStreamWaitEvent(ec.dev[1]->stream, events.pull_done(0), 0));
+        for (int rank = 1; rank < ec.device_count; ++rank) {
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            CUDA_CHECK(cudaStreamWaitEvent(ec.dev[rank]->stream, events.pull_done(0), 0));
+        }
         return;
     }
     gather_columns_rank0(gathered_values, values, ec, events);
@@ -965,6 +1176,9 @@ void allreduce_argmax(std::span<const Tensor> values, std::span<const Tensor> in
         const CurrentDeviceGuard guard;
         CurrentDeviceGuard::set(ec.dev[0]->device);
         merge_argmax_shards(gathered_values, gathered_indices, result, shard_rows, ec.dev[0]->stream);
+        if (id_map != nullptr) {
+            proposal_remap_token_ids(result, id_map, ec.device_count * shard_rows, ec.dev[0]->stream);
+        }
     }
     broadcast_rank0(result, output.subspan(1), ec, events);
 }
@@ -993,6 +1207,28 @@ void broadcast_rank0(const Tensor& source, std::span<const Tensor> destinations,
     if (bytes == 0) { return; }
     const CurrentDeviceGuard guard;
     const DeviceContext& origin = *ec.dev[0];
+    if (ec.device_count == 4 && events.direct_peer_access() &&
+        source.dtype == DType::I32 && bytes <= 4096 &&
+        ec.dev[0]->sm() == 70 && ec.dev[1]->sm() == 70 &&
+        ec.dev[2]->sm() == 70 && ec.dev[3]->sm() == 70) {
+        // The origin writes the destinations directly. Join their preceding consumers
+        // before the write, then join publication before any rank reuses its storage.
+        for (int rank = 1; rank < 4; ++rank) {
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), ec.dev[rank]->stream));
+        }
+        CurrentDeviceGuard::set(origin.device);
+        for (int rank = 1; rank < 4; ++rank) {
+            CUDA_CHECK(cudaStreamWaitEvent(origin.stream, events.inputs_ready(rank), 0));
+        }
+        detail::broadcast_i32_tp4_launch(source, destinations, origin.stream);
+        CUDA_CHECK(cudaEventRecord(events.pull_done(0), origin.stream));
+        for (int rank = 1; rank < 4; ++rank) {
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            CUDA_CHECK(cudaStreamWaitEvent(ec.dev[rank]->stream, events.pull_done(0), 0));
+        }
+        return;
+    }
     CurrentDeviceGuard::set(origin.device);
     CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), origin.stream));
     for (int rank = 1; rank < ec.device_count; ++rank) {

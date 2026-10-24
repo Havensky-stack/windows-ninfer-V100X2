@@ -114,7 +114,8 @@ std::string serve_usage_text(const char* argv0) {
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--rope native|yarn] [--yarn-factor F] [--yarn-origin O] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
+           "[--prefill-chunk N] [--prefill-decode-rounds N] "
+           "[--log-stats-interval-ms N] [--device N] [--tp 1|2|4] "
            "[--devices N,...] [--storage-device N] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
@@ -122,19 +123,21 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--ram-kv-window N] [--ram-kv-budget-bytes N] "
-           "[--default-max-tokens N] "
+           "[--default-max-tokens N] [--max-output-tokens N] "
            "[--vision] [--vision-device gpu|cpu] [--vision-max-tokens N] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
-           "       --volta-long-attention: experimental complete-history SM70 TP2 INT8 attention (1..8 requests); floating-point output may differ\n"
-           "       --volta-fast-decode: experimental QUASAR TP2 Text NVFP4 FP32 epilogues and packed MTP W8; output may differ.\n"
+           "       --prefill-decode-rounds N: experimental decode rounds between prefill steps (1..64, default 1); larger values delay the new request's first token\n"
+           "       --volta-long-attention: experimental complete-history SM70 TP2/TP4 INT8 attention (1..8 requests); floating-point output may differ\n"
+           "       --volta-fast-decode: experimental QUASAR TP2/TP4 Text NVFP4 FP32 epilogues and packed MTP W8; output may differ.\n"
            "       --ram-kv-window: experimental approximate Q/K mean-vector RAM-KV; one SM70 27B Text/MTP request, TP1/TP2/PP2\n"
            "       RAM archive budget defaults to 32000000000 bytes (not process RSS); disabled without the window option\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
+           "       --max-output-tokens N: reject requests above N output tokens; 0 disables this ceiling\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
            "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
            "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
@@ -262,6 +265,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--prefill-decode-rounds") {
+            options.prefill_decode_rounds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--prefill-decode-rounds"), "prefill-decode-rounds"));
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
@@ -339,6 +345,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--max-output-tokens") {
+            options.max_output_tokens =
+                parse_nonnegative_int(require_value("--max-output-tokens"), "max-output-tokens");
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
@@ -429,6 +438,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
+    if (options.prefill_decode_rounds == 0 || options.prefill_decode_rounds > 64) {
+        throw std::invalid_argument("--prefill-decode-rounds must be between 1 and 64");
+    }
     product::validate_speculative_cli_options(options.speculative);
     if (!options.enable_vision && options.vision_device == VisionDevice::Cpu) {
         throw std::invalid_argument("--vision-device cpu requires --vision");
@@ -443,6 +455,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");
         }
+    }
+    if (options.max_output_tokens > 0 &&
+        options.default_max_tokens > options.max_output_tokens) {
+        if (default_max_tokens_explicit) {
+            throw std::invalid_argument("--default-max-tokens exceeds --max-output-tokens");
+        }
+        options.default_max_tokens = options.max_output_tokens;
     }
     return options;
 }

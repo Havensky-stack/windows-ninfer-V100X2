@@ -713,7 +713,7 @@ int run_microbenchmark(const ExecutionContext& ec, const ops::PeerEvents& events
 }
 
 int run_argmax_collective_case(int columns, const ExecutionContext& ec,
-                               const ops::PeerEvents& events) {
+                               const ops::PeerEvents& events, bool mapped = false) {
     constexpr int Rounds = 16, Shard = 65536;
     const std::size_t bytes = sizeof(std::int32_t) * columns;
     std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> value, index, out, history, seeds;
@@ -737,6 +737,11 @@ int run_argmax_collective_case(int columns, const ExecutionContext& ec,
     GuardedDeviceBuffer sv(2 * bytes), si(2 * bytes);
     Tensor gathered_values(sv.data(), DType::FP32, {2, columns});
     Tensor gathered_indices(si.data(), DType::I32, {2, columns});
+    GuardedDeviceBuffer map_buffer(2 * Shard * sizeof(int));
+    std::vector<int> map(2 * Shard);
+    for (int i = 0; i < 2 * Shard; ++i) { map[i] = (i * 97 + 13) % (2 * Shard); }
+    cuda_check(cudaMemcpy(map_buffer.data(), map.data(), 2 * Shard * sizeof(int),
+                          cudaMemcpyHostToDevice), "argmax map");
     const auto invoke = [&] {
         for (int round = 0; round < Rounds; ++round) {
             for (int rank = 0; rank < 2; ++rank) {
@@ -748,7 +753,7 @@ int run_argmax_collective_case(int columns, const ExecutionContext& ec,
                     bytes, cudaMemcpyDeviceToDevice, ec.dev[rank]->stream), "reuse argmax indices");
             }
             ops::allreduce_argmax(values, indices, outputs, gathered_values, gathered_indices,
-                                   Shard, ec, events);
+                                   Shard, ec, events, mapped ? static_cast<const int*>(map_buffer.data()) : nullptr);
             for (int rank = 0; rank < 2; ++rank) {
                 set_device(ec, rank);
                 cuda_check(cudaMemcpyAsync(static_cast<std::uint8_t*>(history[rank]->data()) +
@@ -793,7 +798,8 @@ int run_argmax_collective_case(int columns, const ExecutionContext& ec,
                 const int i = (round % 2) * columns + t;
                 const double a = host_values[0][i], b = host_values[1][i];
                 const int ia = host_indices[0][i], ib = Shard + host_indices[1][i];
-                expected[round * columns + t] = b > a || (b == a && ib < ia) ? ib : ia;
+                const int winner = b > a || (b == a && ib < ia) ? ib : ia;
+                expected[round * columns + t] = mapped ? map[winner] : winner;
             }
         }
         for (int rank = 0; rank < 2; ++rank) {
@@ -812,6 +818,9 @@ int run_argmax_collective_case(int columns, const ExecutionContext& ec,
     set_device(ec, 0);
     failures += sv.verify_guards("argmax gather values");
     failures += si.verify_guards("argmax gather indices");
+    failures += map_buffer.verify_guards("argmax ID map");
+    failures += verify_exact("argmax ID map unchanged",
+        from_device<int>(map_buffer.data(), map.size()), map);
     cuda_check(cudaGraphExecDestroy(executable), "destroy argmax executable");
     cuda_check(cudaGraphDestroy(graph), "destroy argmax graph");
     return failures;
@@ -834,7 +843,8 @@ int main() {
 
     const ExecutionContext ec({0, 1});
     bool peer_access = ops::enable_peer_access(ec);
-    if (peer_access && std::getenv("NINFER_TEST_PEER_OFF") != nullptr) {
+    const bool require_host_packets = std::getenv("NINFER_TEST_HOST_PACKETS") != nullptr;
+    if (peer_access && (std::getenv("NINFER_TEST_PEER_OFF") != nullptr || require_host_packets)) {
         for (int rank = 0; rank < 2; ++rank) {
             set_device(ec, rank);
             cuda_check(cudaDeviceDisablePeerAccess(ec.dev[1 - rank]->device), "disable test peer access");
@@ -845,26 +855,30 @@ int main() {
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec, peer_access);
+    const ops::PeerEvents events(ec, peer_access, require_host_packets
+        ? ops::PeerEvents::HostPackets::Required : ops::PeerEvents::HostPackets::Auto);
+    if (events.host_packets()) std::cout << "small reductions: mapped-host packets\n";
 
     int failures = 0;
     for (int columns : {1, 5, 8, 33}) {
         failures += run_argmax_collective_case(columns, ec, events);
-        const ops::PeerEvents dma_events(ec, false);
+        failures += run_argmax_collective_case(columns, ec, events, true);
+        const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);
         failures += run_argmax_collective_case(columns, ec, dma_events);
+        failures += run_argmax_collective_case(columns, ec, dma_events, true);
     }
     // Real decode shape first: 5120 is the hidden dimension all-reduced 128 times per token.
     // Direct-read threshold, scalar tail, wide DMA fallback, graph replay and immutable inputs.
     for (int count : {1, 4097, 5120, 25600, 40960, 40961}) {
         failures += run_allreduce_case("allreduce_sum_to", count, 1, 121u, ec, events, true);
-        const ops::PeerEvents dma_events(ec, false);
+        const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);
         failures += run_allreduce_case("allreduce_sum_to forced DMA", count, 1, 122u,
                                        ec, dma_events, true);
     }
     for (int tokens : {1, 4, 5, 8, 9}) {
         for (unsigned seed : {141u, 142u}) {
             failures += run_allreduce_case("sum + RMSNorm", 5120, tokens, seed, ec, events, true, true);
-            const ops::PeerEvents dma_events(ec, false);
+            const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);
             failures += run_allreduce_case("sum + RMSNorm DMA", 5120, tokens, seed, ec, dma_events, true, true);
         }
     }

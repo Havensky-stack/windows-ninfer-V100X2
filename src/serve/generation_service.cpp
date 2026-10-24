@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -242,6 +243,7 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
+    engine_options.prefill_decode_rounds    = options_.prefill_decode_rounds;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.ram_kv                   = options_.ram_kv;
     engine_options.prefix_cache_tokens      = options_.prefix_cache_tokens;
@@ -260,12 +262,147 @@ GenerationService::GenerationService(ServeOptions options, LoadProgress load_pro
     prompt_capabilities_ = engine_->prompt_capabilities();
     request_capacity_    = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    engine_options_ = engine_->options();
+    load_ = engine_->load_summary();
+    sampling_defaults_ = engine_->sampling_defaults();
+}
+
+namespace {
+ninfer::RuntimeStats add_execution_stats(ninfer::RuntimeStats current,
+                                         const ninfer::RuntimeStats& completed) {
+    current.computed_prefill_tokens += completed.computed_prefill_tokens;
+    current.committed_decode_tokens += completed.committed_decode_tokens;
+    current.decode_rounds += completed.decode_rounds;
+    current.decode_row_rounds += completed.decode_row_rounds;
+    current.decode_wall_seconds += completed.decode_wall_seconds;
+    current.speculative_drafted_tokens += completed.speculative_drafted_tokens;
+    current.speculative_accepted_tokens += completed.speculative_accepted_tokens;
+    return current;
+}
+
+[[noreturn]] void residency_error(int status, std::string code, std::string message) {
+    ApiError error;
+    error.status = status;
+    error.type = "server_error";
+    error.code = std::move(code);
+    error.message = std::move(message);
+    throw ApiException(std::move(error));
+}
+
+void check_host_memory(std::uint64_t required) {
+    std::ifstream input("/proc/meminfo");
+    std::string key, unit;
+    std::uint64_t kib = 0;
+    while (input >> key >> kib >> unit) {
+        if (key != "MemAvailable:") { continue; }
+        constexpr std::uint64_t reserve = 1024ULL * 1024 * 1024;
+        if (kib * 1024 < required + reserve) {
+            residency_error(507, "insufficient_host_memory",
+                            "not enough available host RAM for the model plus 1 GiB headroom");
+        }
+        break;
+    }
+}
+} // namespace
+
+ModelResidency GenerationService::model_residency() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    auto result = residency_;
+    result.retained_host_bytes = host_model_.bytes();
+    result.active_requests = request_capacity_->active;
+    return result;
+}
+
+void GenerationService::update_load_progress(std::string_view phase, std::uint64_t done,
+                                              std::uint64_t total) {
+    std::lock_guard lock(request_capacity_->mutex);
+    residency_.phase = phase;
+    residency_.done = done;
+    residency_.total = total;
+}
+
+ninfer::RuntimeStats GenerationService::runtime_stats() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return residency_.state == "gpu"
+        ? add_execution_stats(engine_->runtime_stats(), completed_stats_) : completed_stats_;
+}
+
+ninfer::MemorySummary GenerationService::memory_summary() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return residency_.state == "gpu" ? engine_->memory_summary() : ninfer::MemorySummary{};
+}
+
+ninfer::MediaCacheSummary GenerationService::media_cache_summary() const {
+    std::lock_guard lock(request_capacity_->mutex);
+    return residency_.state == "gpu" ? engine_->media_cache_summary() : ninfer::MediaCacheSummary{};
+}
+
+void GenerationService::offload_to_memory() {
+    ninfer::RuntimeStats previous;
+    {
+        std::lock_guard lock(request_capacity_->mutex);
+        if (residency_.state == "ram") { return; }
+        if (residency_.state != "gpu" || request_capacity_->active != 0) {
+            residency_error(409, "model_busy", "wait for active requests or the model transition to finish");
+        }
+        previous = completed_stats_;
+        completed_stats_ = add_execution_stats(engine_->runtime_stats(), completed_stats_);
+        residency_ = ModelResidency{.state = "offloading", .phase = "retain_host"};
+    }
+    try {
+        if (!host_model_) {
+            check_host_memory(std::filesystem::file_size(options_.artifact_path));
+            auto model = engine_->retain_model_in_memory(LoadProgress{
+                .callback = [this](auto phase, auto done, auto total) {
+                    update_load_progress(phase, done, total);
+                }});
+            std::lock_guard lock(request_capacity_->mutex);
+            host_model_ = std::move(model);
+        }
+        update_load_progress("release_gpu", 0, 0);
+        engine_.reset();
+        std::lock_guard lock(request_capacity_->mutex);
+        residency_ = ModelResidency{.state = "ram", .phase = "ready"};
+    } catch (...) {
+        std::lock_guard lock(request_capacity_->mutex);
+        completed_stats_ = previous;
+        residency_ = ModelResidency{};
+        throw;
+    }
+}
+
+void GenerationService::load_from_memory() {
+    {
+        std::lock_guard lock(request_capacity_->mutex);
+        if (residency_.state == "gpu") { return; }
+        if (residency_.state != "ram") {
+            residency_error(409, "model_busy", "a model transition is already in progress");
+        }
+        residency_ = ModelResidency{.state = "loading", .phase = "load_host"};
+    }
+    try {
+        auto options = engine_options_;
+        options.load_progress.callback = [this](auto phase, auto done, auto total) {
+            update_load_progress(phase, done, total);
+        };
+        auto engine = std::make_unique<ninfer::Engine>(std::move(options), host_model_);
+        std::lock_guard lock(request_capacity_->mutex);
+        engine_ = std::move(engine);
+        residency_ = ModelResidency{};
+    } catch (...) {
+        std::lock_guard lock(request_capacity_->mutex);
+        residency_ = ModelResidency{.state = "ram", .phase = "ready"};
+        throw;
+    }
 }
 
 std::shared_ptr<RequestLifetime> GenerationService::acquire_request_lifetime() const {
     const auto started = Clock::now();
     {
         std::lock_guard lock(request_capacity_->mutex);
+        if (residency_.state != "gpu") {
+            residency_error(503, "model_not_loaded", "model is in host RAM or changing residency; load it into VRAM first");
+        }
         if (request_capacity_->active >= request_capacity_->maximum) {
             throw_request_error(ninfer::RequestError(RequestErrorKind::Overloaded,
                                                      "inference request queue is full"));
@@ -335,6 +472,7 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
                                            std::function<bool()> is_cancelled) const {
+    const auto lifetime = acquire_request_lifetime();
     const bool request_has_media = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");

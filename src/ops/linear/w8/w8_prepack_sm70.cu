@@ -6,9 +6,11 @@
 #include "ops/common/volta_mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/linear/w8/w8_launch.h"
+#include "ops/linear/w8/w8_dispatch.h"
 
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -150,10 +152,10 @@ __global__ __launch_bounds__(Split * 32) void w8_qpn_mtp_gemv_kernel(
 
 // Vocabulary heads retain four K partitions and their original association. MTP
 // projections use shape-specific splits. Every eight-code load is coalesced.
-template <int Split = 4>
+template <int Split = 4, class Activation = __nv_bfloat16, int Unroll = 4>
 __global__ __launch_bounds__(Split * 32, 32 / Split) void w8_qpn_prepacked_kernel(
     const std::uint8_t* __restrict__ codes, const std::uint16_t* __restrict__ scales,
-    const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ out,
+    const Activation* __restrict__ x, __nv_bfloat16* __restrict__ out,
     int n, int k, int t, int out_ld) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -166,7 +168,7 @@ __global__ __launch_bounds__(Split * 32, 32 / Split) void w8_qpn_prepacked_kerne
     __shared__ float sums[Split][256];
     float c[8] = {};
     const half2 bias = __half2half2(__ushort_as_half(0x6480));
-#pragma unroll 4
+#pragma unroll Unroll
     for (int group = first; group < end; ++group) {
         const half2 scale = __half2half2(__ushort_as_half(scales[scale_base + group * 32]));
 #pragma unroll
@@ -184,10 +186,16 @@ __global__ __launch_bounds__(Split * 32, 32 / Split) void w8_qpn_prepacked_kerne
             if (r < t) {
                 const uint4 raw_x = *reinterpret_cast<const uint4*>(
                     x + static_cast<std::int64_t>(r) * k + group * 32 + sub * 8);
-                const auto* value = reinterpret_cast<const __nv_bfloat16*>(&raw_x);
+                const auto* value = reinterpret_cast<const Activation*>(&raw_x);
                 half sequential[8];
 #pragma unroll
-                for (int j = 0; j < 8; ++j) { sequential[j] = __float2half(__bfloat162float(value[j])); }
+                for (int j = 0; j < 8; ++j) {
+                    if constexpr (std::is_same_v<Activation, half>) {
+                        sequential[j] = value[j];
+                    } else {
+                        sequential[j] = __float2half(__bfloat162float(value[j]));
+                    }
+                }
 #pragma unroll
                 for (int j = 0; j < 4; ++j) { a[j] = *reinterpret_cast<const half2*>(sequential + 2 * j); }
             } else {
@@ -219,16 +227,25 @@ __global__ __launch_bounds__(Split * 32, 32 / Split) void w8_qpn_prepacked_kerne
     }
 }
 
+// Materialize the same BF16->FP16 operands once, instead of converting them in
+// every vocabulary CTA. No quantization, reduction or output boundary changes.
+__global__ void w8_input_image_kernel(const __nv_bfloat16* input, half* output, int elements) {
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < elements) { output[index] = __float2half(__bfloat162float(input[index])); }
+}
+
 } // namespace
 
 void w8_prepack_qpn_sm70(Weight& weight, cudaStream_t stream) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.n <= 0 ||
         !((weight.k == 5120 && (weight.n == 248320 || weight.n == 124160 ||
-             weight.n == 62080 || weight.n == 5120 || weight.n == 7168 || weight.n == 17408)) ||
-          (weight.n == 5120 && (weight.k == 3072 || weight.k == 8704))) ||
+             weight.n == 62080 || weight.n == 5120 || weight.n == 3584 ||
+             weight.n == 7168 || weight.n == 8704 || weight.n == 17408)) ||
+          (weight.n == 5120 && (weight.k == 1536 || weight.k == 2560 || weight.k == 4352 ||
+                                weight.k == 3072 || weight.k == 8704))) ||
         weight.padded_shape[0] != weight.n || weight.padded_shape[1] != weight.k) {
-        throw std::invalid_argument("W8 QPN prepack requires a registered row-split vocabulary or TP2 MTP projection");
+        throw std::invalid_argument("W8 QPN prepack requires a registered row-split vocabulary or TP2/TP4 MTP projection");
     }
     const auto code_bytes = static_cast<std::size_t>(weight.n) * weight.k;
     const auto scale_bytes = code_bytes / 32 * sizeof(std::uint16_t);
@@ -249,7 +266,7 @@ void w8_prepack_qpn_sm70(Weight& weight, cudaStream_t stream) {
 }
 
 void launch_w8_prepacked_sm70(const Tensor& x, const Weight& weight, Tensor& out,
-                               cudaStream_t stream) {
+                               WorkspaceArena* workspace, cudaStream_t stream) {
     const int t = x.ne[1];
     const int out_ld = static_cast<int>(out.nb[1] / sizeof(__nv_bfloat16));
     const auto* codes = static_cast<const std::uint8_t*>(weight.qdata);
@@ -257,7 +274,15 @@ void launch_w8_prepacked_sm70(const Tensor& x, const Weight& weight, Tensor& out
     const auto* input = static_cast<const __nv_bfloat16*>(x.data);
     auto* output = static_cast<__nv_bfloat16*>(out.data);
     const bool mtp = weight.n <= 17408;
-    if (t == 1 && mtp) {
+    if (workspace != nullptr && w8_prepacked_workspace_bytes(weight.n, weight.k, t, t) != 0) {
+        auto scope = workspace->scope();
+        Tensor image = workspace->alloc(DType::FP16, {weight.k, t});
+        auto* fp16 = static_cast<half*>(image.data);
+        const int elements = weight.k * t;
+        w8_input_image_kernel<<<(elements + 255) / 256, 256, 0, stream>>>(input, fp16, elements);
+        w8_qpn_prepacked_kernel<4, half, 1><<<weight.n / 32, 128, 0, stream>>>(
+            codes, scales, fp16, output, weight.n, weight.k, t, out_ld);
+    } else if (t == 1 && mtp) {
         w8_qpn_mtp_gemv_kernel<16><<<weight.n / 32, 512, 0, stream>>>(
             codes, scales, input, output, weight.n, weight.k);
     } else if (t >= 3 && t <= 8 && mtp) {

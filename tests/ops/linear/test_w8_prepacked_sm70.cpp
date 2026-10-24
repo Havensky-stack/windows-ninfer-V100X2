@@ -4,6 +4,7 @@
 #include "ops/linear/w8/w8_prepack_sm70.h"
 #endif
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -23,6 +24,9 @@ int check_shape(int n, int k, std::span<const int> widths, bool exact_baseline =
     Weight view = weight.view();
     cudaStream_t stream;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    // The fixture upload uses the legacy default stream; establish a device-wide
+    // happens-before edge before launching the nonblocking prepack stream.
+    cuda_synchronize();
     ops::detail::w8_prepack_qpn_sm70(view, stream);
     const auto codes = from_device<std::uint8_t>(view.qdata, static_cast<std::size_t>(n) * k);
     const auto scales = from_device<std::uint16_t>(view.scales, static_cast<std::size_t>(n) * k / 32);
@@ -57,11 +61,17 @@ int check_shape(int n, int k, std::span<const int> widths, bool exact_baseline =
         auto input = to_device_bf16(host);
         Tensor x(input.p, DType::BF16, {k, t});
         fixture::GuardedBf16Tensor expected(n, t), result(n, t);
+        // Guard poisoning uses the default stream; explicitly order it before
+        // either projection on the nonblocking test stream.
+        cuda_synchronize();
         auto expected_tensor = expected.tensor();
         auto result_tensor = result.tensor();
         const auto baseline_view = baseline.view();
+        const auto workspace_bytes = ops::linear_workspace_capacity_bytes(
+            QType::W8G32_F16S, n, k, ops::LinearPolicy::A16Only, t, t);
+        WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
         ops::linear(x, baseline_view, expected_tensor, stream);
-        ops::linear(x, view, result_tensor, stream);
+        ops::linear(x, view, result_tensor, ops::LinearPolicy::A16Only, workspace, stream);
         cuda_synchronize(stream);
         const auto expected_bits = expected.bits();
         if (exact_baseline && result.bits() != expected_bits) {
@@ -75,7 +85,7 @@ int check_shape(int n, int k, std::span<const int> widths, bool exact_baseline =
         cudaGraph_t graph;
         cudaGraphExec_t executable;
         cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
-        ops::linear(x, view, result_tensor, stream);
+        ops::linear(x, view, result_tensor, ops::LinearPolicy::A16Only, workspace, stream);
         cuda_check(cudaStreamEndCapture(stream, &graph), "end capture");
         cuda_check(cudaGraphInstantiate(&executable, graph, 0), "instantiate");
         for (int replay = 0; replay < 2; ++replay) {
@@ -124,11 +134,12 @@ int main() {
         const std::array tp2_widths{1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 33};
         const std::array other_widths{1, 2, 5, 9};
         int failures = check_shape(124160, 5120, tp2_widths);
-        failures += check_shape(62080, 5120, other_widths);
+        failures += check_shape(62080, 5120, tp2_widths);
         failures += check_shape(248320, 5120, other_widths);
         const std::array mtp_widths{1, 2, 3, 5, 8, 9, 33};
-        for (const auto [n, k] : std::array<std::pair<int, int>, 5>{
-                 {{5120, 5120}, {7168, 5120}, {17408, 5120}, {5120, 3072}, {5120, 8704}}}) {
+        for (const auto [n, k] : std::array<std::pair<int, int>, 10>{
+                 {{5120, 5120}, {7168, 5120}, {17408, 5120}, {5120, 3072}, {5120, 8704},
+                  {3584, 5120}, {8704, 5120}, {5120, 1536}, {5120, 2560}, {5120, 4352}}}) {
             failures += check_shape(n, k, mtp_widths, false);
         }
         return failures ? 1 : 0;

@@ -556,6 +556,7 @@ GenerationRequest parse_messages_request(const Json& body, const RequestLimits& 
         out.max_tokens     = limits.default_max_tokens;
         out.max_tokens_set = false;
     }
+    validate_output_token_limit(out.max_tokens, limits, "max_tokens");
     return out;
 }
 

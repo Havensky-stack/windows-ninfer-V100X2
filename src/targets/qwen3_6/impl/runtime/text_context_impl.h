@@ -1921,12 +1921,17 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
     for (std::size_t r = 0; r < ec().device_count; ++r) {
         o[r] = workspace_recipe::gdn_recurrent_output<TextConfig>(*ws[r], T, ec().device_count)
                    .view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), T});
-        on[r] = workspace_recipe::gdn_normalized_output<TextConfig>(*ws[r], T, ec().device_count)
+        const auto output_dtype = norm && tp_[0].events->packet_storage(0)
+            ? Variant::gdn_output_input_dtype(*w[r]->out_proj, ec().device_count, T)
+            : DType::BF16;
+        on[r] = workspace_recipe::gdn_normalized_output<TextConfig>(*ws[r], T, ec().device_count,
+                                                                    output_dtype)
                     .view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), T});
     }
     for_each_rank(execution, [&](int rank) {
         const auto r       = static_cast<std::size_t>(rank);
         cudaStream_t s     = stream_for(rank);
+        bool fused_norm    = false;
         Tensor q_recurrent = qc[r].view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().device_count), T});
         Tensor k_recurrent = kc[r].view({kCfg.gdn_k_dim, (kCfg.gdn_k_heads / ec().device_count), T});
         Tensor vv          = vc[r].view({kCfg.gdn_v_dim, (kCfg.gdn_v_heads / ec().device_count), T});
@@ -1948,10 +1953,24 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
             if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
                 GdnReplayRecordLayer records =
                     replay_records_for(rank)->layer(gidx, active_sequence_batch_);
-                ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
-                                                   kGdnScale, recurrent_states, valid, slots,
-                                                   records.key, records.value, records.gate,
-                                                   out_batch, s);
+                const Tensor counters = io_for(rank).gdn_record_norm_counts;
+                fused_norm = q_batch.ne[1] == 4 && v_batch.ne[1] == 12 &&
+                             active_sequence_batch_ == 1 && width <= 8 &&
+                             on[r].dtype == DType::FP16 && counters.data != nullptr;
+                if (fused_norm) {
+                    const ops::GdnReplayGatedNorm epilogue{
+                        *w[r]->gdn_norm, z[r].view({128, 12, width, 1}), kCfg.rms_eps,
+                        on[r].view({128, 12, width, 1}), counters};
+                    ops::gated_delta_net_replay_record(
+                        q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale, recurrent_states,
+                        valid, slots, records.key, records.value, records.gate, out_batch,
+                        epilogue, s);
+                } else {
+                    ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
+                                                       kGdnScale, recurrent_states, valid, slots,
+                                                       records.key, records.value, records.gate,
+                                                       out_batch, s);
+                }
             } else {
                 ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch,
                                               kGdnScale,
@@ -1966,7 +1985,9 @@ void TextContext::gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecuti
         }
         // `gdn_norm` is the per-head-DIMENSION gain {128}: replicated, so each rank applies the
         // whole weight over its own 24 value heads.
-        ops::gated_rmsnorm(o[r], *w[r]->gdn_norm, z[r], kCfg.rms_eps, on[r], s);
+        if (!fused_norm) {
+            ops::gated_rmsnorm(o[r], *w[r]->gdn_norm, z[r], kCfg.rms_eps, on[r], s);
+        }
     });
 
     Variant::gdn_output_projection(
@@ -2008,9 +2029,22 @@ void TextContext::run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x
         auto layer_scopes = workspace_scopes();
         const bool normalized_mixer_output = x[0].ne[1] <= 8;
         const auto normalized = rank_map([&](int rank) {
-            return normalized_mixer_output
-                ? workspace_recipe::post_mixer_hidden<TextConfig>(*workspaces()[rank], x[rank].ne[1])
-                : Tensor{};
+            if (!normalized_mixer_output) return Tensor{};
+            const MlpW* mlp;
+            if (ModelConfig::is_full(layer)) {
+                const auto i = ModelConfig::full_idx(layer);
+                mlp = rank == 0 ? &full_[i].mlp : &full_peer_[rank - 1][i].mlp;
+            } else {
+                const auto i = ModelConfig::gdn_idx(layer);
+                mlp = rank == 0 ? &gdn_[i].mlp : &gdn_peer_[rank - 1][i].mlp;
+            }
+            // The FP16 image is consumed by the packet-published TP4 projection.
+            // Staged transport composes the BF16 norm and ordinary projection,
+            // just as the GDN output above does without packet storage.
+            const auto dtype = tp_[0].events->packet_storage(0)
+                ? Variant::post_mixer_input_dtype(*mlp->payload, ec().device_count, x[rank].ne[1])
+                : DType::BF16;
+            return workspaces()[rank]->alloc(dtype, {kCfg.hidden, x[rank].ne[1]});
         });
         const auto next_weights = rank_map([&](int rank) -> Tensor {
             if (layer + 1 >= kCfg.n_layers || !handoff_norm) return {};
@@ -2095,7 +2129,7 @@ void TextContext::logits_tp2(
     });
     ops::linear_column_parallel(active(hidden),
         active(rank_map([&](int rank) { return rank == 0 ? *lm_head_ : *lm_head_peer_[rank - 1]; })),
-        active(shards), ec());
+        active(shards), ops::LinearPolicy::A16Only, active(work), ec());
     for (int column = 0; column < columns; ++column) {
         const auto source = rank_map([&](int rank) {
             return shards[rank].slice(1, column, 1).view({1, rows});
@@ -2145,7 +2179,8 @@ void TextContext::head_argmax_tp(
                                  stream_for(rank));
         });
     } else {
-        ops::linear_column_parallel(active(hidden), active(heads), active(shards), ec());
+        ops::linear_column_parallel(active(hidden), active(heads), active(shards),
+                                    ops::LinearPolicy::A16Only, active(work), ec());
         for_each_rank(ec(), [&](int rank) {
             const int valid = std::min(rows, valid_rows - rank * rows);
             if (valid <= 0) { throw std::logic_error("vocabulary shard does not cover token domain"); }
@@ -2157,7 +2192,8 @@ void TextContext::head_argmax_tp(
     Tensor gathered_values = work_.alloc(DType::FP32, {ec().device_count, columns});
     Tensor gathered_indices = work_.alloc(DType::I32, {ec().device_count, columns});
     ops::allreduce_argmax(active(values), active(indices), active(target_tokens),
-                          gathered_values, gathered_indices, rows, ec(), *tp_[0].events);
+                          gathered_values, gathered_indices, rows, ec(), *tp_[0].events,
+                          proposal && proposal_head_ != nullptr ? proposal_head_ids_ : nullptr);
 }
 
 PrefillChunkResult TextContext::prefill_impl_tp2(std::span<const int> ids,
@@ -2563,12 +2599,15 @@ void TextContext::mtp_forward_stem_tp2(
     });
     Tensor flat_ids = ids.view({columns});
     const auto rank_ids = rank_map([&](int rank) {
-        return rank == 0 ? flat_ids : work[rank]->alloc(DType::I32, {columns});
+        return rank == 0 ? flat_ids : embedding_ranks > 1
+            ? work[rank]->alloc(DType::I32, {columns}) : Tensor{};
     });
     // Ranks 0..TP/2-1 contract normalized embedding slices. Others contract hidden slices.
-    // Draft tokens live on rank 0, so broadcast them before any embedding reader can launch.
-    ops::broadcast_rank0(flat_ids, std::span(rank_ids).subspan(1, ec().device_count - 1),
-                         ec(), *tp_[0].events);
+    // TP2 has no remote embedding reader; TP4 still needs the rank-0 token broadcast.
+    if (embedding_ranks > 1) {
+        ops::broadcast_rank0(flat_ids, std::span(rank_ids).subspan(1, ec().device_count - 1),
+                             ec(), *tp_[0].events);
+    }
     std::array<Tensor, kMaximumExecutionDevices> inputs{};
     const auto weights = rank_map([&](int rank) { return *mtp_weights_for(rank).fc; });
     for_each_rank(ec(), [&](int rank) {
@@ -2791,9 +2830,6 @@ void TextContext::proposal_argmax_tp2(
         return rank == 0 ? tokens : work[rank]->alloc(DType::I32, {columns});
     });
     head_argmax_tp(hidden, heads, total, destinations, true);
-    if (proposal_head_ != nullptr) {
-        ops::proposal_remap_token_ids(tokens, proposal_head_ids_, total, ctx_.stream);
-    }
 }
 
 void TextContext::target_verify_batch(const std::array<Tensor, kMaximumExecutionDevices>& ids,

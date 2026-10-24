@@ -196,7 +196,8 @@ __global__ void bf16_gdn_gating_proj_gemv_kernel(const __nv_bfloat16* x,
 
 // A head/token CTA retains the split-10 warp dot products and their final
 // ascending FP32 sum, so the one-launch route preserves the represented controls.
-__global__ void bf16_gdn_gating_proj_tp2_exact_kernel(
+template <int Heads>
+__global__ void bf16_gdn_gating_proj_shard_exact_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
     const __nv_bfloat16* __restrict__ b_weight, const float* __restrict__ A_log,
     const float* __restrict__ dt_bias, float* __restrict__ g, float* __restrict__ beta) {
@@ -229,8 +230,8 @@ __global__ void bf16_gdn_gating_proj_tp2_exact_kernel(
         a = 0.0F; b = 0.0F;
 #pragma unroll
         for (int s = 0; s < 10; ++s) { a += partial[0][s]; b += partial[1][s]; }
-        g[token * kShardN + head] = -expf(A_log[head]) * softplus(a + dt_bias[head]);
-        beta[token * kShardN + head] = sigmoid(b);
+        g[token * Heads + head] = -expf(A_log[head]) * softplus(a + dt_bias[head]);
+        beta[token * Heads + head] = sigmoid(b);
     }
 }
 
@@ -526,16 +527,21 @@ void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight,
                                     std::size_t workspace_bytes, Tensor& g, Tensor& beta,
                                     cudaStream_t stream) {
 #ifdef NINFER_VOLTA_BUILD
-    if (a_weight.n == kShardN && x.ne[1] >= 2 && x.ne[1] <= kSmallTMax) {
+    if ((a_weight.n == kShardN || a_weight.n == 12) &&
+        x.ne[1] >= 2 && x.ne[1] <= kSmallTMax) {
         require_shard_shape(a_weight, "a_weight");
         require_shard_shape(b_weight, "b_weight");
-        bf16_gdn_gating_proj_tp2_exact_kernel
-            <<<dim3(kShardN, x.ne[1]), 320, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(x.data),
-                static_cast<const __nv_bfloat16*>(a_weight.qdata),
-                static_cast<const __nv_bfloat16*>(b_weight.qdata),
-                static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
-                static_cast<float*>(g.data), static_cast<float*>(beta.data));
+        const auto launch = [&]<int Heads>() {
+            bf16_gdn_gating_proj_shard_exact_kernel<Heads>
+                <<<dim3(Heads, x.ne[1]), 320, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(x.data),
+                    static_cast<const __nv_bfloat16*>(a_weight.qdata),
+                    static_cast<const __nv_bfloat16*>(b_weight.qdata),
+                    static_cast<const float*>(A_log.data), static_cast<const float*>(dt_bias.data),
+                    static_cast<float*>(g.data), static_cast<float*>(beta.data));
+        };
+        if (a_weight.n == 12) { launch.template operator()<12>(); }
+        else { launch.template operator()<kShardN>(); }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

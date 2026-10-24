@@ -50,11 +50,11 @@ __global__ __launch_bounds__(256, 4) void q4_proposal_fp32_partial(
 }
 
 __global__ void q4_proposal_fp32_reduce(const float* values, const int* indices,
-                                       float* out, int* id) {
+                                       int tiles, float* out, int* id) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     float v = __int_as_float(0xff800000);
     int idx = 2147483647;
-    for (int i = tid; i < 8192; i += 256) {
+    for (int i = tid; i < tiles; i += 256) {
         const float x = values[i];
         const int j = indices[i];
         if (x > v || (x == v && j < idx)) { v = x; idx = j; }
@@ -85,11 +85,12 @@ __global__ void q4_proposal_fp32_reduce(const float* values, const int* indices,
 void proposal_q4_sm70_launch(const Tensor& x, const Weight& w, Tensor& scratch,
                              Tensor& value, Tensor& index, cudaStream_t stream) {
     auto* scores = static_cast<float*>(scratch.data);
-    auto* indices = reinterpret_cast<int*>(scores + 8192);
-    q4_proposal_fp32_partial<<<8192, 256, 0, stream>>>(
+    const int tiles = w.n / 8;
+    auto* indices = reinterpret_cast<int*>(scores + tiles);
+    q4_proposal_fp32_partial<<<tiles, 256, 0, stream>>>(
         static_cast<const unsigned char*>(w.qdata), static_cast<const unsigned short*>(w.scales),
         static_cast<const __nv_bfloat16*>(x.data), scores, indices);
-    q4_proposal_fp32_reduce<<<1, 256, 0, stream>>>(scores, indices,
+    q4_proposal_fp32_reduce<<<1, 256, 0, stream>>>(scores, indices, tiles,
         static_cast<float*>(value.data), static_cast<int*>(index.data));
     CUDA_CHECK(cudaGetLastError());
 }

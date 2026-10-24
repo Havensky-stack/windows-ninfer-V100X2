@@ -321,6 +321,7 @@ int run_shape(std::string_view label, ActivationCompute activation_compute,
     DeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), device_weight.bytes);
     Weight weight = host_weight.device_weight(device_weight.p);
+    weight.volta_fp32_scale = shape.volta_fp32_scale;
     std::vector<std::uint8_t> prepared_weight;
     if (shape.prepack_volta) {
 #ifdef NINFER_VOLTA_BUILD

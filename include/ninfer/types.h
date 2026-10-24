@@ -103,9 +103,9 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     int device = 0;
     // Tensor-parallel degree: 1, 2 or 4. Parallel execution requires `devices` to name exactly
-    // tp distinct ids of the same compute capability. The 27B package supports TP2 Text/MTP
-    // its optional DFlash2 backend, and Vision; TP4 supports SM70 Qwen3.8 NVFP4/native FP8
-    // Text/MTP without Vision. The 35B-A3B package requires TP1.
+    // tp distinct ids of the same compute capability. The 27B package supports TP2 Text/MTP,
+    // its optional DFlash2 backend, and Vision; TP4 supports SM70 Qwen3.8 official NVFP4,
+    // QUASAR NVFP4 and native FP8 Text/MTP without Vision. The 35B-A3B package requires TP1.
     int tp = 1;
     // Pipeline degree. PP2 owns complete consecutive layer ranges on two SM70 devices;
     // it requires TP1, one active request, Text, and None/MTP speculation.
@@ -135,11 +135,14 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Decode rounds between bounded prefill steps when both phases are runnable (1..64).
+    // More rounds favor active streams at the cost of the prefilling request's TTFT.
+    std::uint32_t prefill_decode_rounds = 1;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
-    // Complete-history SM70 TP2 long attention with coarser KV partitions and FP32 PV.
+    // Complete-history SM70 TP2/TP4 long attention with coarser KV partitions and FP32 PV.
     // Numerically qualified, not output-bit-equivalent to the default profile.
     bool volta_long_attention          = false;
-    // QUASAR SM70 TP2 Text/None/MTP: packed NVFP4 FP32 epilogues and MTP W8 reductions.
+    // QUASAR SM70 TP2/TP4 Text/None/MTP: packed NVFP4 FP32 epilogues and MTP W8 reductions.
     // Changes arithmetic; independent of the optional complete-history attention profile.
     bool volta_fast_decode             = false;
     RamKvOptions ram_kv;

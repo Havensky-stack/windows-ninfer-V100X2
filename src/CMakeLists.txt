@@ -316,6 +316,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
     ops/launcher/gqa_attention_volta_flash.cu
+    ops/launcher/gqa_attention_volta_splitd.cu
     ops/launcher/vision_attention_volta_flash.cu)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
   target_compile_options(ninfer_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)

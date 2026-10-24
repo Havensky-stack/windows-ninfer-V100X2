@@ -13,11 +13,13 @@ using Json = nlohmann::json;
 using Clock = std::chrono::steady_clock;
 int main(int argc, char** argv) {
     try {
-        if (argc != 7) { throw std::invalid_argument("usage: bench ARTIFACT CORPUS INPUT_TOKENS CONCURRENCY OUTPUT_TOKENS REPORT.json"); }
+        if (argc != 7 && argc != 8) { throw std::invalid_argument("usage: bench ARTIFACT CORPUS INPUT_TOKENS CONCURRENCY OUTPUT_TOKENS REPORT.json [PREFILL_DECODE_ROUNDS]"); }
         const unsigned length = std::stoul(argv[3]), concurrency = std::stoul(argv[4]), output = std::stoul(argv[5]);
+        const unsigned decode_rounds = argc == 8 ? std::stoul(argv[7]) : 1;
         if (length < 1 || length > 85000 || concurrency < 1 || concurrency > 8 || output < 2) {
             throw std::invalid_argument("invalid workload");
         }
+        if (decode_rounds < 1 || decode_rounds > 64) { throw std::invalid_argument("invalid decode burst"); }
         std::vector<ninfer::TokenId> ids;
         std::ifstream corpus(argv[2]);
         ninfer::TokenId token;
@@ -28,6 +30,7 @@ int main(int argc, char** argv) {
         options.max_context = 180000;
         options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(180000);
         options.prefill_chunk = 1024;
+        options.prefill_decode_rounds = decode_rounds;
         options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
         options.max_concurrency = concurrency;
         options.pending_timeout_ms = 1800000; // Eight cold 85K prefills can queue for minutes.
@@ -70,8 +73,10 @@ int main(int argc, char** argv) {
                 const auto stats = engine.runtime_stats();
                 samples.push_back({{"seconds", std::chrono::duration<double>(Clock::now() - started).count()},
                     {"running", stats.running_requests}, {"prefilling", stats.prefilling_requests},
-                    {"decode_ready", stats.decode_ready_requests}, {"waiting", stats.waiting_requests}});
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    {"decode_ready", stats.decode_ready_requests}, {"waiting", stats.waiting_requests},
+                    {"computed_prefill_tokens", stats.computed_prefill_tokens - before.computed_prefill_tokens},
+                    {"committed_decode_tokens", stats.committed_decode_tokens - before.committed_decode_tokens}});
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         });
         for (auto& handle : handles) {
@@ -80,6 +85,9 @@ int main(int argc, char** argv) {
             rows.push_back({{"prompt_tokens", result.prompt.prompt_tokens},
                 {"completion_tokens", result.generated_token_ids.size()}, {"cached_tokens", result.reused_prompt_tokens},
                 {"prefill_seconds", result.timings.prefill_seconds}, {"decode_seconds", result.timings.decode_seconds},
+                {"first_token_seconds", result.timings.first_token_seconds}, {"total_seconds", result.timings.total_seconds},
+                {"stream_wall_tok_s", double(output - 1) / (result.timings.total_seconds - result.timings.first_token_seconds)},
+                {"generated_token_ids", result.generated_token_ids},
                 {"drafted", result.speculative.drafted_tokens}, {"accepted", result.speculative.accepted_tokens}});
         }
         const double makespan = std::chrono::duration<double>(Clock::now() - started).count();
@@ -97,14 +105,32 @@ int main(int argc, char** argv) {
             peak_running = std::max(peak_running, sample.at("running").get<unsigned>());
             peak_ready = std::max(peak_ready, sample.at("decode_ready").get<unsigned>());
         }
+        // Only intervals whose starting sample has both phases runnable. Counts are committed
+        // decode tokens; wall time includes intervening prefill stalls. Boundaries have nominal
+        // 10ms sampling uncertainty. This is separate from decode-kernel/round throughput below.
+        double mixed_wall = 0;
+        std::uint64_t mixed_committed = 0;
+        for (std::size_t i = 1; i < samples.size(); ++i) {
+            const auto& previous = samples[i - 1];
+            const auto& current = samples[i];
+            if (previous.at("prefilling").get<unsigned>() > 0 &&
+                previous.at("decode_ready").get<unsigned>() > 0) {
+                mixed_wall += current.at("seconds").get<double>() - previous.at("seconds").get<double>();
+                mixed_committed += current.at("committed_decode_tokens").get<std::uint64_t>() -
+                    previous.at("committed_decode_tokens").get<std::uint64_t>();
+            }
+        }
         Json report{{"artifact_type", "ninfer_v100_long_concurrency"}, {"input_tokens", length},
             {"concurrency", concurrency}, {"output_tokens_per_request", output},
             {"tp", 2}, {"mtp_drafts", 4}, {"graphs", true}, {"kv_capacity", 180000},
-            {"prefill_chunk", 1024}, {"long_attention", true}, {"fast_decode", true},
+            {"prefill_chunk", 1024}, {"prefill_decode_rounds", decode_rounds},
+            {"long_attention", true}, {"fast_decode", true},
             {"prefix_reuse", false}, {"committed_decode_tokens", committed},
             {"decode_wall_seconds", decode_wall}, {"total_decode_tok_s", committed / decode_wall},
             {"group_makespan_seconds", makespan}, {"group_output_tok_s", double(concurrency * output) / makespan},
             {"decode_rounds", rounds}, {"mean_decode_batch", double(row_rounds) / rounds},
+            {"mixed_wall_seconds", mixed_wall}, {"mixed_committed_decode_tokens", mixed_committed},
+            {"mixed_wall_decode_tok_s", mixed_wall > 0 ? Json(mixed_committed / mixed_wall) : Json(nullptr)},
             {"peak_running", peak_running}, {"peak_decode_ready", peak_ready},
             {"requests", rows}, {"scheduler_samples", samples}};
         const std::string temporary = std::string(argv[6]) + ".tmp";
