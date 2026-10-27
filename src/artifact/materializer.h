@@ -22,7 +22,7 @@ struct MaterializationStats {
     std::uint64_t file_bytes              = 0;
     std::uint64_t h2d_bytes               = 0; // summed over every device
     std::uint64_t device_capacity_bytes   = 0; // summed over every device
-    std::uint64_t retained_resource_bytes = 0;
+    std::uint64_t retained_host_bytes = 0;
     std::uint64_t peak_staging_bytes      = 0;
     std::size_t tensor_count              = 0;
     std::size_t resource_count            = 0;
@@ -50,8 +50,8 @@ public:
     // its SHARD, so a caller that keeps a whole-model literal shape would read past the end of a
     // half-sized allocation with nothing else noticing.
     std::uint64_t device_bytes(ObjectHandle handle, int device = 0) const;
-    std::span<const std::byte> resource_bytes(ObjectHandle handle) const;
-    std::vector<std::byte> take_resource_bytes(ObjectHandle handle);
+    std::span<const std::byte> host_bytes(ObjectHandle handle) const;
+    std::vector<std::byte> take_host_bytes(ObjectHandle handle);
 
     const MaterializationStats& stats() const noexcept { return stats_; }
 

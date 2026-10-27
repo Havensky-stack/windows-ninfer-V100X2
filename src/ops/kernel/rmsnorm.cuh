@@ -6,8 +6,10 @@
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -16,6 +18,22 @@ enum class RmsEpilogue {
     Plain,
     Gated,
 };
+
+template <bool Fp16Image>
+using RmsOutput = std::conditional_t<Fp16Image, __half, __nv_bfloat16>;
+template <bool Fp16Image>
+using RmsOutputPair = std::conditional_t<Fp16Image, __half2, __nv_bfloat162>;
+
+template <bool Fp16Image>
+__device__ __forceinline__ RmsOutputPair<Fp16Image> rmsnorm_output_pair(float x, float y) {
+    const auto rounded = __floats2bfloat162_rn(x, y);
+    if constexpr (Fp16Image) {
+        const auto value = __bfloat1622float2(rounded);
+        return __floats2half2_rn(value.x, value.y);
+    } else {
+        return rounded;
+    }
+}
 
 template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
@@ -28,10 +46,10 @@ __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weig
 // Fast geometry for D in {64, 128, 192, 256}. One warp owns one row, keeps the input in
 // registers, and uses only warp shuffles for the reduction. Block is a scheduling choice rather
 // than part of the row geometry.
-template <RmsEpilogue Epilogue, int Block>
+template <RmsEpilogue Epilogue, int Block, bool Fp16Image = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_warp_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                    const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
+                                    const __nv_bfloat162* z, RmsOutputPair<Fp16Image>* out, std::int32_t d,
                                     std::int64_t rows, float eps) {
     static_assert(Block % kWarpSize == 0);
     constexpr int kWarpsPerBlock   = Block / kWarpSize;
@@ -71,7 +89,7 @@ __launch_bounds__(Block) __global__
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
-                __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                rmsnorm_output_pair<Fp16Image>(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }
@@ -123,10 +141,10 @@ __launch_bounds__(Block) __global__
 
 // Fast geometry for wide rows. One CTA owns one row and keeps up to MaxPairsPerThread BF16x2
 // values per lane. The launcher admits only widths evenly divisible by the CTA vector span.
-template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread>
+template <RmsEpilogue Epilogue, int Block, int MaxPairsPerThread, bool Fp16Image = false>
 __launch_bounds__(Block) __global__
     void rmsnorm_cta_bf16x2_kernel(const __nv_bfloat162* x, const __nv_bfloat162* weight,
-                                   const __nv_bfloat162* z, __nv_bfloat162* out, std::int32_t d,
+                                   const __nv_bfloat162* z, RmsOutputPair<Fp16Image>* out, std::int32_t d,
                                    std::int64_t rows, float eps) {
     static_assert(Block % kWarpSize == 0);
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
@@ -166,7 +184,7 @@ __launch_bounds__(Block) __global__
                 zf = __bfloat1622float2(z[row_base + pair]);
             }
             out[row_base + pair] =
-                __floats2bfloat162_rn(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
+                rmsnorm_output_pair<Fp16Image>(rmsnorm_epilogue<Epilogue>(xf.x, inv, wf.x, zf.x),
                                       rmsnorm_epilogue<Epilogue>(xf.y, inv, wf.y, zf.y));
         }
     }
@@ -219,10 +237,10 @@ __launch_bounds__(512) __global__
 
 // Functional fallback outside the aligned fast domains. It intentionally favors a simple complete
 // implementation over another family of shape-specific paths.
-template <RmsEpilogue Epilogue>
+template <RmsEpilogue Epilogue, bool Fp16Image = false>
 __launch_bounds__(256) __global__
     void rmsnorm_generic_kernel(const __nv_bfloat16* x, const __nv_bfloat16* weight,
-                                const __nv_bfloat16* z, __nv_bfloat16* out, std::int32_t d,
+                                const __nv_bfloat16* z, RmsOutput<Fp16Image>* out, std::int32_t d,
                                 std::int64_t rows, float eps) {
     const std::int64_t row = static_cast<std::int64_t>(blockIdx.x);
     if (row >= rows) { return; }
@@ -249,7 +267,12 @@ __launch_bounds__(256) __global__
         const float wv           = __bfloat162float(weight[i]);
         float zv                 = 0.0f;
         if constexpr (Epilogue == RmsEpilogue::Gated) { zv = __bfloat162float(z[index]); }
-        out[index] = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
+        const auto rounded = __float2bfloat16_rn(rmsnorm_epilogue<Epilogue>(xv, inv, wv, zv));
+        if constexpr (Fp16Image) {
+            out[index] = __float2half_rn(__bfloat162float(rounded));
+        } else {
+            out[index] = rounded;
+        }
     }
 }
 

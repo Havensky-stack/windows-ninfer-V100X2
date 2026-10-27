@@ -29,6 +29,7 @@
 #include <deque>
 #include <exception>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <iterator>
 #include <memory>
@@ -168,6 +169,7 @@ struct GenerationScript {
     // When set, decode_batch throws instead of licensing the token at this index. This is the
     // engine-scope leg: a Program/CUDA failure, not an output-session failure.
     int throw_at_decode_index = -1;
+    std::shared_future<void> start_gate;
 };
 
 class ScriptedProgram {
@@ -179,6 +181,11 @@ public:
     [[nodiscard]] rt::AdmissionResources admission_capacity() const noexcept {
         return rt::AdmissionResources{
             .active_lanes = max_concurrency_, .main_kv_pages = max_concurrency_, .backend_kv_pages = 0};
+    }
+
+    std::function<double(const ninfer::PreparationControl&)> media_preparation;
+    double prepare_media(q36::PreparedPrompt&, const ninfer::PreparationControl& control) const {
+        return media_preparation ? media_preparation(control) : 0.0;
     }
 
     // The budget comes from the request's own options, never from the script queue: with several
@@ -196,7 +203,7 @@ public:
             .transient_bytes         = 0,
             .transient_alignment     = 1,
             .admission = rt::AdmissionResources{.active_lanes = 1, .main_kv_pages = 1},
-            .service_work_quanta = output_tokens,
+            .service_work_quanta = output_tokens + prompt.summary().prompt_tokens - 1,
         }};
     }
 
@@ -220,21 +227,34 @@ public:
         Lane& state     = lanes_[lane];
         state.script    = std::move(queued_.front());
         queued_.pop_front();
-        state.lifecycle = Lifecycle::Active;
+        if (state.script.start_gate.valid()) { state.script.start_gate.wait(); }
+        state.lifecycle = Lifecycle::Prefilling;
         state.emitted   = 0;
-        state.token     = license(lane);
-        return rt::PrefillStepResult{
-            .summary = rt::BeginSummary{.prompt_tokens = plan.summary().prompt_tokens,
-                                        .reused_prompt_tokens = 0,
-                                        .prefix_reuse_path = ninfer::PrefixReusePath::FullReset},
-            .round   = rt::GeneratedRound{.tokens = std::span<const TokenId>(&state.token, 1)},
-            .processed_prompt_tokens = prompt.summary().prompt_tokens,
-            .complete                = true,
-        };
+        state.prefill_remaining = prompt.summary().prompt_tokens;
+        state.begin = rt::BeginSummary{.prompt_tokens = plan.summary().prompt_tokens,
+                                      .reused_prompt_tokens = 0,
+                                      .prefix_reuse_path = ninfer::PrefixReusePath::FullReset};
+        return advance_prefill_lane(lane);
     }
 
-    rt::PrefillStepResult advance_prefill_lane(std::uint32_t) {
-        throw std::logic_error("scripted prefill always completes in one step");
+    rt::PrefillStepResult advance_prefill_lane(std::uint32_t lane) {
+        Lane& state = lanes_[lane];
+        if (state.lifecycle != Lifecycle::Prefilling || state.prefill_remaining == 0) {
+            throw std::logic_error("scripted prefill has no remaining work");
+        }
+        trace_.push_back('P');
+        const bool complete = --state.prefill_remaining == 0;
+        if (complete) {
+            state.lifecycle = Lifecycle::Active;
+            state.token = license(lane);
+        }
+        return rt::PrefillStepResult{
+            .summary = state.begin,
+            .round = rt::GeneratedRound{.tokens = complete
+                ? std::span<const TokenId>(&state.token, 1) : std::span<const TokenId>{}},
+            .processed_prompt_tokens = 1,
+            .complete = complete,
+        };
     }
 
     void resolve_prefill_lane(std::uint32_t lane, bool finished) {
@@ -246,6 +266,7 @@ public:
 
     rt::BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
                                            std::span<const rt::RoundBudget>) {
+        trace_.push_back('D');
         batch_.clear();
         for (const std::uint32_t lane : lanes) {
             Lane& state = lanes_[lane];
@@ -324,16 +345,20 @@ public:
     // Widest decode round this Program actually saw. A multi-row isolation test that never
     // produced a multi-row round would be asserting nothing.
     [[nodiscard]] std::size_t maximum_batch_rows() const noexcept { return maximum_batch_rows_; }
+    [[nodiscard]] const std::string& trace() const noexcept { return trace_; }
 
 private:
     enum class Lifecycle : std::uint8_t {
         Empty,   // no request
+        Prefilling,
         Active,  // owns a sequence, no round outstanding
         Pending, // a decode round licensed tokens and owes this lane a resolution
     };
 
     struct Lane {
         GenerationScript script;
+        rt::BeginSummary begin;
+        std::uint32_t prefill_remaining = 0;
         std::size_t emitted = 0;
         TokenId token       = 0;
         Lifecycle lifecycle = Lifecycle::Empty;
@@ -358,6 +383,7 @@ private:
     std::deque<GenerationScript> queued_;
     std::vector<TokenId> batch_;
     std::size_t maximum_batch_rows_ = 0;
+    std::string trace_;
 };
 
 struct ScriptedPackage {
@@ -407,8 +433,8 @@ rt::ResolvedRequestOptions request_options(std::uint32_t output_tokens) {
 }
 
 Executor::Submission submit_request(Executor& executor, const q36::Frontend& frontend,
-                                    std::uint32_t output_tokens) {
-    q36::PreparedPrompt prompt          = frontend.prepare_tokens({0});
+                                    std::uint32_t output_tokens, std::uint32_t prompt_tokens = 1) {
+    q36::PreparedPrompt prompt = frontend.prepare_tokens(std::vector<TokenId>(prompt_tokens, 0));
     const ninfer::PromptSummary summary = prompt.summary();
     return executor.submit(std::move(prompt), summary, 0.0, request_options(output_tokens));
 }
@@ -682,6 +708,76 @@ void test_engine_scope_failure_still_fails_all(const q36::Frontend& frontend,
            "a request after a device failure was not refused as unavailable");
 }
 
+// Observe the actual prefill/decode order and complete output, including the case where the
+// decoding neighbour finishes before its configured burst and prefill must continue immediately.
+void test_prefill_decode_rounds(const q36::Frontend& frontend,
+                               const ninfer::DeviceContext& device,
+                               std::uint32_t rounds, std::uint32_t first_output) {
+    ScriptedInstance instance{.loaded = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                             .program = std::make_unique<ScriptedProgram>(2),
+                             .request_memory = {}, .kv_capacity_resolution = {}};
+    std::promise<void> gate;
+    instance.program->push_script(GenerationScript{
+        .tokens = std::vector<TokenId>(first_output, 0), .start_gate = gate.get_future().share()});
+    instance.program->push_script(GenerationScript{.tokens = {0, 0}});
+    auto options = executor_options(2);
+    options.prefill_decode_rounds = rounds;
+    Executor executor(instance, options, device);
+    auto first = submit_request(executor, frontend, first_output);
+    auto second = submit_request(executor, frontend, 2, 6);
+    gate.set_value();
+    const auto first_result = await(std::move(first));
+    const auto second_result = await(std::move(second));
+    expect(first_result.ok && first_result.content == std::string(first_output, 'x'),
+           "prefill/decode interleaving changed the existing stream's output");
+    expect(second_result.ok && second_result.content == "xx",
+           "prefill/decode interleaving did not complete the new stream");
+    std::string expected = "PDP"; // First request, a donor round, second request admission.
+    std::uint32_t remaining = first_output - 2;
+    for (unsigned step = 0; step < 5; ++step) {
+        const auto burst = std::min(rounds, remaining);
+        expected.append(burst, 'D');
+        remaining -= burst;
+        expected += 'P';
+    }
+    // Once both streams are ready, all ready rows participate in each compact decode round.
+    expected.append(std::max(remaining, 1U), 'D');
+    expect(instance.program->trace() == expected,
+           "the configured decode burst or prefill progress after neighbour completion was wrong");
+    expect(instance.program->all_lanes_idle(), "interleaving left a lane active");
+}
+
+void test_host_preparation_failure_releases_capacity(const q36::Frontend& frontend,
+                                                     const ninfer::DeviceContext& device) {
+    ScriptedInstance instance{.loaded = std::make_shared<ScriptedLoaded>(ScriptedLoaded{frontend}),
+                              .program = std::make_unique<ScriptedProgram>(1),
+                              .request_memory = {}, .kv_capacity_resolution = {}};
+    auto options = executor_options();
+    options.max_pending_requests = 1;
+    Executor executor(instance, options, device);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    for (const auto kind : {ninfer::RequestErrorKind::Cancelled, ninfer::RequestErrorKind::QueueTimeout}) {
+        bool observed = false;
+        instance.program->media_preparation = [&](const ninfer::PreparationControl& control) -> double {
+            observed = control.deadline == deadline && control.cancellation.requested();
+            throw ninfer::RequestError(kind, "scripted CPU media preparation failure");
+        };
+        auto prompt = frontend.prepare_tokens({0});
+        const auto summary = prompt.summary();
+        bool failed = false;
+        try {
+            (void)executor.submit(std::move(prompt), summary, 0.0, request_options(1),
+                ninfer::PreparationControl{.deadline = deadline,
+                    .cancellation = ninfer::CancellationView([] { return true; })});
+        } catch (const ninfer::RequestError& error) { failed = error.kind() == kind; }
+        expect(observed && failed, "CPU preparation did not receive deadline/cancellation or propagate its failure");
+        instance.program->media_preparation = {};
+        instance.program->push_script(GenerationScript{.tokens = {0}});
+        const auto next = run_request(executor, frontend, 1);
+        expect(next.ok && next.content == "x", "failed CPU preparation leaked ingress capacity");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -699,5 +795,9 @@ int main() {
     test_request_scope_failure_is_isolated(frontend, device, true);
     test_request_scope_failure_is_isolated(frontend, device, false);
     test_engine_scope_failure_still_fails_all(frontend, device);
+    test_prefill_decode_rounds(frontend, device, 1, 64);
+    test_prefill_decode_rounds(frontend, device, 4, 64);
+    test_prefill_decode_rounds(frontend, device, 4, 3);
+    test_host_preparation_failure_releases_capacity(frontend, device);
     return failures == 0 ? 0 : 1;
 }

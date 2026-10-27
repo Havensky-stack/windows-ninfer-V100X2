@@ -16,13 +16,26 @@
 // the driver grants peer access and startup validates it, the copy is a direct device-to-device
 // PCIe transfer. On this V100 topology the translated IOMMU domain prevents direct P2P; CUDA's
 // UVA D2D implementation then selects its driver-managed staging path. Startup validates the
-// exact UVA D2D route in either case. Windows WDDM SM70 TP2 without direct peers uses
-// startup-owned mapped pinned mailboxes for reductions up to 80 KiB. Each rank publishes its
-// original bytes with a system fence before inputs_ready; the peer reads those bytes into its
-// device staging before pull_done. The same barriers protect mailbox reuse. Larger reductions
-// and gathers retain DMA. TCC retains its existing transport. Callers need no transport branch.
-// Small qualified SM70 allreduces may read the peer operand directly in a sum kernel, writing
-// only their own staging. Both reads retire before either original operand is overwritten.
+// exact UVA D2D route in either case. Callers need no peer-access branch;
+// enable_peer_access() only reports whether direct peer access was qualified.
+// Qualified aligned SM70 TP2/TP4 reductions through 80 KiB use a two-epoch packet push.
+// Each rank keeps its own contribution in registers and publishes a remote copy into a
+// startup-owned mailbox; it never reads the peer's input allocation. After every lane arrives,
+// it adds in FP32 and rounds once to BF16. Empty slots use a reserved NaN payload, preserving
+// all finite input bits. Two epochs prevent reuse until the peer consumes the older packet.
+// Source/output lifetime is local-stream ordered; mailbox lifetime is part of PeerEvents.
+// WSL2 SM70 TP2 without P2P instead owns 320 KiB of mapped pinned host mailboxes
+// and device-local epoch counters. Aligned reductions through 80 KiB use the same
+// packet formula with system fences after publishing and clearing. The CPU never
+// touches live mailboxes; there are no host callbacks, inter-device atomics or
+// peer-device pointer accesses. Device-mailbox projection fusions stay disabled.
+// Host packet polling is bounded; losing a participating device fails the CUDA
+// execution instead of leaving an indefinitely resident poller. Wider/scalar
+// reductions and all gathers retain the verified driver-staged transport.
+// Other small qualified SM70 payloads use direct peer reads into rank-local staging. Both
+// reads retire before either original operand is overwritten.
+// Native Windows WDDM SM70 TP2 retains event-ordered mapped mailboxes for small reductions;
+// TCC without P2P retains driver-staged DMA.
 //
 // The equivalent cudaMemcpyPeerAsync entry point is deliberately NOT used: it is rejected inside a
 // stream capture region (cudaErrorStreamCaptureUnsupported), which would make the whole
@@ -32,7 +45,7 @@
 // inputs_ready before reading and every other rank's pull_done before overwriting
 // a source. Both routes retain the operands until all reads retire; TP4 sums in
 // global rank order so replicated residuals remain bit-identical across ranks.
-// ORDERING. Every transfer is a PULL: rank r reads the peer's source into storage that rank r
+// ORDERING for the DMA/direct-read routes. Every transfer is a PULL: rank r reads the peer's source into storage that rank r
 // alone owns, on rank r's own stream. Nothing a rank owns is ever written by the peer's stream, so
 // the classic push hazard -- the peer overwriting a staging buffer that this rank has not finished
 // reading yet -- cannot exist. Each rank issues two event records and two event waits:
@@ -64,8 +77,9 @@
 // projection) plus one allgather_rows per logit column, so 129 collectives at batch 1.
 //
 // Everything in a call is stream-ordered CUDA work (memcpy, event record, event wait, kernel
-// launch): there is no host round trip, host-memory spin flag, or explicit host staging allocation
-// in the hot path. That is what makes the sequence capturable. Measured: with both device streams
+// launch): there is no host round trip or allocation in the hot path. The WSL
+// packet route polls mapped RAM only from GPU kernels. Both routes are capturable.
+// Measured: with both device streams
 // enrolled in ONE capture -- the peer's stream joined to the origin's by an event fork -- the record/wait pairs
 // above become graph EDGES rather than nodes, and the whole 128-collective decode program
 // instantiates as a single cross-device cudaGraphExec. Event objects are caller-owned and created
@@ -84,10 +98,12 @@
 // device's own stream, or lets subsequent stream-ordered work depend on it, as usual.
 
 #include "core/device.h" // DeviceContext, ExecutionContext
+#include "core/arena.h"
 #include "core/mapped_peer_transfer.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaEvent_t
+#include <memory>
 
 #include <array>
 #include <cstddef>
@@ -95,6 +111,17 @@
 #include <span>
 
 namespace ninfer::ops {
+
+// The RMSNorm consumer of a replicated BF16 collective output. Every span has
+// one entry per rank; weights are BF16 [D] and outputs are disjoint [D,T]. Outputs
+// are BF16, or (published SM70 TP4 D5120, T1..8 only) the exact FP16 image of
+// that BF16 result. The latter preserves the BF16 rounding before the FP16 cast.
+struct ReplicatedRmsNorm {
+    std::span<const Tensor> weight;
+    std::span<const Tensor> output;
+    float eps;
+    bool unit_offset;
+};
 
 // Qualifies the actual cross-device copy route at startup. On Linux, first resolve both CUDA
 // devices' PCI bus IDs to /sys/bus/pci/devices/<BDF>/iommu_group/type. DMA and DMA-FQ prevent
@@ -115,8 +142,9 @@ namespace ninfer::ops {
 // TP4 qualifies every directed device pair and requires a complete direct-peer mesh.
 bool enable_peer_access(const ExecutionContext& ec);
 
-// The reusable cross-device ordering events: two per device, created on that device with timing
-// disabled.
+// The reusable cross-device transport: two ordering events per device, created with timing
+// disabled, plus fixed SM70 TP2/TP4 packet mailboxes/epochs when direct P2P was qualified. All
+// resources are allocated explicitly at startup and owned by this stream domain.
 //
 //   inputs_ready(r) - recorded on rank r's stream once the inputs rank r contributes are complete;
 //                     the peer waits on it before reading them.
@@ -130,8 +158,12 @@ bool enable_peer_access(const ExecutionContext& ec);
 // moved-from instance holds no events and must not be passed to a collective (the ops reject it).
 class PeerEvents {
 public:
+    // Auto selects WSL2 packets or native Windows WDDM event-ordered mailboxes.
+    // Disabled suppresses both host transports; Required explicitly selects host packets.
+    enum class HostPackets { Auto, Disabled, Required };
     // direct_peer_access is the result of enable_peer_access(ec), not advertised capability.
-    PeerEvents(const ExecutionContext& ec, bool direct_peer_access);
+    PeerEvents(const ExecutionContext& ec, bool direct_peer_access,
+               HostPackets host_packets = HostPackets::Auto);
     ~PeerEvents();
 
     PeerEvents(const PeerEvents&)            = delete;
@@ -153,6 +185,24 @@ public:
     }
     [[nodiscard]] int ranks() const noexcept { return ranks_; }
 
+    // WSL TP2 has no P2P. These are mapped aliases of startup-owned pinned RAM,
+    // independent of the direct-device mailboxes exposed to projection fusions.
+    [[nodiscard]] bool host_packets() const noexcept { return host_packets_[0] != nullptr; }
+    [[nodiscard]] void* host_packet_storage(int device_rank, int owner_rank) const noexcept {
+        return host_packet_aliases_[device_rank][owner_rank];
+    }
+    [[nodiscard]] unsigned* host_packet_epochs(int rank) const noexcept {
+        return static_cast<unsigned*>(host_packet_epochs_[rank].p);
+    }
+
+    // Fixed startup-owned SM70 transport storage. TP4 has a channel per source
+    // rank in each epoch; TP2 retains its single inbound channel.
+    [[nodiscard]] void* packet_storage(int rank) const noexcept {
+        return packets_[static_cast<std::size_t>(rank)].p;
+    }
+    static constexpr std::size_t kPacketMaxBytes = 81920;
+    static constexpr std::size_t kPacketBlocks = kPacketMaxBytes / (16 * 64);
+
     // False for a moved-from instance.
     [[nodiscard]] bool live() const noexcept {
         if (ranks_ != 2 && ranks_ != 4) { return false; }
@@ -166,6 +216,10 @@ private:
     std::optional<MappedPeerTransfer> mapped_transfer_;
     std::array<cudaEvent_t, kMaximumExecutionDevices> inputs_ready_{};
     std::array<cudaEvent_t, kMaximumExecutionDevices> pull_done_{};
+    std::array<DeviceBuffer, kMaximumExecutionDevices> packets_{};
+    std::array<std::unique_ptr<PinnedHostBuffer>, 2> host_packets_{};
+    std::array<std::array<void*, 2>, 2> host_packet_aliases_{};
+    std::array<DeviceBuffer, 2> host_packet_epochs_{};
     bool direct_peer_access_ = false;
     int ranks_ = 0;
 };
@@ -187,7 +241,7 @@ private:
  * The oracle evaluates `ideal` in FP64 from the represented BF16 inputs; the observable BF16
  * output is that value rounded once to BF16 storage. Both DMA/local-combine and direct-peer
  * sum routes use FP32 accumulation and one round-to-nearest-even on
- * store. The Op holds no persistent state and allocates nothing.
+ * store. There is no per-call allocation; PeerEvents owns the protocol storage.
  *
  * Requires `ec.device_count` in {2,4} and live events for the same rank count. Consecutive calls need no
  * host synchronization between them.
@@ -200,6 +254,35 @@ private:
 // the same association, including the direct-P2P route.
 void allreduce_sum(std::span<const Tensor> buffer, std::span<const Tensor> staging,
                    const ExecutionContext& ec, const PeerEvents& events);
+
+// In-place sum followed by RMSNorm from the represented BF16 sum. The sum
+// remains an observable rounding boundary, and the independent norm oracle is
+// its complete FP64 formula. Norm weights/outputs have one entry per rank;
+// outputs are disjoint from the sum buffers. Qualified SM70 TP4 D5120/T1..8
+// fuses transport and normalization; other shapes compose the same Ops.
+void allreduce_sum_rmsnorm(std::span<const Tensor> buffer, std::span<const Tensor> staging,
+                          const ReplicatedRmsNorm& norm,
+                          const ExecutionContext& ec, const PeerEvents& events);
+
+// TP2 out-of-place sum, with the same FP64 oracle and one BF16 output rounding.
+// Both input/output spans contain two equally shaped contiguous BF16 tensors on their ranks.
+// Inputs and outputs are disjoint; inputs remain unchanged. No per-call workspace or allocation.
+// On return both streams are ordered after all source reads, including the DMA fallback,
+// so callers may immediately reuse input storage without host synchronization.
+void allreduce_sum_to(std::span<const Tensor> input, std::span<const Tensor> output,
+                      const ExecutionContext& ec, const PeerEvents& events);
+
+// TP2 sum followed by RMSNorm of the represented BF16 sum. The sum is an
+// observable output and therefore a rounding boundary. Its exact oracle is the
+// FP64 sum rounded once to BF16; the norm oracle evaluates the complete RMSNorm
+// formula in FP64 from that represented sum and the BF16 weights. Input planes
+// remain unchanged and retire on both streams before source reuse is allowed.
+// No per-call allocation. Qualified SM70 D5120/T1..8 uses one fused kernel;
+// other profiles compose the same two Ops.
+void allreduce_sum_rmsnorm_to(std::span<const Tensor> input,
+                              std::span<const Tensor> output,
+                              const ReplicatedRmsNorm& norm,
+                              const ExecutionContext& ec, const PeerEvents& events);
 
 /**
  * Row gather, exact (no arithmetic). The gathered axis is `ne[1]`, so each rank
@@ -238,10 +321,25 @@ void allgather_rows(std::span<const Tensor> destination, std::span<const Tensor>
 void gather_columns_rank0(const Tensor& destination, std::span<const Tensor> part,
                           const ExecutionContext& ec, const PeerEvents& events);
 
+// Merge one FP32 score and local I32 index [1,T] per rank into replicated I32 [T].
+// The largest score wins; ties select the lowest global index (rank * shard_rows
+// + local index). Inputs must be non-NaN; +/-infinity and signed zero are valid.
+// Gather scratch is FP32/I32 [R,T] on rank zero. No input/output may overlap.
+// Sources and destinations retire on all participating streams before reuse.
+// Direct TP2/TP4 peer access fuses merge and publication; otherwise use UVA DMA.
+// Optional rank-zero I32 id_map[device_count * shard_rows] maps the winning global
+// index after tie-breaking. It is immutable until all participating streams retire.
+void allreduce_argmax(std::span<const Tensor> values, std::span<const Tensor> indices,
+                       std::span<const Tensor> output, Tensor& gathered_values,
+                       Tensor& gathered_indices, std::int32_t shard_rows,
+                       const ExecutionContext& ec, const PeerEvents& events,
+                       const std::int32_t* id_map = nullptr);
+
 // Exact relocation from rank 0 to each other active rank. Destinations are indexed by
 // rank minus one and contain ec.device_count - 1 entries. All tensors have the same contiguous
-// dtype and shape. Uses the qualified UVA D2D transport and orders rank 0's next overwrite after
-// rank 1 has consumed the source, including under CUDA Graph capture.
+// dtype and shape. SM70 TP4 direct-peer I32 payloads through 4 KiB use one origin
+// publication kernel; other payloads use qualified UVA D2D transport. Every stream
+// orders source/output reuse after publication, including under CUDA Graph capture.
 void broadcast_rank0(const Tensor& source, std::span<const Tensor> destinations,
                      const ExecutionContext& ec, const PeerEvents& events);
 

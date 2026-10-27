@@ -4,6 +4,8 @@
 
 #include "targets/qwen3_6/impl/runtime/layouts.h"
 #include "targets/qwen3_6/impl/runtime/program.h"
+#include "targets/qwen3_6/impl/vision/host.h"
+#include "targets/qwen3_6/impl/frontend/media_cache.h"
 
 #include <stdexcept>
 #include <utility>
@@ -141,6 +143,14 @@ template <>
 Program<Variant>::~Program() noexcept = default;
 
 template <>
+double Program<Variant>::prepare_media(PreparedPrompt& prompt, const PreparationControl& control) const {
+    if (!impl_->model.vision || !impl_->model.vision->host) { return 0.0; }
+    auto& data = PreparedPromptAccess::mutable_view(prompt);
+    if (!data.has_media()) { return 0.0; }
+    return impl_->host_vision_cache.prepare(*impl_->model.vision->host, data, control);
+}
+
+template <>
 RequestBasePlan<Variant>
 Program<Variant>::plan_request_base(const PreparedPrompt& prompt,
                                     const runtime::ResolvedExecutionOptions& options) {
@@ -216,7 +226,7 @@ bool Program<Variant>::has_retained_lane(std::uint32_t lane) const noexcept {
 }
 
 template <>
-void Program<Variant>::evict_retained_lane(std::uint32_t lane) noexcept {
+void Program<Variant>::evict_retained_lane(std::uint32_t lane) {
     impl_->evict_retained_lane(lane);
 }
 
@@ -226,7 +236,7 @@ GenerationTimings Program<Variant>::generation_timings_lane(std::uint32_t lane) 
 }
 
 template <>
-SpeculativeStats Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
+const SpeculativeStats& Program<Variant>::speculative_stats_lane(std::uint32_t lane) const noexcept {
     return impl_->speculative_stats_lane(lane);
 }
 

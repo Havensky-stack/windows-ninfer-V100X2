@@ -188,8 +188,8 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     chat_done = protocol_events(events, "request_done", "openai_chat_completions")
     require(len(chat_done) == 7, f"expected 7 Chat request_done events, found {len(chat_done)}")
     paths = [item.get("result", {}).get("prefix_reuse_path") for item in chat_done]
-    require(
-        paths == [
+    if backend == "dflash":
+        expected_paths = [
             "full_reset",
             "restore_turn_checkpoint",
             "restore_turn_checkpoint",
@@ -197,16 +197,35 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
             "full_reset",
             "restore_turn_checkpoint",
             "full_reset",
-        ],
-        f"unexpected Chat reuse paths: {paths}",
-    )
+        ]
+        require(paths == expected_paths, f"unexpected Chat reuse paths: {paths}")
+    else:
+        # Complete host GDN images can now outlive the old semantic turn boundary.
+        # Even an unrelated prompt can share the rendered tool/system preamble.
+        # Server warmup can leave a reusable common system-prefix image too.
+        require(paths[0] in ("full_reset", "restore_prefix_checkpoint"),
+                "initial request did not reset or restore a warmup prefix")
+        for index in (1, 2, 5):
+            require(paths[index] in ("restore_turn_checkpoint", "restore_prefix_checkpoint"),
+                    f"Chat {index} did not restore a complete checkpoint: {paths[index]}")
+        for index in (3, 4, 6):
+            require(paths[index] in ("full_reset", "restore_prefix_checkpoint"),
+                    f"Chat {index} did not reset or restore its common prefix: {paths[index]}")
+    for item, response in zip(chat_done, chat_responses + [closed_without_thinking, closed_with_thinking]):
+        result = item["result"]
+        reused = result["prefix_cache_hit_tokens"]
+        prompt = result["prompt_tokens"]
+        require(0 <= reused <= prompt and result["computed_prefill_tokens"] == prompt - reused,
+                "Chat computed/cache counts do not partition the input")
+        require(response["usage"]["prompt_tokens_details"]["cached_tokens"] == reused,
+                "Chat API cache count differs from completed Engine state")
     first_restore = chat_done[1]["result"].get("prefix_cache_hit_tokens")
     second_restore = chat_done[2]["result"].get("prefix_cache_hit_tokens")
     require(
         isinstance(first_restore, int)
         and first_restore > 0
-        and second_restore == first_restore,
-        "tool-loop requests did not restore the same turn checkpoint",
+        and (second_restore == first_restore if backend == "dflash" else second_restore >= first_restore),
+        "tool-loop requests did not retain a complete common-prefix checkpoint",
     )
     for index in (1, 2):
         speculative = chat_done[index].get("speculative", {})
@@ -243,9 +262,11 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         item.get("result", {}).get("prefix_reuse_path") for item in responses_done
     ]
     require(
-        response_paths[0] == "full_reset"
+        response_paths[0] in (("full_reset",) if backend == "dflash" else
+                              ("full_reset", "restore_prefix_checkpoint"))
         and response_paths[1] in ("append_frontier", "restore_response_checkpoint")
-        and response_paths[2] == "full_reset",
+        and response_paths[2] in (("full_reset",) if backend == "dflash" else
+                                  ("full_reset", "restore_prefix_checkpoint")),
         f"unexpected Responses reuse paths: {response_paths}",
     )
     parent_result = responses_done[0]["result"]
@@ -273,16 +294,16 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         f"Responses {response_paths[1]} reused {response_reuse}, "
         f"expected complete frontier {expected_response_reuse}",
     )
-    require(
-        all(responses_done[index]["result"].get("prefix_cache_hit_tokens") == 0
-            for index in (0, 2)),
-        "Responses full resets unexpectedly reused prompt tokens",
-    )
+    for index in (0, 2):
+        reused = responses_done[index]["result"]["prefix_cache_hit_tokens"]
+        require((response_paths[index] == "full_reset" and reused == 0) or
+                (response_paths[index] == "restore_prefix_checkpoint" and 0 < reused < parent_prompt),
+                "Responses reset/partial-restore accounting is inconsistent")
 
     return {
         "backend": backend,
         "model": model,
-        "turn_checkpoint_frontier": first_restore,
+        "first_reused_frontier": first_restore,
         "chat_reuse_paths": paths,
         "closed_turn_prompt_tokens": {
             "stripped": stripped_prompt_tokens,

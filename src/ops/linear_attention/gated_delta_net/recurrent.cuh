@@ -3,6 +3,7 @@
 #include "ops/common/bf16_vector.cuh"
 #include "ops/linear_attention/gated_delta_net/common.cuh"
 #include "ops/linear_attention/gated_delta_net/launch.h"
+#include "ops/kernel/rmsnorm.cuh"
 
 #include <cuda_bf16.h>
 
@@ -174,10 +175,11 @@ __device__ __forceinline__ void normalize_qk_lane(float (&value)[kQkPerLane], in
     }
 }
 
+template <int Dv = kDvPerWarp>
 __device__ __forceinline__ RawValueLane load_value_lane(const __nv_bfloat16* base, int lane,
                                                         std::uint32_t dv_base) {
     RawValueLane out{__float2bfloat16(0.0f), 0.0f};
-    if (lane < kDvPerWarp) {
+    if (lane < Dv) {
         out.bits  = base[dv_base + lane];
         out.value = __bfloat162float(out.bits);
     }
@@ -196,13 +198,14 @@ __device__ __forceinline__ RawGatePair load_record_gate(const uint2* gate, std::
     return {bits, __uint_as_float(bits.x), __uint_as_float(bits.y)};
 }
 
-__device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][kQkPerLane],
+template <int Dv>
+__device__ __forceinline__ void apply_gdn_transition(float (&state)[Dv][kQkPerLane],
                                                      const float (&key)[kQkPerLane], float v_local,
                                                      float g, float beta) {
     const float alpha = expf(g);
 
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < Dv; ++r) {
         float partial = 0.0f;
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * key[c]; }
@@ -216,8 +219,8 @@ __device__ __forceinline__ void apply_gdn_transition(float (&state)[kDvPerWarp][
     }
 }
 
-template <bool Normalize, typename QK>
-__device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQkPerLane],
+template <bool Normalize, int Dv, typename QK>
+__device__ __forceinline__ void readout_and_store(float (&state)[Dv][kQkPerLane],
                                                   const QK* query, __nv_bfloat16* output,
                                                   std::uint32_t dqk_base, std::uint32_t dv_base,
                                                   int lane, float scale) {
@@ -226,14 +229,14 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
 
     float attn_val = 0.0f;
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < Dv; ++r) {
         float partial = 0.0f;
 #pragma unroll
         for (int c = 0; c < kQkPerLane; ++c) { partial += state[r][c] * q.value[c]; }
         partial = warp_sum<kWarpSize>(partial);
         if (lane == r) { attn_val = partial; }
     }
-    if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
+    if (lane < Dv) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
 template <bool NormalizeQK, typename QK>
@@ -402,7 +405,7 @@ struct SnapshotAccess {
     }
 };
 
-template <bool Masked>
+template <bool Masked, int Dv = kDvPerWarp, int Warps = kNumWarps>
 struct RecordAccess {
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
@@ -422,8 +425,10 @@ struct RecordAccess {
     float scale;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
-        return make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
-                                static_cast<std::int32_t>(blockIdx.z), heads);
+        auto coord = make_coordinates(static_cast<std::int32_t>(blockIdx.y), 0,
+                                      static_cast<std::int32_t>(blockIdx.z), heads);
+        coord.dv_base = blockIdx.z * (Dv * Warps) + threadIdx.y * Dv;
+        return coord;
     }
 
     __device__ __forceinline__ std::int32_t
@@ -480,7 +485,7 @@ struct RecordAccess {
 
     __device__ __forceinline__ void store_value(const RecurrentCoordinates& coord,
                                                 std::int32_t token, const RawValueLane& raw) const {
-        if (coord.lane < kDvPerWarp) {
+        if (coord.lane < Dv) {
             __nv_bfloat16* destination =
                 value_record + (column(coord, token) * heads.H_v + coord.value_head) * kStateDim;
             destination[coord.dv_base + coord.lane] = raw.bits;
@@ -649,7 +654,7 @@ struct FoldAccess {
     }
 };
 
-template <RecurrentMode Mode, bool NormalizeInputs, class Access>
+template <RecurrentMode Mode, bool NormalizeInputs, class Access, int Dv = kDvPerWarp>
 __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
                                                     const RecurrentCoordinates& coord,
                                                     std::int32_t width, std::int32_t valid) {
@@ -658,9 +663,9 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
     }
 
     const float* initial = access.state_read_base(coord);
-    __align__(16) float state[kDvPerWarp][kQkPerLane];
+    __align__(16) float state[Dv][kQkPerLane];
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
+    for (int r = 0; r < Dv; ++r) {
         load_qk_lane(state[r], initial + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
                      coord.dqk_base);
     }
@@ -672,7 +677,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
     for (std::int32_t token = 0; token < valid; ++token) {
         const RawGatePair gate = access.load_gate(coord, token);
         const RawValueLane value =
-            load_value_lane(access.value_ptr(coord, token), coord.lane, coord.dv_base);
+            load_value_lane<Dv>(access.value_ptr(coord, token), coord.lane, coord.dv_base);
         if constexpr (Mode == RecurrentMode::Record) {
             access.store_value(coord, token, value);
             access.store_gate(coord, token, gate);
@@ -702,7 +707,7 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
         access.store_final_state(coord, state);
         access.publish_final_conv_history(coord, valid);
     } else {
-        if (coord.lane < kDvPerWarp) {
+        if (coord.lane < Dv) {
             for (std::int32_t token = valid; token < width; ++token) {
                 access.output_ptr(coord, token)[coord.dv_base + coord.lane] =
                     __float2bfloat16(0.0f);
@@ -720,12 +725,57 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                                                   access.active_columns(coord));
 }
 
-template <bool Masked>
-__global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
-    recurrent_record_kernel(RecordAccess<Masked> access) {
+template <bool Masked, int Dv = kDvPerWarp, int Warps = kNumWarps>
+__global__ void __launch_bounds__(kWarpSize* Warps, 2)
+    recurrent_record_kernel(RecordAccess<Masked, Dv, Warps> access) {
     const RecurrentCoordinates coord = access.coordinates();
-    recurrent_bf16_body<RecurrentMode::Record, true>(access, coord, access.width,
+    recurrent_bf16_body<RecurrentMode::Record, true, RecordAccess<Masked, Dv, Warps>, Dv>(access, coord, access.width,
                                                      access.active_columns(coord));
+}
+
+// The final state-column tile normalizes the complete published BF16 readout. Every writing
+// thread publishes before the completion atomic; volatile loads bypass any earlier L1 lines.
+// The last atomic restores zero. The caller orders successive invocations on one stream, so no
+// next invocation can use the counter or readout before this kernel has completely finished.
+template <bool Masked>
+__global__ __launch_bounds__(128, 2) void recurrent_record_norm_kernel(
+    RecordAccess<Masked, 2, 4> access, const __nv_bfloat162* weight,
+    const __nv_bfloat162* z, __half2* output, float eps, unsigned* counters) {
+    const auto coord = access.coordinates();
+    recurrent_bf16_body<RecurrentMode::Record, true, RecordAccess<Masked, 2, 4>, 2>(
+        access, coord, access.width, access.active_columns(coord));
+    __threadfence();
+    __syncthreads();
+    __shared__ int last;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        last = atomicInc(counters + coord.value_head, 15) == 15;
+    }
+    __syncthreads();
+    if (!last) { return; }
+    const int lane = threadIdx.x;
+    for (int token = threadIdx.y; token < access.width; token += 4) {
+        const int base = (token * access.heads.H_v + coord.value_head) * 64;
+        const auto* x = reinterpret_cast<const volatile unsigned*>(access.out) + base;
+        const unsigned p = x[lane], q = x[lane + 32];
+        const auto f = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&p));
+        const auto h = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&q));
+        float sum = 0.0F;
+        sum += f.x * f.x + f.y * f.y;
+        sum += h.x * h.x + h.y * h.y;
+        sum = warp_reduce_sum(sum);
+        float inv = lane == 0 ? rsqrtf(sum / 128.0F + eps) : 0.0F;
+        inv = __shfl_sync(0xffffffffU, inv, 0);
+        const auto w0 = __bfloat1622float2(weight[lane]);
+        const auto w1 = __bfloat1622float2(weight[lane + 32]);
+        const auto z0 = __bfloat1622float2(z[base + lane]);
+        const auto z1 = __bfloat1622float2(z[base + lane + 32]);
+        output[base + lane] = rmsnorm_output_pair<true>(
+            rmsnorm_epilogue<RmsEpilogue::Gated>(f.x, inv, w0.x, z0.x),
+            rmsnorm_epilogue<RmsEpilogue::Gated>(f.y, inv, w0.y, z0.y));
+        output[base + lane + 32] = rmsnorm_output_pair<true>(
+            rmsnorm_epilogue<RmsEpilogue::Gated>(h.x, inv, w1.x, z1.x),
+            rmsnorm_epilogue<RmsEpilogue::Gated>(h.y, inv, w1.y, z1.y));
+    }
 }
 
 template <class Geometry>

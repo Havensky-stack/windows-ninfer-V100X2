@@ -102,21 +102,27 @@ void ggml_k_gdn_output(std::span<const Tensor> x, std::span<const Weight> w,
 // in FP64 from represented BF16 inputs and independently decoded packed weights. Internal
 // partial storage/reduction rounding is an implementation profile, not an oracle boundary.
 //
-// Rank 0 folds the residual into its partial exactly once; all other ranks overwrite their
-// copies with residual-free projections. The one allreduce_sum leaves the full residual on
-// every rank. BF16_CTRL composes plain Linear and residual_add using staging's first plane;
-// registered packed formats use their fused LinearAdd route on rank 0. There are no per-rank
-// residual additions after the reduction and no extra hot-path allocation.
+// Rank 0 folds the residual into its contribution exactly once; every other rank produces a
+// residual-free contribution. One reduction leaves the full residual on every rank. Contributions
+// may occupy the existing staging planes and reduce directly into the residual destinations.
+// BF16_CTRL composes plain Linear and residual_add using staging's first plane; packed formats
+// may fuse the rank-0 epilogue. There are no per-rank residual additions after the reduction and
+// no extra hot-path allocation.
 //
 // Ranks agree on token count, output extent N and weight format/layout. K_r may differ. Input
 // and output residency/stream requirements are the same as linear_row_parallel. GGML_K,
 // NVFP4, Q5G64_F16S, row-scaled FP8 and BF16_CTRL are admitted only at their registered shapes.
 // W8G32_F16S is not registered for this split form.
+// SM70 TP4 prepacked NVFP4 [5120,1536/4352], A16Only, T1..8 with the published RMSNorm
+// collective additionally accepts contiguous FP16 x. This consumes the BF16-rounded
+// FP16 image from gated RMSNorm / column-parallel SwiGLU directly; residual and collective outputs keep
+// their declared representations. Other LinearAdd profiles require BF16 x.
 void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,
                              std::span<const Tensor> residual,
                              std::span<const Tensor> staging, LinearPolicy policy,
                              std::span<WorkspaceArena* const> workspace,
-                             const ExecutionContext& ec, const PeerEvents& events);
+                             const ExecutionContext& ec, const PeerEvents& events,
+                             const ReplicatedRmsNorm* norm = nullptr);
 
 /// A16-only convenience form for profiles whose queried transient workspace is zero.
 void linear_add_row_parallel(std::span<const Tensor> x, std::span<const Weight> w,

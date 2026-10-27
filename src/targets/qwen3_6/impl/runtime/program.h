@@ -16,6 +16,7 @@
 #include "targets/qwen3_6/impl/runtime/text_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
+#include "targets/qwen3_6/impl/vision/host.h"
 
 #include <cstdint>
 #include <array>
@@ -29,6 +30,8 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 using PreparedPromptData    = qwen3_6::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_6::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_6::RewriteCheckpointSpec;
+
+struct ArchivedPrefix;
 
 using ReusePath = ninfer::PrefixReusePath;
 
@@ -69,6 +72,7 @@ struct RequestBasePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t vision_transient_bytes = 0;
     std::optional<qwen3_6::RewriteCheckpointSpec> rewrite_checkpoint;
     bool allow_prefix_reuse = false;
+    bool capture_prefix_checkpoints = false;
 };
 
 template <>
@@ -78,7 +82,9 @@ struct RequestPlanImpl<NINFER_QWEN36_VARIANT> {
     std::uint32_t reuse_base                  = 0;
     NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode mtp_bridge =
         NINFER_QWEN36_RUNTIME_NS::MtpBridgeMode::None;
+    std::shared_ptr<const NINFER_QWEN36_RUNTIME_NS::ArchivedPrefix> archived_prefix;
     bool prepare_mtp = false;
+    bool capture_prefix_checkpoints = false;
     std::optional<NINFER_QWEN36_RUNTIME_NS::VisionPrefillPlan> vision;
     NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction rewrite_checkpoint_action =
         NINFER_QWEN36_RUNTIME_NS::RewriteCheckpointAction::Drop;
@@ -124,6 +130,14 @@ struct RewriteCheckpoint {
     std::uint32_t frontier     = 0;
 };
 
+struct PrefixCheckpoint {
+    std::uint32_t frontier = 0;
+    // All ranks' exact convolution/recurrent state followed by rank 0's tail hidden.
+    std::shared_ptr<std::byte[]> image;
+};
+
+inline constexpr std::size_t kPrefixCheckpointBudget = 2ULL * 1024 * 1024 * 1024;
+
 struct SequenceKVBundle {
     PagedKVAllocation text;
     std::optional<PagedKVAllocation> backend;
@@ -133,6 +147,25 @@ struct SequenceKVBundle {
     // Peer backend allocations use the same lockstep page ownership. In PP2 the peer's
     // symmetric MTP reservation is unused by computation.
     std::array<std::optional<PagedKVAllocation>, kMaximumExecutionDevices - 1> backend_peers;
+};
+
+// Immutable host chunks form a persistent prefix tree. Descendants share only complete
+// chunks restored from this exact lineage; numerically recomputed prefixes never alias.
+struct PrefixKVChunk {
+    std::uint32_t first_page = 0;
+    std::uint32_t backend_pages = 0;
+    std::uint32_t pages = 0;
+    std::array<std::vector<std::byte>, kMaximumExecutionDevices> text;
+    std::array<std::vector<std::byte>, kMaximumExecutionDevices> backend;
+};
+
+struct ArchivedPrefix {
+    std::uint32_t frontier = 0;
+    std::uint32_t mtp_valid = 0;
+    std::vector<TokenId> ledger;
+    qwen3_6::detail::ResidentPrefixIdentity identity;
+    std::vector<PrefixCheckpoint> checkpoints;
+    std::vector<std::shared_ptr<const PrefixKVChunk>> chunks;
 };
 
 struct DecodeGraphProfile {
@@ -177,6 +210,14 @@ struct SequenceState {
     bool tail_hidden_valid        = false;
     bool retained                 = false;
     RewriteCheckpoint rewrite_checkpoint;
+    std::vector<PrefixCheckpoint> prefix_checkpoints;
+    bool history_enabled = false;
+    std::vector<std::shared_ptr<const PrefixKVChunk>> prefix_chunks;
+    std::uint32_t shared_prefix_tokens = 0;
+    std::weak_ptr<ArchivedPrefix> archived_snapshot;
+    // When set, the committed GDN state lives in this lane's complete owned RAM
+    // checkpoint at this frontier; the current GPU GDN slot is not readable yet.
+    std::optional<std::uint32_t> deferred_prefix_state;
     TokenSpan ram_query;
     std::uint32_t ram_rank_frontier = 0;
 };
@@ -190,6 +231,15 @@ struct RequestControl {
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
 
+    // Exact-hit output selection needs only the lane's saved tail hidden. Restore the
+    // recurrent state and rebuild MTP continuation when decode first consumes them.
+    // These inputs belong to this request/lane, never to shared prefill scratch.
+    struct ExactHitContinuation {
+        std::array<std::int32_t, 3> bridge_rope;
+        std::uint32_t proposal_extent = 0;
+    };
+    std::optional<ExactHitContinuation> exact_hit;
+
     struct Prefill {
         PreparedPromptData prompt;
         std::optional<VisionPrefillPlan> vision_plan;
@@ -202,6 +252,7 @@ struct RequestControl {
         std::uint32_t initial_mtp_extent = 0;
         double elapsed_seconds           = 0.0;
         bool prepare_mtp                 = false;
+        bool capture_prefix_checkpoints  = false;
         ReusePath reuse                  = ReusePath::FullReset;
         MtpBridgeMode mtp_bridge         = MtpBridgeMode::None;
     };
@@ -281,15 +332,16 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    void evict_retained_lane(std::uint32_t lane) noexcept;
+    void evict_retained_lane(std::uint32_t lane);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    [[nodiscard]] const SpeculativeStats& speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
 
     const LoadedModelData& model;
+    mutable qwen3_6::HostVisionCache host_vision_cache;
     ExecutionContext& execution;
     DeviceContext& device;
     const int device_count;
@@ -299,6 +351,7 @@ public:
     const std::uint32_t capacity;
     const std::uint32_t kv_capacity;
     const std::uint32_t max_concurrency;
+    const std::uint32_t prefix_cache_tokens;
     const std::uint32_t prefill_chunk;
     const std::uint32_t draft_window;
     const RamKvOptions ram_kv;
@@ -364,6 +417,11 @@ public:
 
     std::array<SequenceState, kMaximumConcurrency> sequences;
     std::array<RequestControl, kMaximumConcurrency> requests;
+    std::vector<std::shared_ptr<ArchivedPrefix>> prefix_history;
+    void archive_prefix(SequenceState& sequence);
+    void restore_archived_prefix(SequenceState& sequence, const ArchivedPrefix& archive,
+                                 const RequestPlanImpl& plan);
+    void trim_prefix_history();
 
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
@@ -493,6 +551,14 @@ private:
     void materialize_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                                  std::uint32_t backend_tokens = 0);
     void refresh_ram_kv(SequenceState& sequence, std::uint32_t frontier);
+    [[nodiscard]] std::size_t prefix_checkpoint_bytes() const;
+    void save_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier, const Tensor& hidden);
+    PrefixCheckpoint capture_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                                const Tensor& hidden,
+                                                std::shared_ptr<std::byte[]> image = {});
+    void restore_prefix_checkpoint(SequenceState& sequence, std::uint32_t frontier,
+                                   bool restore_linear_state = true);
+    void finish_exact_hit(SequenceState& sequence, RequestControl& request, bool decode);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,
                           std::uint32_t backend_tokens = 0);
     void release_sequence_growth_entitlement(SequenceState& sequence) noexcept;

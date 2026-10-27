@@ -34,6 +34,14 @@ struct Nvfp4GdnInputSections<Nvfp4GdnInputTp2ColumnGeometry> {
     static constexpr std::int32_t kValueRows = 3072;
 };
 
+#ifdef NINFER_VOLTA_BUILD
+template <>
+struct Nvfp4GdnInputSections<Nvfp4GdnInputTp4ColumnGeometry> {
+    static constexpr std::int32_t kKeyRows   = 512;
+    static constexpr std::int32_t kValueRows = 1536;
+};
+#endif
+
 // The tp1-named struct (unparameterized) is kept exactly as it was -- every existing tp1 call site
 // (nvfp4_gdn_input_{decode,small_t,w4a4}.cu, nvfp4_w4a4_tma.cu) continues to build the identical
 // Nvfp4GdnInputOutput{qkv,z} aggregate it always has, unmodified. The shard uses the new templated

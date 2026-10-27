@@ -1,13 +1,44 @@
 #pragma once
 
 #include "core/tensor.h"
+#include "ninfer/ops/allreduce.h"
 #include <array>
 #include <cuda_runtime.h>
 
 namespace ninfer::ops::detail {
+void broadcast_i32_tp4_launch(const Tensor& source, std::span<const Tensor> destinations,
+                              cudaStream_t stream);
+void allreduce_argmax_tp2_launch(std::span<const Tensor> values, std::span<const Tensor> indices,
+    std::span<const Tensor> output, std::int32_t shard_rows, const std::int32_t* id_map, cudaStream_t stream);
+void allreduce_argmax_tp4_launch(std::span<const Tensor> values, std::span<const Tensor> indices,
+    std::span<const Tensor> output, std::int32_t shard_rows, const std::int32_t* id_map, cudaStream_t stream);
+
 // Validated non-overlapping BF16 operands, qualified P2P mapping, and rank-local output.
 void allreduce_peer_sum_launch(const Tensor& local, const Tensor& peer, const Tensor& output,
                                cudaStream_t stream);
+void allreduce_packet_sum_launch(const Tensor& local, const Tensor& output,
+                                 void* local_storage, void* peer_storage,
+                                 std::size_t epoch_bytes, cudaStream_t stream);
+void allreduce_host_packet_sum_launch(const Tensor& local, const Tensor& output,
+    void* local_storage, void* peer_storage, unsigned* epochs,
+    std::size_t epoch_bytes, cudaStream_t stream);
+void allreduce_packet_sum4_launch(const Tensor& buffer, const std::array<void*, 4>& storage,
+                                  int rank, std::size_t channel_bytes, cudaStream_t stream, bool published = false);
+void allreduce_packet_sum4_rmsnorm_launch(const Tensor& buffer, const Tensor& weight,
+    const Tensor& normalized, float eps, bool unit_offset, const std::array<void*, 4>& storage,
+    int rank, std::size_t channel_bytes, cudaStream_t stream, bool published);
+void allreduce_packet_rmsnorm_launch(const Tensor& input, const Tensor& output,
+    const Tensor& weight, const Tensor& normalized, float eps, bool unit_offset,
+    void* local_storage, void* peer_storage, std::size_t epoch_bytes, cudaStream_t stream,
+    bool published = false);
+// Finish the same packet protocol after a qualified projection epilogue has
+// published every contribution. Caller must use the same mailboxes/epoch domains.
+void allreduce_published_sum_rmsnorm_to(std::span<const Tensor> input,
+    std::span<const Tensor> output, const ReplicatedRmsNorm& norm,
+    const ExecutionContext& ec, const PeerEvents& events);
+void allreduce_published_sum_rmsnorm(std::span<const Tensor> buffer,
+    std::span<const Tensor> staging, const ReplicatedRmsNorm& norm,
+    const ExecutionContext& ec, const PeerEvents& events);
 void allreduce_sum4_launch(const std::array<Tensor, 4>& inputs, const Tensor& output,
                           cudaStream_t stream);
 } // namespace ninfer::ops::detail

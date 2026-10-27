@@ -243,6 +243,40 @@ void test_concurrent_direct_reads() {
     second.get();
 }
 
+void test_memory_image() {
+    auto fixture = write_fixture(normative_directory(), "memory_image");
+    auto original = std::make_unique<Reader>(fixture.path);
+    std::uint64_t completed = 0;
+    auto image = original->retain_in_memory([&](auto done, auto total) {
+        if (done < completed || done > total) { throw std::runtime_error("invalid copy progress"); }
+        completed = done;
+    });
+    if (completed != original->file_bytes()) { throw std::runtime_error("incomplete host image"); }
+    Reader resident(image);
+    image.reset();
+    if (resident.identity().model_id != original->identity().model_id ||
+        resident.file_bytes() != original->file_bytes()) {
+        throw std::runtime_error("host image metadata mismatch");
+    }
+    for (const auto& object : original->objects()) {
+        const auto a = original->payload(object).data;
+        const auto b = resident.payload(ninfer::artifact::object_name(object)).data;
+        if (!std::equal(a.begin(), a.end(), b.begin(), b.end())) {
+            throw std::runtime_error("host image changed original packed bytes");
+        }
+    }
+    // Windows cannot unlink a mapped file. Retained bytes must outlive both mapping and path.
+    original.reset();
+    std::filesystem::remove(fixture.path);
+    alignas(4096) std::array<std::byte, 16384> buffer{};
+    const auto bytes = resident.read_direct(0, buffer);
+    auto again = resident.retain_in_memory();
+    if (bytes != resident.file_bytes() ||
+        !std::equal(buffer.begin(), buffer.begin() + bytes, again->begin())) {
+        throw std::runtime_error("host image aligned reads / EOF differ");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -251,6 +285,7 @@ int main() {
         test_normative_fixture();
         test_common_validation();
         test_concurrent_direct_reads();
+        test_memory_image();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

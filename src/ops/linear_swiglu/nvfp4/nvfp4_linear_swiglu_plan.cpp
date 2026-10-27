@@ -75,7 +75,9 @@ struct Nvfp4LinearSwiGluWorkspace {
 };
 
 template <class Geometry, class Allocator>
-Nvfp4LinearSwiGluWorkspace allocate_baseline_workspace(Allocator& allocator, std::int32_t tokens) {
+Nvfp4LinearSwiGluWorkspace allocate_baseline_workspace(Allocator& allocator,
+                                                        LinearPolicy policy,
+                                                        std::int32_t tokens) {
     Nvfp4LinearSwiGluWorkspace out;
     out.projected =
         allocator.alloc(DType::BF16, {Geometry::kOutputRows, tokens}, 256);
@@ -84,8 +86,7 @@ Nvfp4LinearSwiGluWorkspace allocate_baseline_workspace(Allocator& allocator, std
     // floor cannot desynchronize them.
     const std::size_t linear_bytes = std::max<std::size_t>(
         linear_workspace_capacity_bytes(QType::NVFP4, Geometry::kOutputRows,
-                                        Geometry::kInputRows, kNvfp4InternalPolicy,
-                                        tokens, tokens),
+                                        Geometry::kInputRows, policy, tokens, tokens),
         256);
     out.linear = allocator.alloc_bytes(linear_bytes, 256);
     return out;
@@ -97,9 +98,9 @@ Nvfp4W4a4Workspace allocate_fused_workspace(Allocator& allocator, std::int32_t t
 }
 
 template <class Geometry>
-std::size_t baseline_workspace_bytes(std::int32_t tokens) {
+std::size_t baseline_workspace_bytes(LinearPolicy policy, std::int32_t tokens) {
     WorkspaceLayoutBuilder layout;
-    (void)allocate_baseline_workspace<Geometry>(layout, tokens);
+    (void)allocate_baseline_workspace<Geometry>(layout, policy, tokens);
     return layout.peak_bytes(1);
 }
 
@@ -167,7 +168,7 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
         // small widths and the materialized baseline for wider calls.
         const Nvfp4LinearSwiGluRoute route = resolve_route(policy, max_tokens);
         if (route == Nvfp4LinearSwiGluRoute::LinearW4A4Post) {
-            return baseline_workspace_bytes<Geometry>(max_tokens);
+            return baseline_workspace_bytes<Geometry>(policy, max_tokens);
         }
 #ifdef NINFER_VOLTA_BUILD
         if (route == Nvfp4LinearSwiGluRoute::VoltaQpnSplit) {
@@ -193,7 +194,7 @@ std::size_t capacity_bytes_impl(LinearPolicy policy, std::int32_t min_tokens,
         --last_baseline;
     }
     if (last_baseline >= std::max(min_tokens, 49)) {
-        maximum = std::max(maximum, baseline_workspace_bytes<Geometry>(last_baseline));
+        maximum = std::max(maximum, baseline_workspace_bytes<Geometry>(policy, last_baseline));
     }
     return maximum;
 }
@@ -322,9 +323,10 @@ void dispatch_impl(const Tensor& x, const Weight& weight, Tensor& out, LinearPol
             "nvfp4 linear_swiglu materialized W4A4 requires caller workspace");
     }
     auto scope                         = workspace->scope();
-    Nvfp4LinearSwiGluWorkspace scratch = allocate_baseline_workspace<Geometry>(*workspace, x.ne[1]);
+    Nvfp4LinearSwiGluWorkspace scratch =
+        allocate_baseline_workspace<Geometry>(*workspace, policy, x.ne[1]);
     WorkspaceArena linear_workspace(scratch.linear);
-    linear(x, weight, scratch.projected, LinearPolicy::AllowA4, linear_workspace, stream);
+    linear(x, weight, scratch.projected, policy, linear_workspace, stream);
     constexpr std::int32_t kIntermediate = Geometry::kOutputRows / 2;
     silu_mul(scratch.projected.slice(0, 0, kIntermediate),
              scratch.projected.slice(0, kIntermediate, kIntermediate), out, stream);

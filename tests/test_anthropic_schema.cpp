@@ -6,6 +6,7 @@
 // consumed by Claude Code / other Anthropic clients.
 
 #include "serve/anthropic_schema.h"
+#include "serve/generation_service.h"
 #include "serve/request.h"
 #include "serve/translate.h"
 
@@ -704,7 +705,7 @@ int test_streaming_events() {
     const Json stop = parse_sse(make_content_block_stop(2), &type);
     failures += check(type == "content_block_stop" && stop.at("index") == 2, "content_block_stop");
 
-    const Json mdelta = parse_sse(make_message_delta("tool_use", 5), &type);
+    const Json mdelta = parse_sse(make_message_delta("tool_use", CompletionUsage{11, 5}), &type);
     failures +=
         check(type == "message_delta" && mdelta.at("delta").at("stop_reason") == "tool_use" &&
                   mdelta.at("delta").at("stop_sequence").is_null() &&
@@ -746,10 +747,63 @@ int test_count_tokens_and_error() {
     return failures;
 }
 
+int test_cache_usage_serialization() {
+    int failures = 0;
+    for (const int cached : {0, 37, 100}) {
+        GenerationOutcome outcome;
+        outcome.prompt_tokens = 100;
+        outcome.completion_tokens = 9;
+        outcome.metrics.prefix_cache_hit_tokens = cached;
+        const CompletionUsage usage = outcome.usage();
+        const Json expected = {{"input_tokens", 100 - cached}, {"output_tokens", 9},
+                               {"cache_read_input_tokens", cached},
+                               {"cache_creation_input_tokens", 0}};
+        const Json response = Json::parse(make_messages_response(
+            "msg-cache", "m", "answer", "", {}, "end_turn", usage));
+        failures += check(response.at("usage") == expected,
+                          "Messages usage must separate reused and newly computed input");
+        const Json delta = parse_sse(make_message_delta("end_turn", usage));
+        failures += check(delta.at("usage") == expected,
+                          "terminal Messages SSE must report complete cached-token usage");
+    }
+    return failures;
+}
+
+int test_output_token_cap() {
+    RequestLimits cap;
+    cap.default_max_tokens = 64;
+    cap.max_output_tokens = 64;
+    Json body = {{"model", "m"}, {"messages", Json::array({{{"role", "user"}, {"content", "hello"}}})}};
+    int failures = 0;
+    for (int tokens : {32, 64}) {
+        body["max_tokens"] = tokens;
+        const auto out = parse_messages_request(body, cap);
+        failures += check(out.max_tokens == tokens, "output cap rejected a supported budget");
+    }
+    body["max_tokens"] = 65;
+    bool rejected = false;
+    try { (void)parse_messages_request(body, cap); }
+    catch (const ApiException& error) {
+        rejected = error.error().status == 400 &&
+                   error.error().code == "max_output_tokens_exceeded" &&
+                   error.error().param == "max_tokens";
+    }
+    failures += check(rejected, "output cap did not reject an oversized request");
+    body.erase("max_tokens");
+    auto out = parse_messages_request(body, cap);
+    failures += check(out.max_tokens == 64, "output cap changed the default budget");
+    cap.max_output_tokens = 0;
+    body["max_tokens"] = 65;
+    out = parse_messages_request(body, cap);
+    failures += check(out.max_tokens == 65, "disabled output cap still limits requests");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_output_token_cap();
     failures += test_parse_basic_and_system();
     failures += test_parse_system_array_and_blocks();
     failures += test_ordered_system_messages();
@@ -764,6 +818,7 @@ int main() {
     failures += test_response_serialization();
     failures += test_streaming_events();
     failures += test_count_tokens_and_error();
+    failures += test_cache_usage_serialization();
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

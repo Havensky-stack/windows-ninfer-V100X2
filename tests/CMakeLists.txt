@@ -46,6 +46,10 @@ function(ninfer_add_linear_test name source)
     LIBRARIES ninfer_ops)
 endfunction()
 
+ninfer_add_op_test(ninfer_host_vision_test
+  SOURCES ops/test_host_vision.cpp
+  LIBRARIES ninfer_host_ops)
+
 ninfer_add_op_test(ninfer_ggml_k_test
   SOURCES ops/test_ggml_k.cpp
   LIBRARIES ninfer_ops)
@@ -161,6 +165,12 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
 target_link_libraries(ninfer_qwen3_6_27b_prefix_real_test PRIVATE ${NINFER_CUDART_TARGET})
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME ninfer_qwen3_6_27b_vision_tp2_real_test COMMAND ninfer_qwen3_6_27b_prefix_real_test)
+if(UNIX)
+  ninfer_add_test(ninfer_vision_long_real_test
+    SOURCES targets/qwen3_6_27b/test_vision_long_real.cpp
+    LIBRARIES ninfer_engine)
+  set_tests_properties(ninfer_vision_long_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+endif()
 set_tests_properties(ninfer_qwen3_6_27b_vision_tp2_real_test PROPERTIES
   SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT "NINFER_TEST_TP2=1")
 ninfer_add_test(ninfer_qwen3_8_27b_tp2_real_test
@@ -187,6 +197,8 @@ set_tests_properties(ninfer_qwen3_8_27b_v100x2_real_test
 add_executable(ninfer_long_attention_real_test targets/qwen3_6_27b/test_long_attention_real.cpp)
 target_link_libraries(ninfer_long_attention_real_test PRIVATE ninfer_engine)
 target_include_directories(ninfer_long_attention_real_test PRIVATE ${PROJECT_SOURCE_DIR}/third_party)
+add_executable(ninfer_prefix_history_real_test targets/qwen3_6_27b/test_prefix_history_real.cpp)
+target_link_libraries(ninfer_prefix_history_real_test PRIVATE ninfer_engine)
 # TP2 INT8 KV + MTP3/DFlash7 cache continuation and response-checkpoint replay.
 ninfer_add_test(ninfer_qwen3_8_27b_v100x2_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_v100x2_prefix_real.cpp
@@ -318,6 +330,10 @@ ninfer_add_test(ninfer_http_error_handler_test
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_error_handler_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+ninfer_add_test(ninfer_model_residency_real_test
+  SOURCES test_model_residency_real.cpp
+  LIBRARIES ninfer_serve)
+set_tests_properties(ninfer_model_residency_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp
@@ -340,6 +356,7 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
+  proposal_argmax
   gdn_gating
   gdn_gating_proj
   rope
@@ -395,12 +412,27 @@ ninfer_add_op_test(ninfer_gdn_projections_split_test
 ninfer_add_op_test(ninfer_nvfp4_input_sm70_test
   SOURCES ops/test_nvfp4_input_sm70.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_nvfp4_row_add_sm70_test
+  SOURCES ops/test_nvfp4_row_add_sm70.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_output_head_split_test
   SOURCES ops/test_output_head_split.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_attention_headlocal_test
   SOURCES ops/test_attention_headlocal.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_attention_headlocal_tp4_test
+  SOURCES ops/test_attention_headlocal.cpp
+  LIBRARIES ninfer_ops)
+target_compile_definitions(ninfer_attention_headlocal_tp4_test PRIVATE NINFER_ATTENTION_TP=4)
+add_test(NAME ninfer_attention_tp4_geometry_test
+  COMMAND ninfer_attention_headlocal_tp4_test --single-device-geometry --prefill-only)
+set_tests_properties(ninfer_attention_tp4_geometry_test PROPERTIES SKIP_RETURN_CODE 77)
+foreach(section prefill decode1 decode4 decode5 decode6 boundaries short)
+    add_test(NAME ninfer_attention_tp2_${section}_test
+        COMMAND ninfer_attention_headlocal_test --section ${section})
+    set_tests_properties(ninfer_attention_tp2_${section}_test PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 ninfer_add_op_test(ninfer_gdn_headsplit_test
   SOURCES ops/test_gdn_headsplit.cpp
   LIBRARIES ninfer_ops)
@@ -423,6 +455,8 @@ set_tests_properties(ninfer_ram_kv_real_test PROPERTIES TIMEOUT 1200 SKIP_RETURN
 ninfer_add_op_test(ninfer_gdn_tp4_test
   SOURCES ops/test_gdn_tp4.cpp
   LIBRARIES ninfer_ops)
+add_test(NAME ninfer_gdn_tp4_decode_test COMMAND ninfer_gdn_tp4_test --gdn-decode)
+set_tests_properties(ninfer_gdn_tp4_decode_test PROPERTIES SKIP_RETURN_CODE 77)
 # The visible-key domain past the pre-YaRN 262144 bound: its own target because it needs multi-GiB
 # KV pools and a long FP64 oracle, and skips per case when the device cannot hold one.
 ninfer_add_op_test(ninfer_gqa_attention_long_context_test

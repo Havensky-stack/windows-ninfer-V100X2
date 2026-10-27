@@ -50,3 +50,6 @@ profiles/
 
 /models
 *.ninfer
+
+# Generated release packages and Docker exports
+dist/

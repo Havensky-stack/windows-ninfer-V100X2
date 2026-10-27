@@ -11,7 +11,7 @@ namespace {
 
 std::string take_string(artifact::MaterializedArtifact& materialized,
                         artifact::ObjectHandle handle) {
-    const auto bytes = materialized.take_resource_bytes(handle);
+    const auto bytes = materialized.take_host_bytes(handle);
     return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 

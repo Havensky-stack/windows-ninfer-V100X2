@@ -277,14 +277,16 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
-ConstructedTarget construct_target(const EngineOptions& options, ExecutionContext& execution) {
+ConstructedTarget construct_target(const EngineOptions& options, ExecutionContext& execution,
+                                  std::shared_ptr<const std::vector<std::byte>> image) {
     validate_options(options);
     if (execution.device_count != options.tp * options.pp) {
         throw std::invalid_argument("execution context width does not match EngineOptions.tp");
     }
     const auto load_start = Clock::now();
 
-    artifact::Reader reader(options.artifact_path);
+    artifact::Reader reader = image ? artifact::Reader(std::move(image))
+                                   : artifact::Reader(options.artifact_path);
     const auto& identity = reader.identity();
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(

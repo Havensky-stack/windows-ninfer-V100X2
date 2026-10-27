@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
@@ -33,5 +35,21 @@ void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor&
 // linear_row_parallel's own convention) reach this dispatcher directly.
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                                LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream);
+
+#ifdef NINFER_VOLTA_BUILD
+// QPN projection into a distinct contribution plane, preserving the existing
+// BF16 projection boundary before adding the represented BF16 residual.
+void nvfp4_linear_add_qpn_to(const Tensor& x, const Weight& weight, const Tensor& residual,
+                             const Tensor& output, WorkspaceArena& workspace, cudaStream_t stream);
+// TP4 in-place contribution publication, with the same BF16 projection/add boundary.
+void nvfp4_linear_add_qpn_publish4(const Tensor& x, const Weight& weight,
+    const Tensor& residual, const Tensor& output, WorkspaceArena& workspace,
+    const std::array<void*, 4>& storage, int rank, std::size_t channel_bytes, cudaStream_t stream);
+// Same represented projection/add boundaries, additionally publishing each pair
+// into the peer's current packet epoch before the norm consumer is issued.
+void nvfp4_linear_add_qpn_publish(const Tensor& x, const Weight& weight,
+    const Tensor& residual, const Tensor& output, WorkspaceArena& workspace,
+    void* local_storage, void* peer_storage, std::size_t epoch_bytes, cudaStream_t stream);
+#endif
 
 } // namespace ninfer::ops::detail

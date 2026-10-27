@@ -80,7 +80,8 @@ int run_control(const ExecutionContext& ec, int tokens) {
     return failures;
 }
 
-int run_attention(const ExecutionContext& ec, QType type, int tokens) {
+int run_attention(const ExecutionContext& ec, QType type, int tokens, bool prepack = false,
+                   bool fast = false) {
     std::array<std::unique_ptr<DevicePackedWeight>,4> weights;
     std::array<std::unique_ptr<GuardedBf16Tensor>,4> inputs,q,k,g,v;
     std::array<std::unique_ptr<DeviceBuffer>,4> storage;
@@ -96,7 +97,7 @@ int run_attention(const ExecutionContext& ec, QType type, int tokens) {
         quantized_weight::PatternedWeightOptions options;
         if(type==QType::NVFP4) {options.weight_scale_divisor=.125F;options.input_scale_divisor=3.5F;}
         weights[r]=std::make_unique<DevicePackedWeight>(quantized_weight::make_patterned_weight(
-            type,3584,5120,2011+r,options));
+            type,3584,5120,2011+r,options), prepack);
         inputs[r]=std::make_unique<GuardedBf16Tensor>(5120,tokens);
         q[r]=std::make_unique<GuardedBf16Tensor>(1536,tokens);
         k[r]=std::make_unique<GuardedBf16Tensor>(256,tokens);
@@ -111,6 +112,7 @@ int run_attention(const ExecutionContext& ec, QType type, int tokens) {
             DeviceSpan{storage[r]->p,std::max<std::size_t>(bytes,256)});
         xv[r]=inputs[r]->tensor();qv[r]=q[r]->tensor();kv[r]=k[r]->tensor();
         gv[r]=g[r]->tensor();vv[r]=v[r]->tensor();wv[r]=weights[r]->view();ws[r]=arenas[r].get();
+        wv[r].volta_fp32_scale = fast;
         // Fixtures use the legacy default stream; the Op uses nonblocking rank streams.
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -136,7 +138,8 @@ int run_attention(const ExecutionContext& ec, QType type, int tokens) {
     return failures;
 }
 
-int run_projection(const ExecutionContext& ec, QType type, int tokens) {
+int run_projection(const ExecutionContext& ec, QType type, int tokens, bool prepack = false,
+                    bool fast = false) {
     std::array<std::unique_ptr<DevicePackedWeight>, 4> weights;
     std::array<std::unique_ptr<GuardedBf16Tensor>, 4> inputs, qkv, z;
     std::array<std::unique_ptr<DeviceBuffer>, 4> storage;
@@ -155,7 +158,7 @@ int run_projection(const ExecutionContext& ec, QType type, int tokens) {
             options.input_scale_divisor = 3.5F;
         }
         weights[r] = std::make_unique<DevicePackedWeight>(
-            quantized_weight::make_patterned_weight(type, 4096, 5120, 1911U + r, options));
+            quantized_weight::make_patterned_weight(type, 4096, 5120, 1911U + r, options), prepack);
         inputs[r] = std::make_unique<GuardedBf16Tensor>(5120, tokens);
         qkv[r] = std::make_unique<GuardedBf16Tensor>(2560, tokens);
         z[r] = std::make_unique<GuardedBf16Tensor>(1536, tokens);
@@ -169,6 +172,7 @@ int run_projection(const ExecutionContext& ec, QType type, int tokens) {
         qkv_view[r] = qkv[r]->tensor();
         z_view[r] = z[r]->tensor();
         w_view[r] = weights[r]->view();
+        w_view[r].volta_fp32_scale = fast;
         ws[r] = arenas[r].get();
         CUDA_CHECK(cudaDeviceSynchronize());
     }
@@ -202,9 +206,176 @@ int run_projection(const ExecutionContext& ec, QType type, int tokens) {
     }
     return failures;
 }
+
+// The FP64 oracle decodes the original signed codes/scales and evaluates the entire
+// projection/convolution/SiLU formula. The record Op exposes a BF16 projection consumed by
+// convolution, so that named boundary is rounded in the oracle. The composed snapshot route
+// is an additional exact regression check, including the read-only source-state contract.
+int run_record(const ExecutionContext& ec, int tokens, bool fast) {
+    constexpr int hidden = 5120, channels = 2560, query_rows = 512, value_rows = 1536;
+    const int slots = tokens + 4;
+    std::array<std::unique_ptr<DevicePackedWeight>, 4> weights;
+    std::array<DeviceBuffer, 4> dx, dc, ds, snapshot_state, di, db, dv;
+    std::array<std::unique_ptr<WorkspaceArena>, 4> arenas;
+    std::array<std::unique_ptr<GuardedBf16Tensor>, 4> record, q, k, v, z, sq, sk, sv, sz;
+    std::array<Tensor, 4> x, conv, state, snapshot, initial, base, valid, rec, query, key,
+        value, gate, snapshot_query, snapshot_key, snapshot_value, snapshot_gate;
+    std::array<Weight, 4> w;
+    std::array<WorkspaceArena*, 4> ws;
+    std::array<std::vector<float>, 4> activation, conv_host, state_host;
+    std::array<int, 4> valid_count;
+    const auto bytes = std::max(
+        ops::gdn_input_proj_conv_record_column_parallel_workspace_capacity_bytes(
+            QType::NVFP4, ops::LinearPolicy::A16Only, 1, tokens, tokens, 4),
+        ops::gdn_input_proj_conv_snapshot_column_parallel_workspace_capacity_bytes(
+            QType::NVFP4, ops::LinearPolicy::A16Only, 1, tokens, tokens, 4));
+    for (int r = 0; r < 4; ++r) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
+        quantized_weight::PatternedWeightOptions options;
+        options.weight_scale_divisor = .125F;
+        options.input_scale_divisor = 3.5F;
+        weights[r] = std::make_unique<DevicePackedWeight>(quantized_weight::make_patterned_weight(
+            QType::NVFP4, 4096, hidden, 2211U + r, options), true);
+        activation[r] = make_bf16_activation(hidden, tokens, 2221U + r);
+        conv_host[r].resize(channels * 4);
+        state_host[r].resize(channels * 3 * slots);
+        fill_uniform(conv_host[r], 2231U + r, -.02F, .02F);
+        fill_uniform(state_host[r], 2241U + r, -.05F, .05F);
+        round_to_bf16(conv_host[r]);
+        round_to_bf16(state_host[r]);
+        dx[r] = to_device_bf16(activation[r]);
+        dc[r] = to_device_bf16(conv_host[r]);
+        ds[r] = to_device_bf16(state_host[r]);
+        snapshot_state[r] = to_device_bf16(state_host[r]);
+        di[r] = to_device(std::vector<std::int32_t>{2});
+        db[r] = to_device(std::vector<std::int32_t>{3});
+        valid_count[r] = std::max(1, tokens - r);
+        if (r != 0) {
+            dv[r] = to_device(std::vector<std::int32_t>{valid_count[r]});
+            valid[r] = Tensor(dv[r].p, DType::I32, {1});
+        }
+        record[r] = std::make_unique<GuardedBf16Tensor>(channels, tokens);
+        q[r] = std::make_unique<GuardedBf16Tensor>(query_rows, tokens);
+        k[r] = std::make_unique<GuardedBf16Tensor>(query_rows, tokens);
+        v[r] = std::make_unique<GuardedBf16Tensor>(value_rows, tokens);
+        z[r] = std::make_unique<GuardedBf16Tensor>(value_rows, tokens);
+        sq[r] = std::make_unique<GuardedBf16Tensor>(query_rows, tokens);
+        sk[r] = std::make_unique<GuardedBf16Tensor>(query_rows, tokens);
+        sv[r] = std::make_unique<GuardedBf16Tensor>(value_rows, tokens);
+        sz[r] = std::make_unique<GuardedBf16Tensor>(value_rows, tokens);
+        arenas[r] = std::make_unique<WorkspaceArena>(std::max<std::size_t>(bytes, 256));
+        ws[r] = arenas[r].get();
+        x[r] = Tensor(dx[r].p, DType::BF16, {hidden, tokens, 1});
+        conv[r] = Tensor(dc[r].p, DType::BF16, {channels, 4});
+        state[r] = Tensor(ds[r].p, DType::BF16, {channels, 3, slots});
+        snapshot[r] = Tensor(snapshot_state[r].p, DType::BF16, {channels, 3, slots});
+        initial[r] = Tensor(di[r].p, DType::I32, {1});
+        base[r] = Tensor(db[r].p, DType::I32, {1});
+        rec[r] = Tensor(record[r]->data(), DType::BF16, {channels, tokens, 1});
+        query[r] = q[r]->tensor(); key[r] = k[r]->tensor();
+        value[r] = v[r]->tensor(); gate[r] = z[r]->tensor();
+        snapshot_query[r] = sq[r]->tensor(); snapshot_key[r] = sk[r]->tensor();
+        snapshot_value[r] = sv[r]->tensor(); snapshot_gate[r] = sz[r]->tensor();
+        w[r] = weights[r]->view();
+        w[r].volta_fp32_scale = fast;
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    ops::gdn_input_proj_conv_record_column_parallel(x, w, conv, state, valid, initial,
+        rec, query, key, value, gate, ops::LinearPolicy::A16Only, ws, ec);
+    ops::gdn_input_proj_conv_snapshot_column_parallel(x, w, conv, snapshot, valid, initial,
+        base, snapshot_query, snapshot_key, snapshot_value, snapshot_gate,
+        ops::LinearPolicy::A16Only, ws, ec);
+    int failures = 0;
+    for (int r = 0; r < 4; ++r) {
+        CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
+        ec.dev[r]->synchronize();
+        const std::string label = "TP4 GDN record rank=" + std::to_string(r) +
+            " T=" + std::to_string(tokens) + " fast=" + std::to_string(fast);
+        const ReductionCriterion criterion{3.15e-3, 4.0e-3, 3.2e-3};
+        const auto record_values = record[r]->values();
+        for (auto section : {std::array{0, query_rows}, std::array{query_rows, query_rows},
+                             std::array{2 * query_rows, value_rows}}) {
+            const GuardedBf16Tensor* output = section[0] == 0 ? q[r].get() :
+                section[0] == query_rows ? k[r].get() : v[r].get();
+            const auto actual = output->values();
+            const auto actual_bits = output->bits();
+            for (int t = valid_count[r]; t < tokens; ++t) {
+                if (!std::all_of(actual_bits.begin() + t * section[1],
+                                 actual_bits.begin() + (t + 1) * section[1],
+                                 [](std::uint16_t bits) { return bits == 0; })) {
+                    std::cerr << label << ": masked output is not exact zero\n";
+                    ++failures;
+                }
+            }
+            std::vector<double> expected, observed, expected_record, observed_record;
+            for (int local : sampled_rows(section[1])) {
+                const int row = section[0] + local;
+                double history[3];
+                for (int h = 0; h < 3; ++h) {
+                    history[h] = state_host[r][(2 * 3 + h) * channels + row];
+                }
+                for (int t = 0; t < tokens; ++t) {
+                    const double projected = quantized_weight::dot_fp64(weights[r]->host,
+                        row, activation[r].data() + t * hidden, hidden);
+                    double result = 0;
+                    if (t < valid_count[r]) {
+                        const double represented = bf16_to_f32(
+                            f32_to_bf16(static_cast<float>(projected)));
+                        double sum = conv_host[r][3 * channels + row] * represented;
+                        for (int h = 0; h < 3; ++h) {
+                            sum += conv_host[r][h * channels + row] * history[h];
+                        }
+                        result = sum / (1.0 + std::exp(-sum));
+                        history[0] = history[1]; history[1] = history[2]; history[2] = represented;
+                        expected_record.push_back(projected);
+                        observed_record.push_back(record_values[t * channels + row]);
+                    }
+                    expected.push_back(result);
+                    observed.push_back(actual[t * section[1] + local]);
+                }
+            }
+            failures += compare(label + " conv", observed, expected, criterion);
+            failures += compare(label + " record", observed_record, expected_record, criterion);
+        }
+        failures += compare(label + " z", gather_rows(z[r]->values(), value_rows, 0,
+            value_rows, tokens), projection_oracle(weights[r]->host, channels,
+            value_rows, activation[r], hidden, tokens), criterion);
+        for (const auto pair : {std::pair{q[r].get(), sq[r].get()},
+                               std::pair{k[r].get(), sk[r].get()},
+                               std::pair{v[r].get(), sv[r].get()},
+                               std::pair{z[r].get(), sz[r].get()}}) {
+            if (pair.first->bits() != pair.second->bits()) {
+                std::cerr << label << ": composed and fused output bits differ\n";
+                ++failures;
+            }
+            failures += pair.first->verify_guards(label);
+            failures += pair.first->verify_fully_written(label);
+        }
+        const auto history = from_device<std::uint16_t>(snapshot_state[r],
+                                                       state_host[r].size());
+        const auto bits = record[r]->bits();
+        for (int t = 0; t < valid_count[r]; ++t) {
+            if (!std::equal(bits.begin() + t * channels, bits.begin() + (t + 1) * channels,
+                            history.begin() + ((3 + t) * 3 + 2) * channels)) {
+                std::cerr << label << ": record and snapshot newest history differ\n";
+                ++failures;
+            }
+        }
+        failures += record[r]->verify_guards(label);
+        failures += verify_preserved(label, ds[r], bf16_bits(state_host[r]));
+        failures += verify_preserved(label, dx[r], bf16_bits(activation[r]));
+        failures += weights[r]->verify_preserved(label);
+        if (ws[r]->used() != 0 || ws[r]->peak_used() > bytes) { ++failures; }
+    }
+    return failures;
+}
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool nvfp4_decode = argc == 2 && std::string_view(argv[1]) == "--nvfp4-decode";
+    const bool controls_only = argc == 2 && std::string_view(argv[1]) == "--controls-only";
+    const bool gdn_decode = argc == 2 && std::string_view(argv[1]) == "--gdn-decode";
+    if (argc != 1 && !nvfp4_decode && !controls_only && !gdn_decode) { return 2; }
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count < 4) {
         std::cout << "SKIP: four CUDA devices required\n";
@@ -213,7 +384,36 @@ int main() {
     try {
         ExecutionContext ec({0, 1, 2, 3});
         int failures = 0;
-        for(const int tokens:{1,4,128,2560}) {failures+=run_control(ec,tokens);}
+        if (gdn_decode) {
+            for (bool fast : {false, true}) {
+                for (int tokens : {1, 2, 4, 5, 6, 8}) {
+                    failures += run_projection(ec, QType::NVFP4, tokens, true, fast);
+                    if (tokens >= 2) { failures += run_record(ec, tokens, fast); }
+                }
+            }
+            std::cout << (failures ? "FAIL" : "OK")
+                      << " TP4 prepacked GDN projection/record (FP64 and composed checks)\n";
+            return failures ? 1 : 0;
+        }
+        if (nvfp4_decode) {
+            for (bool fast : {false, true}) {
+                for (int tokens : {1, 4, 5, 6}) {
+                    failures += run_projection(ec, QType::NVFP4, tokens, true, fast);
+                    failures += run_attention(ec, QType::NVFP4, tokens, true, fast);
+                }
+            }
+            std::cout << (failures ? "FAIL" : "OK")
+                      << " TP4 prepacked NVFP4 normal/fast decode projections\n";
+            return failures ? 1 : 0;
+        }
+        for (const int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 128, 2560}) {
+            failures += run_control(ec, tokens);
+        }
+        if (controls_only) {
+            std::cout << (failures ? "FAIL" : "OK")
+                      << " TP4 BF16 controls (independent FP64 oracle)\n";
+            return failures ? 1 : 0;
+        }
         for (const auto type : {QType::NVFP4, QType::FP8_E4M3FN_ROW_BF16S,
                                 QType::FP8_E4M3FN_BLOCK128_BF16S}) {
             for (const int tokens : {1, 4, 128}) {

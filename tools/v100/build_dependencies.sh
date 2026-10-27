@@ -6,7 +6,7 @@ repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 deps_dir=${NINFER_DEPS_DIR:-"${repo_dir}/build/_deps"}
 prefix="${deps_dir}/install"
 sources="${deps_dir}/sources"
-build_jobs=${NINFER_BUILD_JOBS:-4}
+build_jobs=${NINFER_BUILD_JOBS:-2}
 mkdir -p "${prefix}" "${sources}"
 
 fetch_source() {
@@ -52,6 +52,15 @@ if [[ ! -f "${prefix}/lib/pkgconfig/libcurl.pc" || ! -f "${prefix}/include/curl/
         -DCURL_USE_LIBPSL=OFF -DCURL_DISABLE_LDAP=ON -DCURL_DISABLE_LDAPS=ON
     cmake --build "${deps_dir}/curl-build" -j"${build_jobs}"
     cmake --install "${deps_dir}/curl-build"
+fi
+
+# Single-threaded BLAS leaves CPU headroom and never creates background decode workers.
+fetch_source OpenBLAS-0.3.30 https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.30/OpenBLAS-0.3.30.tar.gz
+if [[ ! -f "${prefix}/lib/libopenblas.a" ]]; then
+    make -C "${sources}/OpenBLAS-0.3.30" -j"${build_jobs}" \
+        DYNAMIC_ARCH=1 USE_THREAD=0 NOFORTRAN=1 NO_LAPACK=1 NO_SHARED=1
+    make -C "${sources}/OpenBLAS-0.3.30" PREFIX="${prefix}" \
+        USE_THREAD=0 NOFORTRAN=1 NO_LAPACK=1 NO_SHARED=1 install
 fi
 
 PKG_CONFIG_PATH="${prefix}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}" \

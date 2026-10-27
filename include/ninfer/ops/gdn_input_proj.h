@@ -253,7 +253,7 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
-// --- Tensor-parallel split form (tp == 2) -------------------------------------------------------
+// --- Tensor-parallel split form (tp == 2 or SM70 tp == 4) ---------------------------------------
 //
 // DESIGN NOTE. ShardPlan's real interior layout for `gdn/query_key_value_z`
 // (src/targets/qwen3_6_27b/impl/load/bindings.cpp, `plan_for`'s "gdn/query_key_value_z" branch) is
@@ -279,6 +279,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
 // `device_rank * 8` (Q/K) or `device_rank * 24` (V/Z) to the shard-local row's head number
 // (row / 128), the same convention attn_input_proj states for its own output. No cross-device
 // traffic occurs before or during this Op -- gdn_input_proj is column-parallel only, no allreduce.
+// SM70 TP4 admits A16 NVFP4 and FP8 row/block-128 shards [4096,5120], with Q/K/V/Z extents
+// 512/512/1536/1536. It writes qkv [2560,T] and z [1536,T], retaining the same section order
+// and head-local ownership. NVFP4 retains its normal/fast arithmetic profile and original codes,
+// scales and FP32 activation divisor.
 //
 // FORMATS REGISTERED: NVFP4 (A16Only/AllowA4, Nvfp4GdnInputTp2ColumnGeometry, shared with
 // ops::linear's own registry in src/ops/linear/nvfp4/nvfp4_config.h), FP8_E4M3FN_ROW_BF16S
@@ -312,7 +316,7 @@ void gdn_input_proj_column_parallel(std::span<const Tensor> x,
                                     std::span<const Tensor> qkv, std::span<const Tensor> z,
                                     const ExecutionContext& ec);
 
-// --- Tensor-parallel split forms of the fused projection+conv1d+SiLU pair (tp == 2) -------------
+// --- Tensor-parallel split forms of the fused projection+conv1d+SiLU pair -----------------------
 //
 // DESIGN NOTE. These two Ops are reached only from Phase::Verify (the MTP / speculative-verify
 // path), so their split is the composition of the bare projection's column shard (above) with the
@@ -331,20 +335,19 @@ void gdn_input_proj_column_parallel(std::span<const Tensor> x,
 // repacks between the projection and the convolution.
 // Per-device operand shapes: x [5120,W,B], conv_weight [5120,4], conv_states [5120,3,Slots],
 // query/key [1024,W,B], value [3072,W,B], z [3072,W,B], conv_record [5120,T,B].
+// SM70 TP4 A16 NVFP4/FP8 uses half these per-rank channel extents: conv_weight [2560,4],
+// conv_states [2560,3,Slots], query/key [512,W,B], value/z [1536,W,B], record [2560,W,B].
 //
 // NO COLLECTIVE. The convolution is depthwise and the projection is column-parallel, so a device's
 // 5120 channels never mix with the peer's. Both Ops are entirely local; the GDN block's one and
 // only all-reduce is the row-parallel `gdn/output` projection at the very end.
 //
-// ROUTE. The shard always takes the COMPOSED route (projection shard -> BF16 projected plane ->
-// the channel-generic projected-conv kernel), never a fused per-format snapshot kernel. The fused
-// NVFP4/FP8/W8 snapshot kernels bake the tp1 row profile into compile-time constants, and
-// instantiating a parallel exact set at the shard profile is kernel work, not the registry work
-// a shard geometry otherwise needs; the composed route is the same arithmetic in the same order at
-// one extra kernel launch and one BF16 staging round for query/key/value. This is the one route
-// fall-off the conv snapshot/record shards carry, and it is a performance item only: FP8 is
-// bit-exact against the tp1 reference at every case covered by ninfer_mtp_split_test, and NVFP4
-// is bit-exact wherever the tp1 path is also composed.
+// NUMERIC. The record route publishes the BF16 projection consumed by the convolution and leaves
+// source state unchanged. On SM70, narrow single-row prepacked NVFP4 shards can fuse projection,
+// record and convolution while retaining that BF16 boundary; other routes compose the projection
+// with the channel-generic convolution. Each valid prefix is chronological, query/key/value are
+// exactly zero in masked tails, and z is projected for every physical column. Snapshot routes
+// publish the same per-column history into caller-selected slots.
 //
 // FORMATS REGISTERED: NVFP4 (A16Only/AllowA4), FP8_E4M3FN_ROW_BF16S (A16Only/AllowA8) and the
 // Q4G64_F16S/Q5G64_F16S split-storage two-weight form -- exactly the three

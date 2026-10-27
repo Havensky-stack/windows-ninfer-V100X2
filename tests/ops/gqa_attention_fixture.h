@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -496,58 +497,71 @@ inline double cache_value(const HostCache& cache, bool key, std::int32_t head, s
 
 inline std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
                                     const std::vector<std::int32_t>& positions,
-                                    std::span<const std::int32_t> selected_pages = {}) {
+                                    std::span<const std::int32_t> selected_pages = {},
+                                    unsigned workers = 1) {
     const Geometry& geometry  = cache.geometry;
     const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
                                static_cast<std::size_t>(geometry.q_heads) *
                                static_cast<std::size_t>(tokens));
 
-    std::vector<double> scores(static_cast<std::size_t>(positions.back()) + 1);
-    std::vector<double> probabilities(scores.size());
+    workers = std::clamp(workers, 1U, std::min(4U, static_cast<unsigned>(geometry.q_heads)));
     const auto selected = [&](std::int32_t position) {
         return selected_pages.empty() || std::find(selected_pages.begin(), selected_pages.end(),
             position / kPagedKVPageSize) != selected_pages.end();
     };
-    for (std::int32_t token = 0; token < tokens; ++token) {
-        const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
-        for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
-            const std::int32_t kv_head = q_head / geometry.query_group();
-            double max_score           = -std::numeric_limits<double>::infinity();
-            for (std::int32_t position = 0; position < visible; ++position) {
-                if (!selected(position)) { continue; }
-                double dot = 0.0;
-                for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
-                           cache_value(cache, true, kv_head, position, d);
-                }
-                const double score = dot * static_cast<double>(kAttentionScale);
-                scores[static_cast<std::size_t>(position)] = score;
-                max_score                                  = std::max(max_score, score);
-            }
-
-            double sum = 0.0;
-            for (std::int32_t position = 0; position < visible; ++position) {
-                if (!selected(position)) { probabilities[position] = 0; continue; }
-                const double probability =
-                    std::exp(scores[static_cast<std::size_t>(position)] - max_score);
-                probabilities[static_cast<std::size_t>(position)] = probability;
-                sum += probability;
-            }
-            for (std::int32_t position = 0; position < visible; ++position) {
-                probabilities[static_cast<std::size_t>(position)] /= sum;
-            }
-
-            for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                double value = 0.0;
+    // Heads own disjoint outputs. Keep the complete scalar FP64 reduction of
+    // each head unchanged; only schedule independent heads on bounded workers.
+    const auto evaluate = [&](unsigned worker) {
+        std::vector<double> scores(static_cast<std::size_t>(positions.back()) + 1);
+        std::vector<double> probabilities(scores.size());
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+            for (std::int32_t q_head = static_cast<std::int32_t>(worker); q_head < geometry.q_heads;
+                 q_head += static_cast<std::int32_t>(workers)) {
+                const std::int32_t kv_head = q_head / geometry.query_group();
+                double max_score           = -std::numeric_limits<double>::infinity();
                 for (std::int32_t position = 0; position < visible; ++position) {
-                    value += probabilities[static_cast<std::size_t>(position)] *
-                             cache_value(cache, false, kv_head, position, d);
+                    if (!selected(position)) { continue; }
+                    double dot = 0.0;
+                    for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                        dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
+                               cache_value(cache, true, kv_head, position, d);
+                    }
+                    const double score = dot * static_cast<double>(kAttentionScale);
+                    scores[static_cast<std::size_t>(position)] = score;
+                    max_score                                  = std::max(max_score, score);
                 }
-                output[q_index(geometry, q_head, d, token)] = value;
+
+                double sum = 0.0;
+                for (std::int32_t position = 0; position < visible; ++position) {
+                    if (!selected(position)) { probabilities[position] = 0; continue; }
+                    const double probability =
+                        std::exp(scores[static_cast<std::size_t>(position)] - max_score);
+                    probabilities[static_cast<std::size_t>(position)] = probability;
+                    sum += probability;
+                }
+                for (std::int32_t position = 0; position < visible; ++position) {
+                    probabilities[static_cast<std::size_t>(position)] /= sum;
+                }
+
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    double value = 0.0;
+                    for (std::int32_t position = 0; position < visible; ++position) {
+                        value += probabilities[static_cast<std::size_t>(position)] *
+                                 cache_value(cache, false, kv_head, position, d);
+                    }
+                    output[q_index(geometry, q_head, d, token)] = value;
+                }
             }
         }
+    };
+    std::vector<std::future<void>> pending;
+    for (unsigned worker = 1; worker < workers; ++worker) {
+        pending.push_back(std::async(std::launch::async, evaluate, worker));
     }
+    evaluate(0);
+    for (auto& task : pending) { task.get(); }
     return output;
 }
 

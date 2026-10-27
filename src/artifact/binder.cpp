@@ -333,9 +333,13 @@ void Binder::retain_on_host(ObjectHandle handle) {
     if (resource == nullptr) {
         throw ArtifactError("tensor cannot be retained as a host resource");
     }
+    materialize_on_host(handle);
+}
+
+void Binder::materialize_on_host(ObjectHandle handle) {
     if (planned_[handle.index]) {
         throw ArtifactError("artifact object has more than one materialization placement: " +
-                            std::string(resource->name));
+                            std::visit([](const auto& object) { return std::string(object.name); }, descriptor(handle)));
     }
     materialization_.host_objects.push_back(HostMaterialization{handle});
     planned_[handle.index] = true;

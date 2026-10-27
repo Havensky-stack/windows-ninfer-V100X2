@@ -4,6 +4,9 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
+#ifdef NINFER_VOLTA_BUILD
+#include "ops/linear/nvfp4/nvfp4_prepack_sm70.h"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -245,7 +248,8 @@ void validate_profile(const Profile& profile) {
 } // namespace
 
 int run_profile(std::string_view label, const Profile& profile,
-                std::span<const std::int32_t> token_cases) {
+                std::span<const std::int32_t> token_cases,
+                bool volta_prepacked, bool volta_fp32_scale) {
     validate_profile(profile);
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     if (!cuda_available()) {
@@ -275,7 +279,19 @@ int run_profile(std::string_view label, const Profile& profile,
 
     test::GuardedDeviceBuffer device_weight(host_weight.payload.size());
     device_weight.copy_from_host(host_weight.payload.data(), host_weight.payload.size());
-    const Weight weight = host_weight.device_weight(device_weight.data());
+    Weight weight = host_weight.device_weight(device_weight.data());
+    std::vector<std::uint8_t> expected_device_weight = host_weight.payload;
+#ifdef NINFER_VOLTA_BUILD
+    if (volta_prepacked) {
+        ops::detail::nvfp4_prepack_qpn_sm70(weight);
+        weight.volta_fp32_scale = volta_fp32_scale;
+        device_weight.copy_to_host(expected_device_weight.data(), expected_device_weight.size());
+    }
+#else
+    if (volta_prepacked || volta_fp32_scale) {
+        throw std::invalid_argument("linear_swiglu: Volta profile requires an SM70 build");
+    }
+#endif
 
     test::GuardedDeviceBuffer device_activation(host_activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(host_activation.data(),
@@ -327,12 +343,14 @@ int run_profile(std::string_view label, const Profile& profile,
         verify_unchanged(std::string(label) + " activation", device_activation,
                          host_activation.data(), host_activation.size() * sizeof(std::uint16_t));
     failures += verify_unchanged(std::string(label) + " weight", device_weight,
-                                 host_weight.payload.data(), host_weight.payload.size());
+                                 expected_device_weight.data(), expected_device_weight.size());
     return failures;
 }
 
 int run_column_parallel_profile(std::string_view label, const Profile& shard_profile,
-                                std::span<const std::int32_t> token_cases) {
+                                std::span<const std::int32_t> token_cases,
+                                bool volta_prepacked, bool volta_fp32_scale, bool fp16_image,
+                                bool fp16_output_image) {
     Profile parent_profile = shard_profile;
     const int tp = 34816 / shard_profile.gate_up_rows;
     if (tp != 2 && tp != 4) { throw std::invalid_argument("LinearSwiGLU split: invalid width"); }
@@ -353,7 +371,9 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
     }
     struct Rank {
         quantized_weight::PackedWeight packed;
-        std::vector<std::uint16_t> activation;
+        std::vector<std::uint16_t> activation, image;
+        std::vector<std::uint8_t> expected_weight;
+        Weight weight_view;
         std::vector<double> expected;
         std::unique_ptr<test::GuardedDeviceBuffer> weight;
         std::unique_ptr<test::GuardedDeviceBuffer> x;
@@ -381,8 +401,25 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
             profile, data.packed, data.activation, maximum_tokens);
         data.weight = std::make_unique<test::GuardedDeviceBuffer>(data.packed.payload.size());
         data.weight->copy_from_host(data.packed.payload.data(), data.packed.payload.size());
-        data.x = std::make_unique<test::GuardedDeviceBuffer>(data.activation.size() * 2);
-        data.x->copy_from_host(data.activation.data(), data.activation.size() * 2);
+        data.weight_view = data.packed.device_weight(data.weight->data());
+#ifdef NINFER_VOLTA_BUILD
+        if (volta_prepacked) {
+            ops::detail::nvfp4_prepack_qpn_sm70(data.weight_view);
+            data.weight_view.volta_fp32_scale = volta_fp32_scale;
+        }
+#endif
+        data.expected_weight.resize(data.packed.payload.size());
+        data.weight->copy_to_host(data.expected_weight.data(), data.expected_weight.size());
+        data.image = data.activation;
+        if (fp16_image) for (auto& v : data.image) {
+            const float represented = test::bf16_to_f32(v);
+            v = quantized_weight::detail::f32_to_f16(represented);
+            if (quantized_weight::detail::f16_to_f32(v) != represented) {
+                throw std::logic_error("FP16 image fixture must preserve its BF16 oracle input");
+            }
+        }
+        data.x = std::make_unique<test::GuardedDeviceBuffer>(data.image.size() * 2);
+        data.x->copy_from_host(data.image.data(), data.image.size() * 2);
         data.workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(capacity, 256));
     }
     int failures = 0;
@@ -396,14 +433,34 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
             auto& data = ranks[rank];
             data.output = std::make_unique<test::GuardedDeviceBuffer>(elements * 2);
             data.output->fill(0xff);
-            x[rank] = Tensor(data.x->data(), DType::BF16, {shard_profile.input_rows, tokens});
+            x[rank] = Tensor(data.x->data(), fp16_image ? DType::FP16 : DType::BF16,
+                             {shard_profile.input_rows, tokens});
             output[rank] = Tensor(data.output->data(), DType::BF16,
                                   {shard_profile.output_rows, tokens});
-            weights[rank] = data.packed.device_weight(data.weight->data());
+            weights[rank] = data.weight_view;
             data.workspace->reset();
             data.workspace->reset_peak();
             workspace[rank] = data.workspace.get();
             cuda_check(cudaDeviceSynchronize(), "retire split staging");
+        }
+        std::array<std::vector<std::uint16_t>, 4> expected_image;
+        if (fp16_output_image) {
+            ops::linear_swiglu_column_parallel(std::span(x).first(tp), std::span(weights).first(tp),
+                                              std::span(output).first(tp), policy,
+                                              std::span(workspace).first(tp), ec);
+            for (int rank = 0; rank < tp; ++rank) {
+                cuda_check(cudaSetDevice(ec.dev[rank]->device), "select BF16 image reference rank");
+                cuda_check(cudaStreamSynchronize(ec.dev[rank]->stream), "complete BF16 reference");
+                expected_image[rank].resize(elements);
+                ranks[rank].output->copy_to_host(expected_image[rank].data(), elements * 2);
+                for (auto& value : expected_image[rank]) {
+                    value = quantized_weight::detail::f32_to_f16(test::bf16_to_f32(value));
+                }
+                output[rank].dtype = DType::FP16;
+                ranks[rank].output->fill(0xff);
+                ranks[rank].workspace->reset_peak();
+                cuda_check(cudaDeviceSynchronize(), "retire FP16 output staging");
+            }
         }
         ops::linear_swiglu_column_parallel(std::span(x).first(tp), std::span(weights).first(tp),
                                           std::span(output).first(tp), policy,
@@ -416,8 +473,19 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
             auto& data = ranks[rank];
             const std::string name = std::string(label) + " T=" + std::to_string(tokens) +
                                      " rank=" + std::to_string(rank);
-            failures += compare_output(name, read_bf16_output(*data.output, elements),
-                                        data.expected.data(), ActivationCompute::A16);
+            auto actual = read_bf16_output(*data.output, elements);
+            if (fp16_output_image) {
+                std::vector<std::uint16_t> bits(elements);
+                data.output->copy_to_host(bits.data(), elements * 2);
+                if (bits != expected_image[rank]) {
+                    std::cerr << name << ": BF16-rounded FP16 output image differs\n";
+                    ++failures;
+                }
+                for (std::size_t i = 0; i < elements; ++i) {
+                    actual[i] = quantized_weight::detail::f16_to_f32(bits[i]);
+                }
+            }
+            failures += compare_output(name, actual, data.expected.data(), ActivationCompute::A16);
             failures += data.output->verify_guards(name);
             if (data.workspace->used() != 0 || data.workspace->peak_used() != exact) {
                 std::cerr << name << ": exact workspace query/execution high-water mismatch\n";
@@ -428,9 +496,9 @@ int run_column_parallel_profile(std::string_view label, const Profile& shard_pro
     for (int rank = 0; rank < tp; ++rank) {
         cuda_check(cudaSetDevice(ec.dev[rank]->device), "select split device");
         auto& data = ranks[rank];
-        failures += verify_unchanged(label, *data.weight, data.packed.payload.data(),
-                                     data.packed.payload.size());
-        failures += verify_unchanged(label, *data.x, data.activation.data(), data.activation.size() * 2);
+        failures += verify_unchanged(label, *data.weight, data.expected_weight.data(),
+                                     data.expected_weight.size());
+        failures += verify_unchanged(label, *data.x, data.image.data(), data.image.size() * 2);
         data.output.reset();
         data.workspace.reset();
         data.x.reset();

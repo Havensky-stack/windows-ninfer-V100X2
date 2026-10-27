@@ -9,6 +9,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
 #include "ninfer/ops/residual_add.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/silu_mul.h"
 
 #include <algorithm>
@@ -69,12 +70,14 @@ constexpr std::size_t kMinimumLeafWorkspaceBytes = 1;
 
 QType tp4_projection_type(WeightsProfile profile) {
     switch (profile) {
+    case WeightsProfile::Qwen38QuasarNvfp4:
+        return QType::NVFP4;
     case WeightsProfile::Qwen38Nvfp4:
         return QType::FP8_E4M3FN_ROW_BF16S;
     case WeightsProfile::Qwen38Fp8:
         return QType::FP8_E4M3FN_BLOCK128_BF16S;
     default:
-        throw std::invalid_argument("TP4 text projection requires Qwen3.8 NVFP4 or native FP8");
+        throw std::invalid_argument("TP4 text projection requires Qwen3.8 NVFP4, QUASAR NVFP4 or native FP8");
     }
 }
 
@@ -780,9 +783,10 @@ void Variant::attention_output_projection(std::span<const Tensor> attention,
                                           std::span<const Tensor> residual,
                                           std::span<const Tensor> staging, qwen3_6::TextPhase,
                                           std::span<WorkspaceArena* const> workspace,
-                                          const ExecutionContext& ec, const ops::PeerEvents& ev) {
+                                          const ExecutionContext& ec, const ops::PeerEvents& ev,
+                                    const ops::ReplicatedRmsNorm* norm) {
     ops::linear_add_row_parallel(attention, weight, residual, staging, text_policy(weight[0]),
-                                 workspace, ec, ev);
+                                 workspace, ec, ev, norm);
 }
 
 void Variant::gdn_input_projection(std::span<const Tensor> hidden,
@@ -846,13 +850,19 @@ void Variant::gdn_output_projection(std::span<const Tensor> hidden,
                                     std::span<const Tensor> residual,
                                     std::span<const Tensor> staging, qwen3_6::TextPhase,
                                     std::span<WorkspaceArena* const> workspace,
-                                    const ExecutionContext& ec, const ops::PeerEvents& ev) {
+                                    const ExecutionContext& ec, const ops::PeerEvents& ev,
+                                    const ops::ReplicatedRmsNorm* norm) {
     if (weight[0].qtype == QType::GGML_K) {
         ops::ggml_k_gdn_output(hidden, weight, residual, staging, workspace, ec, ev);
+        if (norm != nullptr) for_each_rank(ec, [&](int rank) {
+            Tensor normalized = norm->output[rank];
+            ops::rmsnorm(residual[rank], norm->weight[rank], norm->eps, norm->unit_offset,
+                         normalized, ec.dev[rank]->stream);
+        });
         return;
     }
     ops::linear_add_row_parallel(hidden, weight, residual, staging, text_policy(weight[0]),
-                                 workspace, ec, ev);
+                                 workspace, ec, ev, norm);
 }
 
 void Variant::gdn_control_projection(std::span<const Tensor> hidden,
@@ -885,12 +895,26 @@ void Variant::gdn_control_projection(std::span<const Tensor> hidden,
         workspace, g, beta, ec);
 }
 
+DType Variant::gdn_output_input_dtype(const Weight& w, int tp, int tokens) {
+    return tp == 4 && tokens >= 1 && tokens <= 8 && w.qtype == QType::NVFP4 &&
+           w.layout == QuantLayout::VoltaQpnPrepacked && w.n == 5120 && w.k == 1536
+               ? DType::FP16 : DType::BF16;
+}
+
+DType Variant::post_mixer_input_dtype(const PostMixerWeights& w, int tp, int tokens) {
+    return tp == 4 && tokens >= 1 && tokens <= 8 &&
+           w.gate_up.qtype == QType::NVFP4 &&
+           w.gate_up.layout == QuantLayout::VoltaQpnPrepacked &&
+           w.gate_up.n == 8704 && w.gate_up.k == 5120 ? DType::FP16 : DType::BF16;
+}
+
 void Variant::post_mixer(std::span<const Tensor> hidden,
                          std::span<const PostMixerWeights* const> w,
                          std::span<const Tensor> residual,
                          std::span<const Tensor> staging, qwen3_6::TextPhase,
                          std::span<WorkspaceArena* const> workspace,
-                         const ExecutionContext& ec, const ops::PeerEvents& ev) {
+                         const ExecutionContext& ec, const ops::PeerEvents& ev,
+                         const ops::ReplicatedRmsNorm* norm) {
     // The activation width is this rank's own gate/up shard, read off the weight rather than
     // assumed: `gate_up` is [2 * intermediate_shard, hidden], so half its rows is the shard.
     const std::int32_t shard_intermediate = w[0]->gate_up.n / 2;
@@ -902,13 +926,20 @@ void Variant::post_mixer(std::span<const Tensor> hidden,
     std::array<Tensor, kMaximumExecutionDevices> activation{};
     auto scopes = workspace_scopes(workspace);
     for (std::size_t rank = 0; rank < ec.device_count; ++rank) {
+        const bool fp16_activation = norm && norm->weight.size() == 4 &&
+            norm->output.size() == 4 && ev.packet_storage(0) &&
+            post_mixer_input_dtype(*w[rank], ec.device_count, hidden[rank].ne[1]) == DType::FP16 &&
+            w[rank]->down.qtype == QType::NVFP4 &&
+            w[rank]->down.layout == QuantLayout::VoltaQpnPrepacked &&
+            w[rank]->down.n == 5120 && w[rank]->down.k == 4352;
+        const auto activation_dtype = fp16_activation ? DType::FP16 : DType::BF16;
         activation[rank] =
-            workspace[rank]->alloc(DType::BF16, {shard_intermediate, hidden[0].ne[1]});
+            workspace[rank]->alloc(activation_dtype, {shard_intermediate, hidden[0].ne[1]});
     }
     ops::linear_swiglu_column_parallel(hidden, active(weight_shards(w, &PostMixerWeights::gate_up, ec), ec), active(activation, ec),
                                        text_policy(w[0]->gate_up), workspace, ec);
     ops::linear_add_row_parallel(active(activation, ec), active(weight_shards(w, &PostMixerWeights::down, ec), ec), residual, staging,
-                                 text_policy(w[0]->down), workspace, ec, ev);
+                                 text_policy(w[0]->down), workspace, ec, ev, norm);
 }
 
 void Variant::gdn_input_projection_record(

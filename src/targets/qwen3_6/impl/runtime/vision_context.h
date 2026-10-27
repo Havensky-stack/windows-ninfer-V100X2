@@ -49,6 +49,7 @@ public:
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
                                                               std::uint32_t max_segments);
     void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
+    [[nodiscard]] bool is_cpu() const noexcept { return host_ != nullptr; }
 
 private:
     struct BlockW {
@@ -76,6 +77,7 @@ private:
     };
 
     DeviceContext& ctx_;
+    const qwen3_6::HostVisionWeights* host_ = nullptr;
     const Weight* patch_embed_      = nullptr;
     const Tensor* patch_embed_bias_ = nullptr;
     const Tensor* position_embed_   = nullptr;
@@ -109,6 +111,7 @@ private:
     std::optional<std::uint32_t> active_item_;
     std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
+    double host_seconds_ = 0.0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule

@@ -41,12 +41,13 @@ template's default. An artifact whose template does not expose effort rejects th
 
 ## Startup memory profile
 
-`--tp 4 --devices 0,1,2,3` selects the new Qwen3.8-27B NVFP4/native FP8 Text/MTP route on
-SM70. NVFP4 four-card model/state and occupied-context results are recorded in
-[`performance.md`](performance.md); native FP8 TP4 qualification and the measured occupancy
+`--tp 4 --devices 0,1,2,3` selects the Qwen3.8-27B official NVFP4, experimental QUASAR NVFP4,
+or native FP8 Text/MTP route on SM70. Four-card model/state and occupied-context results are
+recorded in [`tp4.md`](tp4.md); native FP8 TP4 qualification and the measured occupancy
 and capacity controls are complete.
-The native `qwen3.8-27b/fp8` identity requires TP4; neither TP4 profile supports Vision or
-DFlash. Existing TP2 qualification and results remain separate.
+The native `qwen3.8-27b/fp8` identity requires TP4. TP4 excludes Vision and DFlash.
+SM70 TP4 admits the default-off long-attention profile and, for QUASAR, fast decode.
+Existing TP2 qualification and results remain separate.
 
 GPU residency is frozen when the Engine starts:
 
@@ -56,7 +57,8 @@ GPU residency is frozen when the Engine starts:
 - a speculative backend with the full proposal head omits the optimized proposal head;
 - Vision is disabled by default, omitting its weights, Vision scratch phase, and frozen
   request-transient allocation;
-- `--vision` loads those allocations and enables image/video input.
+- `--vision` enables image/video input. `--vision-device gpu` (default) loads those GPU allocations;
+  `--vision-device cpu` instead keeps the tower in host RAM and reserves only the GPU embedding transient.
 
 The complete `.ninfer` inventory is still validated. These choices are not lazy loading: a
 text-only Engine rejects media and cannot enable Vision later. DFlash and Vision are mutually
@@ -65,10 +67,11 @@ exclusive. The default speculative and Vision settings produce the smallest resi
 default `32768`) and startup Vision reservations; the prepared text-plus-media prompt still must
 fit `--max-context`. On memory-constrained GPUs a smaller visual budget allows a larger text
 context without promising to process images or videos beyond that separate budget.
-TP2 Vision is experimental on the two 16 GB V100 profile. Its visual-prefix bridge integration
-test currently fails on that host; see [test status](../tests/README.md#experimental-tp2-vision-status).
-CLI processes do not share Engine prefix state. For a persistent Vision server, the recommended
-profile uses the server option `--no-prefix-reuse` to avoid the unqualified multimodal cache path.
+QUASAR TP2/MTP4 passes the existing Vision/prefix integration test at 4096 capacity, including
+the visual-prefix bridge. The older official-NVFP4 cached/cold discrepancy remains separate;
+see [test status](../tests/README.md#experimental-tp2-vision-status). CLI processes do not share
+Engine prefix state. The supplied Vision server preset starts with `--no-prefix-reuse`; QUASAR
+users may enable prefix reuse manually.
 
 ## Structured messages
 
@@ -184,11 +187,14 @@ are a measured choice, not the 35B-A3B semantic limit.
 | `--pipeline-chunks N` | PP prefill wave of `1..8` chunks; `1` is the serial control | `8` |
 | `--devices A,B` | exactly `tp * pp` distinct CUDA device indices; required for parallel execution | `--device` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/PP1, one active request, INT8 KV, Text/None/MTP only; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
+| `--volta-long-attention` | experimental complete-history attention arithmetic; SM70 27B TP2/TP4, PP1, 1–8 active requests, INT8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
+| `--vision-device gpu\|cpu` | visual encoder placement; requires `--vision` for CPU; CPU weights remain in host RAM, final BF16 embeddings upload; may change numerical outputs | `gpu` |
 | `--vision-max-tokens N` | merged visual tokens per prompt and startup Vision reservation, independent of text context (`1..32768`) | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
@@ -249,7 +255,7 @@ Tensor-parallel execution is implemented for the 27B execution package (`qwen3.6
 `qwen3.8-27b`, either weight profile). `qwen3.6-35b-a3b` has no tensor-parallel path and rejects
 `--tp 2` at startup. `--spec mtp` and optional Qwen3.8 DFlash2 support `--tp 2`, including
 compatible-prefix reuse in a resident Engine. Experimental `--vision` is also available at TP2
-for artifacts with execution-qualified Vision weights; QUASAR and GGUF-derived Q4_K_M reject it.
+for artifacts with execution-qualified Vision weights; QUASAR NVFP4 admits TP2 None/MTP; GGUF-derived Q4_K_M rejects it.
 Both suffix prefill and exact-frontier
 sampling restore the complete state on both devices. The HTTP server enables reuse by default;
 separate CLI processes do not share a cache.
@@ -331,3 +337,28 @@ growth.
 
 All weight, sequence, workspace, request-transient, and graph allocations are released when the
 Engine is destroyed.
+
+## CPU visual encoding (0.1.2)
+
+Use `--vision --vision-device cpu` to trade visual encoding latency and host RAM for lower GPU
+residency. Source codes and FP16 group scales are decoded exactly to one FP32 host copy on load;
+there is no new weight quantization. CPU Ops retain BF16 activation/result boundaries, 2-D RoPE,
+all causally permitted language keys and all keys within each temporal vision segment. CPU and
+CUDA reduction/GEMM arithmetic are not bit-identical, so embeddings and output can differ.
+No new GPQA or task-accuracy percentage is available.
+
+CPU visual encoding runs in the submitting thread after the bounded ingress slot is reserved,
+before the request joins the GPU FIFO. It reads immutable weights and does not hold the GPU
+execution lock; other requests may continue decoding. Explicit submission deadlines and cancellation also bound
+CPU work; the ordinary Engine default queue timeout begins after encoding. Request references are
+freed after their GPU consumers finish. A Program-local immutable embedding cache retains at most 128 MiB in FIFO order, keyed by media digest, modality and grid;
+repeated images do not rerun the CPU tower. This cache is separate from the text KV history budget. Large media still consumes host scratch
+space in addition to resident tower weights. CPU placement does not enable Vision on unsupported
+artifacts, TP4, PP2, DFlash or sparse RAM-KV.
+For serving large CPU media, increase `--pending-timeout-ms` (for example `600000`); the server
+default of 30 seconds still covers preparation and can expire during CPU encoding. GUI/TUI select
+600000 ms when CPU Vision is enabled. The deadline is finite and can still reject oversized work.
+
+`--volta-long-attention` can be combined with GPU or CPU Vision on SM70 27B TP2/PP1, complete
+INT8 group-64 KV, None/MTP and experimental concurrency 1–8. It remains default-off and changes
+floating-point association. `--volta-fast-decode` remains incompatible with Vision.

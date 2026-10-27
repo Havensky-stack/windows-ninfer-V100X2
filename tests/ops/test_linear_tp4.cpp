@@ -41,11 +41,15 @@ void sync(const ExecutionContext& execution) {
 }
 
 int run(const ExecutionContext& execution, const ops::PeerEvents& events,
-        int n, int k, int tokens, bool row, bool residual = false) {
-    std::array<std::unique_ptr<Buffer>, 4> input, weights, output, scratch, initial;
-    std::array<Tensor, 4> x, y, staging;
+        int n, int k, int tokens, bool row, bool residual = false, bool normalize = false) {
+    std::array<std::unique_ptr<Buffer>, 4> input, weights, output, scratch, initial,
+        norm_weights, norm_output;
+    std::array<Tensor, 4> x, y, staging, gamma, normalized;
+    std::array<WorkspaceArena*, 4> workspace{};
     std::array<Weight, 4> w;
     std::array<std::vector<double>, 4> oracle;
+    std::array<std::vector<std::uint16_t>, 4> eager_residual, eager_normalized;
+    const ops::ReplicatedRmsNorm norm{gamma, normalized, 1e-6F, true};
     std::vector<std::uint16_t> initial_words(n * tokens);
     for (int i = 0; i < n * tokens; ++i) {
         initial_words[i] = encode(4.0 + double(i % 17 - 8) / 4.0);
@@ -61,6 +65,16 @@ int run(const ExecutionContext& execution, const ops::PeerEvents& events,
         x[rank] = Tensor(input[rank]->data, DType::BF16, {k, tokens});
         y[rank] = Tensor(output[rank]->data, DType::BF16, {n, tokens});
         staging[rank] = Tensor(scratch[rank]->data, DType::BF16, {n, tokens, 4});
+        if (normalize) {
+            norm_weights[rank] = std::make_unique<Buffer>(device, n * 2);
+            norm_output[rank] = std::make_unique<Buffer>(device, n * tokens * 2);
+            gamma[rank] = Tensor(norm_weights[rank]->data, DType::BF16, {n});
+            normalized[rank] = Tensor(norm_output[rank]->data, DType::BF16, {n, tokens});
+            std::vector<std::uint16_t> host_gamma(n, encode(0.25));
+            CUDA_CHECK(cudaMemcpyAsync(gamma[rank].data, host_gamma.data(), n * 2,
+                                       cudaMemcpyHostToDevice, stream));
+            execution.dev[rank]->synchronize();
+        }
         if (residual && tokens == 4) {
             // The collective requires capacity, not a prescribed scratch-axis layout.
             staging[rank] = Tensor(scratch[rank]->data, DType::BF16, {n * 4, tokens});
@@ -119,7 +133,19 @@ int run(const ExecutionContext& execution, const ops::PeerEvents& events,
                 CUDA_CHECK(cudaMemcpyAsync(y[rank].data, initial[rank]->data, n * tokens * 2,
                                            cudaMemcpyDeviceToDevice, execution.dev[rank]->stream));
             }
-            ops::linear_add_row_parallel(x, w, y, staging, execution, events);
+            if (normalize) {
+                // Scratch is deliberately unrelated to the incoming residual. Both eager
+                // and captured execution must fold y[0], never this temporary plane.
+                for (int rank = 0; rank < 4; ++rank) {
+                    CUDA_CHECK(cudaSetDevice(execution.dev[rank]->device));
+                    CUDA_CHECK(cudaMemsetAsync(staging[rank].data, 0x5a,
+                                               staging[rank].bytes(), execution.dev[rank]->stream));
+                }
+                ops::linear_add_row_parallel(x, w, y, staging, ops::LinearPolicy::A16Only,
+                                             workspace, execution, events, &norm);
+            } else {
+                ops::linear_add_row_parallel(x, w, y, staging, execution, events);
+            }
         }
         else if (row) { ops::linear_row_parallel(x, w, y, staging, execution, events); }
         else { ops::linear_column_parallel(x, w, y, execution); }
@@ -146,6 +172,37 @@ int run(const ExecutionContext& execution, const ops::PeerEvents& events,
                     break;
                 }
             }
+            if (normalize) {
+                std::vector<std::uint16_t> norm_actual(n * tokens);
+                CUDA_CHECK(cudaMemcpy(norm_actual.data(), normalized[rank].data,
+                                       norm_actual.size() * 2, cudaMemcpyDeviceToHost));
+                for (int t = 0; t < tokens; ++t) {
+                    // RMSNorm's input is the observable represented BF16 sum. Its
+                    // independent FP64 oracle does not copy the production reduction.
+                    double square_sum = 0.0;
+                    for (int i = 0; i < n; ++i) {
+                        const double value = decode(actual[t * n + i]);
+                        square_sum += value * value;
+                    }
+                    const double inverse = 1.0 / std::sqrt(square_sum / n + double(norm.eps));
+                    for (int i = 0; i < n; ++i) {
+                        const double ideal = decode(actual[t * n + i]) * inverse * 1.25;
+                        if (!std::isfinite(decode(norm_actual[t * n + i])) ||
+                            std::abs(decode(norm_actual[t * n + i]) - ideal) >
+                            std::max(1e-6, std::abs(ideal) / 256.0)) {
+                            ++failures;
+                            break;
+                        }
+                    }
+                }
+                if (eager_residual[rank].empty()) {
+                    eager_residual[rank] = actual;
+                    eager_normalized[rank] = norm_actual;
+                } else if (actual != eager_residual[rank] || norm_actual != eager_normalized[rank]) {
+                    std::cerr << "rank=" << rank << " residual/norm graph/eager bits differ\n";
+                    ++failures;
+                }
+            }
         }
         return failures;
     };
@@ -169,7 +226,7 @@ int run(const ExecutionContext& execution, const ops::PeerEvents& events,
         failures += verify();
     }
     std::cout << "TP4 BF16 " << (residual ? "residual" : row ? "row" : "column") << " N=" << n << " K=" << k
-              << " T=" << tokens << " failures=" << failures << '\n';
+              << " T=" << tokens << " norm=" << normalize << " failures=" << failures << '\n';
     return failures;
 }
 } // namespace
@@ -187,6 +244,9 @@ int main() {
         failures += run(execution, events, 5120, 2560, tokens, true);
         failures += run(execution, events, 5120, 1536, tokens, true, true);
         failures += run(execution, events, 5120, 4352, tokens, true, true);
+    }
+    for (int tokens : {1, 5}) {
+        failures += run(execution, events, 5120, 1536, tokens, true, true, true);
     }
     return failures ? 1 : 0;
 }

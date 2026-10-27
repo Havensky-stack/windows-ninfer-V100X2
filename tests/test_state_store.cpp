@@ -181,6 +181,23 @@ int main() {
     failures += expect_device_byte(slotted.conv_slot(0, 2), 0x6b, "zero kept conv slot2");
     failures += expect_device_byte(slotted.recurrent_slot(0, 2), 0x4d, "zero kept recurrent slot2");
 
+    // Save every layer's exact BF16 convolution and FP32 recurrence bytes. Restoring
+    // after overwriting the source must neither alias the image nor touch other slots.
+    std::vector<std::byte> image(slotted.slot_bytes());
+    slotted.export_slot(1, image, ctx.stream);
+    failures += expect_size(image.size(), 2 * (30 * 2 + 120 * 4), "host state image size");
+    slotted.zero_slot(1, ctx.stream);
+    slotted.import_slot(1, image, ctx.stream);
+    failures += expect_device_byte(slotted.conv_slot(0, 1), 0x6b, "restored conv layer0");
+    failures += expect_device_byte(slotted.recurrent_slot(0, 1), 0x4d, "restored recurrence layer0");
+    failures += expect_device_byte(slotted.conv_slot(1, 1), 0x3c, "restored conv layer1");
+    failures += expect_device_byte(slotted.recurrent_slot(1, 1), 0x2d, "restored recurrence layer1");
+    failures += expect_device_byte(slotted.conv_slot(0, 0), 0, "restore kept slot0");
+    failures += expect_device_byte(slotted.recurrent_slot(1, 2), 0x2d, "restore kept slot2");
+    std::vector<std::byte> roundtrip(image.size());
+    slotted.export_slot(1, roundtrip, ctx.stream);
+    if (image != roundtrip) { failures += fail("host state image did not round-trip exactly"); }
+
     auto fp32_conv_plan = plan_state(1, 7, 2, 2, 3, 4, 2, ninfer::DType::FP32);
     ninfer::DeviceArena fp32_conv_arena(fp32_conv_plan.bytes);
     ninfer::LinearAttentionStatePool fp32_conv({fp32_conv_arena.base(), fp32_conv_arena.capacity()},

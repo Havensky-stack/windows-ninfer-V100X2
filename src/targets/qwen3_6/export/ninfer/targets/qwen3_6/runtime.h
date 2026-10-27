@@ -137,6 +137,11 @@ class Program {
 public:
     ~Program() noexcept;
 
+    // Host-only request staging. Called outside the executor/device lock after ingress
+    // capacity is reserved. Reads immutable model weights; never touches GPU/sequence state.
+    [[nodiscard]] double prepare_media(PreparedPrompt& prompt,
+                                       const PreparationControl& control) const;
+
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
     Program(Program&&)                 = delete;
@@ -171,9 +176,10 @@ public:
                                std::span<const std::uint8_t> cancelled);
     void abort_lane(std::uint32_t lane) noexcept;
     [[nodiscard]] bool has_retained_lane(std::uint32_t lane) const noexcept;
-    void evict_retained_lane(std::uint32_t lane) noexcept;
+    void evict_retained_lane(std::uint32_t lane);
     [[nodiscard]] GenerationTimings generation_timings_lane(std::uint32_t lane) const noexcept;
-    [[nodiscard]] SpeculativeStats speculative_stats_lane(std::uint32_t lane) const noexcept;
+    // Borrowed worker-owned counters; valid until the next mutation of this lane.
+    [[nodiscard]] const SpeculativeStats& speculative_stats_lane(std::uint32_t lane) const noexcept;
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
     void reset_memory_peaks() noexcept;

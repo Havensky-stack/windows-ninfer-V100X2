@@ -63,7 +63,8 @@ struct Variant {
                                             std::span<const Tensor> staging,
                                             qwen3_6::TextPhase phase,
                                             std::span<WorkspaceArena* const> workspace,
-                                            const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                            const ExecutionContext& ec, const ops::PeerEvents& ev,
+                                      const ops::ReplicatedRmsNorm* norm = nullptr);
     static void gdn_input_projection(std::span<const Tensor> hidden,
                                      std::span<const GdnProjectionWeights* const> w,
                                      std::span<const Tensor> qkv,
@@ -85,19 +86,24 @@ struct Variant {
                                       std::span<const Tensor> staging,
                                       qwen3_6::TextPhase phase,
                                       std::span<WorkspaceArena* const> workspace,
-                                      const ExecutionContext& ec, const ops::PeerEvents& ev);
+                                      const ExecutionContext& ec, const ops::PeerEvents& ev,
+                                      const ops::ReplicatedRmsNorm* norm = nullptr);
     static void gdn_control_projection(std::span<const Tensor> hidden,
                                        std::span<const GdnProjectionWeights* const> w,
                                        std::span<const Tensor> g,
                                        std::span<const Tensor> beta,
                                        std::span<WorkspaceArena* const> workspace,
                                        const ExecutionContext& ec);
+    [[nodiscard]] static DType gdn_output_input_dtype(const Weight& w, int tp, int tokens);
+    [[nodiscard]] static DType post_mixer_input_dtype(const PostMixerWeights& w,
+                                                     int tp, int tokens);
     static void post_mixer(std::span<const Tensor> hidden,
                            std::span<const PostMixerWeights* const> w,
                            std::span<const Tensor> residual,
                            std::span<const Tensor> staging, qwen3_6::TextPhase phase,
                            std::span<WorkspaceArena* const> workspace,
-                           const ExecutionContext& ec, const ops::PeerEvents& ev);
+                           const ExecutionContext& ec, const ops::PeerEvents& ev,
+                         const ops::ReplicatedRmsNorm* norm = nullptr);
     static void gdn_input_projection_record(
         std::span<const Tensor> hidden, std::span<const GdnProjectionWeights* const> w,
         std::span<const Tensor> conv_weight, std::span<const Tensor> conv_states,

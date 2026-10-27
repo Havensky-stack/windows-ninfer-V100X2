@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -166,7 +167,7 @@ int run_mapped_bytes(const ExecutionContext& ec, const ops::PeerEvents& events) 
 
 // `ne0` is contiguous, `ne1` outer: a vector uses ne1 == 1; the residual uses {5120, 48}.
 int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::uint32_t seed,
-                       const ExecutionContext& ec, const ops::PeerEvents& events) {
+                       const ExecutionContext& ec, const ops::PeerEvents& events, bool out_of_place = false, bool with_norm = false) {
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
     std::vector<float> a(count), b(count);
     fill_uniform(a, seed, -8.0f, 8.0f);
@@ -180,12 +181,12 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
     const std::size_t bytes = count * sizeof(std::uint16_t);
 
     set_device(ec, 0);
-    GuardedDeviceBuffer buffer_0(bytes), staging_0(bytes);
+    GuardedDeviceBuffer buffer_0(bytes), staging_0(bytes), normalized_0(with_norm ? bytes : 2);
     buffer_0.copy_from_host(a_bits.data(), bytes);
     staging_0.fill(0);
 
     set_device(ec, 1);
-    GuardedDeviceBuffer buffer_1(bytes), staging_1(bytes);
+    GuardedDeviceBuffer buffer_1(bytes), staging_1(bytes), normalized_1(with_norm ? bytes : 2);
     buffer_1.copy_from_host(b_bits.data(), bytes);
     staging_1.fill(0);
 
@@ -194,26 +195,73 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
     const std::array<Tensor, 2> staging{Tensor(staging_0.data(), DType::BF16, {ne0, ne1}),
                                         Tensor(staging_1.data(), DType::BF16, {ne0, ne1})};
 
+    std::array<std::vector<float>, 2> host_weights;
+    std::array<DeviceBuffer, 2> device_weights;
+    std::array<Tensor, 2> norm_weights, normalized;
+    if (with_norm) for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        host_weights[rank].resize(ne0);
+        fill_uniform(host_weights[rank], seed + 5 + rank, -.75F, .75F);
+        round_to_bf16(host_weights[rank]);
+        device_weights[rank] = to_device_bf16(host_weights[rank]);
+        norm_weights[rank] = Tensor(device_weights[rank].p, DType::BF16, {ne0});
+        normalized[rank] = Tensor(rank ? normalized_1.data() : normalized_0.data(), DType::BF16, {ne0, ne1});
+    }
+    const ops::ReplicatedRmsNorm norm{norm_weights, normalized, 1e-6F, (seed & 1) != 0};
+    const auto verify_norm = [&] {
+        int errors = 0;
+        if (!with_norm) return errors;
+        for (int rank = 0; rank < 2; ++rank) {
+            std::vector<double> oracle(count);
+            for (int row = 0; row < ne1; ++row) {
+                double ss = 0;
+                for (int d = 0; d < ne0; ++d) {
+                    const double v = bf16_to_f32(f32_to_bf16(expected[row * ne0 + d]));
+                    ss += v * v;
+                }
+                const double inv = 1 / std::sqrt(ss / ne0 + double(norm.eps));
+                for (int d = 0; d < ne0; ++d) oracle[row * ne0 + d] =
+                    bf16_to_f32(f32_to_bf16(expected[row * ne0 + d])) * inv *
+                    (double(host_weights[rank][d]) + (norm.unit_offset ? 1 : 0));
+            }
+            set_device(ec, rank);
+            // A BF16 value rounded across a binade can exceed the old norm
+            // fixture's 0.0034 * max bound even for correctly rounded FP64.
+            // Keep its L2 bound; 1/256 covers BF16 round-to-nearest itself.
+            errors += verify_reduction("collective RMSNorm FP64", from_device_bf16(normalized[rank].data, count),
+                                         oracle, ReductionCriterion{1.85e-3, 1e-5, 1.0 / 256});
+            errors += verify_exact("collective norm weight unchanged", from_device_bf16(device_weights[rank], ne0),
+                                     std::vector<double>(host_weights[rank].begin(), host_weights[rank].end()));
+        }
+        errors += normalized_0.verify_guards("collective norm 0");
+        errors += normalized_1.verify_guards("collective norm 1");
+        return errors;
+    };
+    const auto invoke = [&] {
+        if (with_norm) { ops::allreduce_sum_rmsnorm_to(buffer, staging, norm, ec, events); }
+        else if (out_of_place) { ops::allreduce_sum_to(buffer, staging, ec, events); }
+        else { ops::allreduce_sum(buffer, staging, ec, events); }
+    };
     retire_staging(ec);
-    ops::allreduce_sum(buffer, staging, ec, events);
+    invoke();
     synchronize_both(ec);
 
-    int failures = 0;
+    int failures = verify_norm();
     set_device(ec, 0);
     failures += verify_pointwise((std::string(label) + " device 0").c_str(),
-                                 from_device_bf16(buffer_0.data(), count), expected,
+                                 from_device_bf16(out_of_place ? staging_0.data() : buffer_0.data(), count), expected,
                                  allreduce_sum_bf16_criterion());
     failures += buffer_0.verify_guards("allreduce buffer device 0");
     failures += staging_0.verify_guards("allreduce staging device 0");
     set_device(ec, 1);
     failures += verify_pointwise((std::string(label) + " device 1").c_str(),
-                                 from_device_bf16(buffer_1.data(), count), expected,
+                                 from_device_bf16(out_of_place ? staging_1.data() : buffer_1.data(), count), expected,
                                  allreduce_sum_bf16_criterion());
     failures += buffer_1.verify_guards("allreduce buffer device 1");
     failures += staging_1.verify_guards("allreduce staging device 1");
     // Replay the same public collective from original represented inputs, against the same
     // FP64 oracle. This exercises graph source-lifetime edges and both sum routes directly.
-    auto graph = capture_both(ec, [&] { ops::allreduce_sum(buffer, staging, ec, events); });
+    auto graph = capture_both(ec, invoke);
     cudaGraphExec_t executable;
     cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "allreduce graph");
     for (int replay = 0; replay < 2; ++replay) {
@@ -223,21 +271,134 @@ int run_allreduce_case(const char* label, std::int32_t ne0, std::int32_t ne1, st
         set_device(ec, 0);
         cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "allreduce graph launch");
         synchronize_both(ec);
+        failures += verify_norm();
         set_device(ec, 0);
         failures += verify_pointwise((std::string(label) + " graph device 0").c_str(),
-                                     from_device_bf16(buffer_0.data(), count), expected,
+                                     from_device_bf16(out_of_place ? staging_0.data() : buffer_0.data(), count), expected,
                                      allreduce_sum_bf16_criterion());
         failures += buffer_0.verify_guards("allreduce graph buffer device 0");
         failures += staging_0.verify_guards("allreduce graph staging device 0");
         set_device(ec, 1);
         failures += verify_pointwise((std::string(label) + " graph device 1").c_str(),
-                                     from_device_bf16(buffer_1.data(), count), expected,
+                                     from_device_bf16(out_of_place ? staging_1.data() : buffer_1.data(), count), expected,
                                      allreduce_sum_bf16_criterion());
         failures += buffer_1.verify_guards("allreduce graph buffer device 1");
         failures += staging_1.verify_guards("allreduce graph staging device 1");
     }
+    if (out_of_place) {
+        set_device(ec, 0);
+        failures += verify_exact("out-of-place input 0 immutable",
+                                  from_device<std::uint16_t>(buffer_0.data(), count), a_bits);
+        set_device(ec, 1);
+        failures += verify_exact("out-of-place input 1 immutable",
+                                  from_device<std::uint16_t>(buffer_1.data(), count), b_bits);
+    }
     cuda_check(cudaGraphExecDestroy(executable), "allreduce graph destroy");
     cuda_check(cudaGraphDestroy(graph), "allreduce definition destroy");
+    return failures;
+}
+
+// Consecutive short collectives change active CTA counts and immediately reuse
+// the same sources, without a gather or host wait between them. This exercises
+// the packet epochs across changing sizes and transitions to scalar/DMA routes.
+int run_varying_size_chain(const ExecutionContext& ec, const ops::PeerEvents& events) {
+    constexpr int maximum = 40961, rounds = 128;
+    const std::vector<std::uint16_t> initial(maximum, f32_to_bf16(std::ldexp(1.0f, -60)));
+    std::vector<std::uint16_t> expected = initial;
+    const std::array<int, 5> sizes{5120, 25600, 40960, 4097, maximum};
+    for (int round = 0; round < rounds; ++round) {
+        for (int i = 0; i < sizes[round % sizes.size()]; ++i) {
+            expected[i] = f32_to_bf16(2.0f * bf16_to_f32(expected[i]));
+        }
+    }
+    set_device(ec, 0);
+    GuardedDeviceBuffer a(2ULL * maximum), sa(2ULL * maximum), na(2ULL * maximum);
+    auto wa = to_device_bf16(std::vector<float>(5120, 1.0F));
+    set_device(ec, 1);
+    GuardedDeviceBuffer b(2ULL * maximum), sb(2ULL * maximum), nb(2ULL * maximum);
+    auto wb = to_device_bf16(std::vector<float>(5120, 1.0F));
+    const auto reset = [&] {
+        set_device(ec, 0); a.copy_from_host(initial.data(), 2ULL * maximum);
+        set_device(ec, 1); b.copy_from_host(initial.data(), 2ULL * maximum);
+        retire_staging(ec);
+    };
+    const auto invoke = [&] {
+        for (int round = 0; round < rounds; ++round) {
+            const int n = sizes[round % sizes.size()];
+            const std::array<Tensor, 2> input{Tensor(a.data(), DType::BF16, {n}),
+                                              Tensor(b.data(), DType::BF16, {n})};
+            const std::array<Tensor, 2> staging{Tensor(sa.data(), DType::BF16, {n}),
+                                                Tensor(sb.data(), DType::BF16, {n})};
+            if (n % 5120 == 0 && (round & 1)) {
+                const std::array<Tensor, 2> sources{input[0].view({5120, n/5120}), input[1].view({5120, n/5120})};
+                const std::array<Tensor, 2> sums{staging[0].view({5120, n/5120}), staging[1].view({5120, n/5120})};
+                const std::array<Tensor, 2> weights{Tensor(wa.p, DType::BF16, {5120}), Tensor(wb.p, DType::BF16, {5120})};
+                const std::array<Tensor, 2> normalized{Tensor(na.data(), DType::BF16, {5120, n/5120}), Tensor(nb.data(), DType::BF16, {5120, n/5120})};
+                ops::allreduce_sum_rmsnorm_to(sources, sums, {weights, normalized, 1e-6F, true}, ec, events);
+                for (int rank=0; rank<2; ++rank) {
+                    set_device(ec, rank);
+                    cuda_check(cudaMemcpyAsync(input[rank].data, staging[rank].data, input[rank].bytes(),
+                        cudaMemcpyDeviceToDevice, ec.dev[rank]->stream), "mixed packet source reuse");
+                }
+            } else ops::allreduce_sum(input, staging, ec, events);
+        }
+    };
+    const auto check = [&] {
+        int failures = 0;
+        set_device(ec, 0);
+        failures += verify_exact("varying-size chain rank 0", from_device<std::uint16_t>(a.data(), maximum), expected);
+        failures += a.verify_guards("varying-size rank 0");
+        failures += sa.verify_guards("varying-size staging 0");
+        failures += na.verify_guards("varying-size norm 0");
+        set_device(ec, 1);
+        failures += verify_exact("varying-size chain rank 1", from_device<std::uint16_t>(b.data(), maximum), expected);
+        failures += b.verify_guards("varying-size rank 1");
+        failures += sb.verify_guards("varying-size staging 1");
+        failures += nb.verify_guards("varying-size norm 1");
+        return failures;
+    };
+    reset(); invoke(); synchronize_both(ec);
+    int failures = check();
+    const auto graph = capture_both(ec, invoke);
+    cudaGraphExec_t executable;
+    cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "varying-size graph");
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        reset(); set_device(ec, 0);
+        cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "varying-size graph launch");
+        synchronize_both(ec); failures += check();
+    }
+    cuda_check(cudaGraphExecDestroy(executable), "varying-size graph destroy");
+    cuda_check(cudaGraphDestroy(graph), "varying-size definition destroy");
+    return failures;
+}
+
+int run_special_sum_inputs(const ExecutionContext& ec, const ops::PeerEvents& events) {
+    constexpr int n = 5120;
+    const std::array<std::uint16_t, 16> pattern{
+        0x0000, 0x8000, 0x0001, 0x8001, 0x7f7f, 0xff7f, 0x7f80, 0xff80,
+        0xffff, 0x7fff, 0x7fc0, 0xffc0, 0x3f80, 0xbf80, 0x0080, 0x8080};
+    std::vector<std::uint16_t> x(n), y(n);
+    for (int i = 0; i < n; ++i) { x[i] = pattern[i % 16]; y[i] = pattern[(i / 16) % 16]; }
+    set_device(ec, 0); auto a = to_device(x); GuardedDeviceBuffer oa(2ULL * n);
+    set_device(ec, 1); auto b = to_device(y); GuardedDeviceBuffer ob(2ULL * n);
+    const std::array<Tensor, 2> input{Tensor(a.p, DType::BF16, {n}), Tensor(b.p, DType::BF16, {n})};
+    const std::array<Tensor, 2> output{Tensor(oa.data(), DType::BF16, {n}), Tensor(ob.data(), DType::BF16, {n})};
+    retire_staging(ec); ops::allreduce_sum_to(input, output, ec, events); synchronize_both(ec);
+    int failures = 0;
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        const auto actual = from_device<std::uint16_t>(output[rank].data, n);
+        for (int i = 0; i < n; ++i) {
+            const double ideal = double(bf16_to_f32(x[i])) + double(bf16_to_f32(y[i]));
+            if (std::isnan(ideal)) {
+                if (!std::isnan(bf16_to_f32(actual[i]))) { ++failures; }
+            } else if (actual[i] != f32_to_bf16(static_cast<float>(ideal))) { ++failures; }
+        }
+    }
+    set_device(ec, 0); failures += verify_exact("special input 0 unchanged", from_device<std::uint16_t>(a, n), x);
+    failures += oa.verify_guards("special output 0");
+    set_device(ec, 1); failures += verify_exact("special input 1 unchanged", from_device<std::uint16_t>(b, n), y);
+    failures += ob.verify_guards("special output 1");
     return failures;
 }
 
@@ -359,6 +520,46 @@ int run_gather_columns_rank0_case(const char* label, std::int32_t width_0,
                              from_device<std::uint16_t>(source_0.data(), count_0), bits_0);
     failures += destination_0.verify_guards("gather_columns_rank0 destination device 0");
     failures += source_0.verify_guards("gather_columns_rank0 source device 0");
+    // Real DFlash regression: one pre-instantiated executable must change arena
+    // destination addresses in both directions, without recapture/instantiation.
+    GuardedDeviceBuffer alternate(full_bytes);
+    const Tensor alternate_tensor(alternate.data(), DType::BF16, {width, columns});
+    const auto first_graph = capture_both(ec, [&] {
+        ops::gather_columns_rank0(destination[0], part, ec, events);
+    });
+    const auto second_graph = capture_both(ec, [&] {
+        ops::gather_columns_rank0(alternate_tensor, part, ec, events);
+    });
+    set_device(ec, 0);
+    cudaGraphExec_t executable = nullptr;
+    cuda_check(cudaGraphInstantiate(&executable, first_graph, 0), "gather graph instantiate");
+    const std::vector<std::uint16_t> untouched(expected.size(), 0xcdcd);
+    for (bool use_alternate : {true, false, true, false}) {
+        destination_0.fill(0xcd);
+        alternate.fill(0xcd);
+        cuda_check(cudaDeviceSynchronize(), "gather destination reset");
+        cudaGraphExecUpdateResultInfo update{};
+        cuda_check(cudaGraphExecUpdate(executable, use_alternate ? second_graph : first_graph,
+                                       &update), "gather graph address update");
+        cuda_check(cudaGetLastError(), "gather graph update error state");
+        if (update.result != cudaGraphExecUpdateSuccess) { ++failures; }
+        cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "gather graph launch");
+        synchronize_both(ec);
+        set_device(ec, 0);
+        failures += verify_exact("gather updated destination",
+            from_device<std::uint16_t>(use_alternate ? alternate.data() : destination_0.data(),
+                                       expected.size()), expected);
+        failures += verify_exact("gather inactive destination unchanged",
+            from_device<std::uint16_t>(use_alternate ? destination_0.data() : alternate.data(),
+                                       expected.size()), untouched);
+    }
+    cuda_check(cudaGraphExecDestroy(executable), "gather graph executable destroy");
+    cuda_check(cudaGraphDestroy(first_graph), "gather first graph destroy");
+    cuda_check(cudaGraphDestroy(second_graph), "gather second graph destroy");
+    failures += alternate.verify_guards("gather alternate destination");
+    failures += destination_0.verify_guards("gather updated original destination");
+    failures += verify_exact("gather graph source 0 unchanged",
+        from_device<std::uint16_t>(source_0.data(), count_0), bits_0);
     set_device(ec, 1);
     failures += verify_exact("gather_columns_rank0 unused destination remains untouched",
                              from_device<std::uint16_t>(destination_1.data(), expected.size()),
@@ -392,8 +593,8 @@ int run_gather_columns_rank0_case(const char* label, std::int32_t width_0,
 //
 // Deliberate skew: a large memset is queued on rank 0's stream first, with no host sync, so the
 // two streams run genuinely out of step for the first rounds instead of in lockstep.
-int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) {
-    constexpr std::int32_t n     = 5120;
+int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events, bool out_of_place = false, bool with_norm = false) {
+    const std::int32_t n = 5120 * (with_norm ? 5 : 1);
     constexpr int kRounds        = 64;
     constexpr int kStartExponent = -40;
     constexpr std::size_t kSkewBytes = 256u << 20;
@@ -411,27 +612,49 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
     const std::vector<double> expected_gathered(2 * count, expected_value);
 
     set_device(ec, 0);
-    GuardedDeviceBuffer buffer_0(bytes), staging_0(bytes), gathered_0(2 * bytes);
+    GuardedDeviceBuffer buffer_0(bytes), staging_0(bytes), gathered_0(2 * bytes), norm_0(with_norm ? bytes : 2);
+    auto weight_0 = to_device_bf16(std::vector<float>(5120, 1.0F));
     buffer_0.copy_from_host(start_bits.data(), bytes);
     staging_0.fill(0);
     gathered_0.fill(0xcd);
     DeviceBuffer skew(kSkewBytes);
 
     set_device(ec, 1);
-    GuardedDeviceBuffer buffer_1(bytes), staging_1(bytes), gathered_1(2 * bytes);
+    GuardedDeviceBuffer buffer_1(bytes), staging_1(bytes), gathered_1(2 * bytes), norm_1(with_norm ? bytes : 2);
+    auto weight_1 = to_device_bf16(std::vector<float>(5120, 1.0F));
     buffer_1.copy_from_host(start_bits.data(), bytes);
     staging_1.fill(0);
     gathered_1.fill(0xcd);
 
-    const std::array<Tensor, 2> buffer{Tensor(buffer_0.data(), DType::BF16, {n}),
-                                       Tensor(buffer_1.data(), DType::BF16, {n})};
-    const std::array<Tensor, 2> staging{Tensor(staging_0.data(), DType::BF16, {n}),
-                                        Tensor(staging_1.data(), DType::BF16, {n})};
+    const std::array<Tensor, 2> buffer{Tensor(buffer_0.data(), DType::BF16, {5120, with_norm ? 5 : 1}),
+                                       Tensor(buffer_1.data(), DType::BF16, {5120, with_norm ? 5 : 1})};
+    const std::array<Tensor, 2> staging{Tensor(staging_0.data(), DType::BF16, {5120, with_norm ? 5 : 1}),
+                                        Tensor(staging_1.data(), DType::BF16, {5120, with_norm ? 5 : 1})};
     const std::array<Tensor, 2> gathered{Tensor(gathered_0.data(), DType::BF16, {n, 2}),
                                          Tensor(gathered_1.data(), DType::BF16, {n, 2})};
     const std::array<Tensor, 2> part{Tensor(buffer_0.data(), DType::BF16, {n, 1}),
                                      Tensor(buffer_1.data(), DType::BF16, {n, 1})};
 
+    const std::array<Tensor, 2> norm_weights{Tensor(weight_0.p, DType::BF16, {5120}),
+                                            Tensor(weight_1.p, DType::BF16, {5120})};
+    const std::array<Tensor, 2> norm_outputs{Tensor(norm_0.data(), DType::BF16, {5120, 5}),
+                                            Tensor(norm_1.data(), DType::BF16, {5120, 5})};
+    const ops::ReplicatedRmsNorm norm{norm_weights, norm_outputs, 1e-6F, false};
+    const auto invoke = [&] {
+        if (out_of_place) {
+            if (with_norm) ops::allreduce_sum_rmsnorm_to(buffer, staging, norm, ec, events);
+            else ops::allreduce_sum_to(buffer, staging, ec, events);
+            // Immediately overwrite the sources on their own streams; a missing
+            // peer-read retirement edge becomes a real cross-rank race here.
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                cuda_check(cudaMemcpyAsync(buffer[rank].data, staging[rank].data, bytes,
+                    cudaMemcpyDeviceToDevice, ec.dev[rank]->stream), "reuse sum sources");
+            }
+        } else {
+            ops::allreduce_sum(buffer, staging, ec, events);
+        }
+    };
     retire_staging(ec);
 
     set_device(ec, 0);
@@ -441,12 +664,26 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
     }
 
     for (int round = 0; round < kRounds; ++round) {
-        ops::allreduce_sum(buffer, staging, ec, events);
+        invoke();
         ops::allgather_rows(gathered, part, ec, events);
     }
     synchronize_both(ec);
 
-    int failures = 0;
+    const auto check_norm = [&] {
+        int errors = 0;
+        if (with_norm) {
+            const double expected_norm = expected_value / std::sqrt(expected_value * expected_value + double(norm.eps));
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                errors += verify_pointwise("chained norm FP64", from_device_bf16(norm_outputs[rank].data, count),
+                                            std::vector<double>(count, expected_norm), PointwiseCriterion{1e-6, 1.0 / 256});
+            }
+            errors += norm_0.verify_guards("chained norm 0");
+            errors += norm_1.verify_guards("chained norm 1");
+        }
+        return errors;
+    };
+    int failures = check_norm();
     set_device(ec, 0);
     failures += verify_pointwise("chained 64x device 0 buffer",
                                  from_device_bf16(buffer_0.data(), count), expected,
@@ -475,7 +712,7 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
             cuda_check(cudaMemsetAsync(skew.p, i, skew.bytes, ec.dev[0]->stream), "captured skew");
         }
         for (int round = 0; round < kRounds; ++round) {
-            ops::allreduce_sum(buffer, staging, ec, events);
+            invoke();
             ops::allgather_rows(gathered, part, ec, events);
         }
     });
@@ -488,6 +725,7 @@ int run_chained_case(const ExecutionContext& ec, const ops::PeerEvents& events) 
         set_device(ec, 0);
         cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "chained graph launch");
         synchronize_both(ec);
+        failures += check_norm();
         set_device(ec, 0);
         failures += verify_pointwise("chained graph buffer 0", from_device_bf16(buffer_0.data(), count),
                                      expected, allreduce_sum_bf16_criterion());
@@ -592,6 +830,120 @@ int run_microbenchmark(const ExecutionContext& ec, const ops::PeerEvents& events
     return failures;
 }
 
+int run_argmax_collective_case(int columns, const ExecutionContext& ec,
+                               const ops::PeerEvents& events, bool mapped = false) {
+    constexpr int Rounds = 16, Shard = 65536;
+    const std::size_t bytes = sizeof(std::int32_t) * columns;
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> value, index, out, history, seeds;
+    std::array<Tensor, 2> values, indices, outputs;
+    std::array<std::vector<float>, 2> host_values;
+    std::array<std::vector<int>, 2> host_indices;
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        value[rank] = std::make_unique<GuardedDeviceBuffer>(bytes);
+        index[rank] = std::make_unique<GuardedDeviceBuffer>(bytes);
+        out[rank] = std::make_unique<GuardedDeviceBuffer>(bytes);
+        history[rank] = std::make_unique<GuardedDeviceBuffer>(Rounds * bytes);
+        seeds[rank] = std::make_unique<GuardedDeviceBuffer>(4 * bytes);
+        values[rank] = Tensor(value[rank]->data(), DType::FP32, {1, columns});
+        indices[rank] = Tensor(index[rank]->data(), DType::I32, {1, columns});
+        outputs[rank] = Tensor(out[rank]->data(), DType::I32, {columns});
+        host_values[rank].resize(2 * columns);
+        host_indices[rank].resize(2 * columns);
+    }
+    set_device(ec, 0);
+    GuardedDeviceBuffer sv(2 * bytes), si(2 * bytes);
+    Tensor gathered_values(sv.data(), DType::FP32, {2, columns});
+    Tensor gathered_indices(si.data(), DType::I32, {2, columns});
+    GuardedDeviceBuffer map_buffer(2 * Shard * sizeof(int));
+    std::vector<int> map(2 * Shard);
+    for (int i = 0; i < 2 * Shard; ++i) { map[i] = (i * 97 + 13) % (2 * Shard); }
+    cuda_check(cudaMemcpy(map_buffer.data(), map.data(), 2 * Shard * sizeof(int),
+                          cudaMemcpyHostToDevice), "argmax map");
+    const auto invoke = [&] {
+        for (int round = 0; round < Rounds; ++round) {
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                auto* seed = static_cast<std::uint8_t*>(seeds[rank]->data());
+                cuda_check(cudaMemcpyAsync(values[rank].data, seed + (round % 2) * bytes,
+                    bytes, cudaMemcpyDeviceToDevice, ec.dev[rank]->stream), "reuse argmax scores");
+                cuda_check(cudaMemcpyAsync(indices[rank].data, seed + (2 + round % 2) * bytes,
+                    bytes, cudaMemcpyDeviceToDevice, ec.dev[rank]->stream), "reuse argmax indices");
+            }
+            ops::allreduce_argmax(values, indices, outputs, gathered_values, gathered_indices,
+                                   Shard, ec, events, mapped ? static_cast<const int*>(map_buffer.data()) : nullptr);
+            for (int rank = 0; rank < 2; ++rank) {
+                set_device(ec, rank);
+                cuda_check(cudaMemcpyAsync(static_cast<std::uint8_t*>(history[rank]->data()) +
+                    round * bytes, outputs[rank].data, bytes, cudaMemcpyDeviceToDevice,
+                    ec.dev[rank]->stream), "retire argmax output");
+            }
+        }
+    };
+    cudaGraph_t graph = capture_both(ec, invoke);
+    cudaGraphExec_t executable;
+    set_device(ec, 0);
+    cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "argmax graph");
+    int failures = 0;
+    for (int probe = 0; probe < 3; ++probe) {
+        for (int rank = 0; rank < 2; ++rank) {
+            for (int mode = 0; mode < 2; ++mode) {
+                for (int t = 0; t < columns; ++t) {
+                    const int i = mode * columns + t;
+                    float v = float((t + mode + probe + rank) % 7 - 3);
+                    if (t % 4 == 0) { v = mode ? -INFINITY : INFINITY; }
+                    if (t % 4 == 1) { v = rank ? -0.0F : 0.0F; }
+                    host_values[rank][i] = v;
+                    host_indices[rank][i] = (t * 11 + probe * 13 + mode * 17) % Shard;
+                }
+            }
+            set_device(ec, rank);
+            cuda_check(cudaMemcpy(seeds[rank]->data(), host_values[rank].data(), 2 * bytes,
+                cudaMemcpyHostToDevice), "argmax score seeds");
+            cuda_check(cudaMemcpy(static_cast<std::uint8_t*>(seeds[rank]->data()) + 2 * bytes,
+                host_indices[rank].data(), 2 * bytes, cudaMemcpyHostToDevice), "argmax index seeds");
+        }
+        retire_staging(ec);
+        if (probe == 0) { invoke(); }
+        else {
+            set_device(ec, 0);
+            cuda_check(cudaGraphLaunch(executable, ec.dev[0]->stream), "argmax replay");
+        }
+        synchronize_both(ec);
+        std::vector<int> expected(Rounds * columns);
+        for (int round = 0; round < Rounds; ++round) {
+            for (int t = 0; t < columns; ++t) {
+                const int i = (round % 2) * columns + t;
+                const double a = host_values[0][i], b = host_values[1][i];
+                const int ia = host_indices[0][i], ib = Shard + host_indices[1][i];
+                const int winner = b > a || (b == a && ib < ia) ? ib : ia;
+                expected[round * columns + t] = mapped ? map[winner] : winner;
+            }
+        }
+        for (int rank = 0; rank < 2; ++rank) {
+            set_device(ec, rank);
+            failures += verify_exact("replicated argmax and source retirement",
+                from_device<int>(history[rank]->data(), expected.size()), expected);
+            failures += value[rank]->verify_guards("argmax values");
+            failures += index[rank]->verify_guards("argmax indices");
+            failures += out[rank]->verify_guards("argmax output");
+            failures += history[rank]->verify_guards("argmax history");
+            failures += seeds[rank]->verify_guards("argmax seeds");
+            failures += verify_exact("argmax seed values unchanged",
+                from_device<float>(seeds[rank]->data(), 2 * columns), host_values[rank]);
+        }
+    }
+    set_device(ec, 0);
+    failures += sv.verify_guards("argmax gather values");
+    failures += si.verify_guards("argmax gather indices");
+    failures += map_buffer.verify_guards("argmax ID map");
+    failures += verify_exact("argmax ID map unchanged",
+        from_device<int>(map_buffer.data(), map.size()), map);
+    cuda_check(cudaGraphExecDestroy(executable), "destroy argmax executable");
+    cuda_check(cudaGraphDestroy(graph), "destroy argmax graph");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -609,7 +961,8 @@ int main() {
 
     const ExecutionContext ec({0, 1});
     bool peer_access = ops::enable_peer_access(ec);
-    if (peer_access && std::getenv("NINFER_TEST_PEER_OFF") != nullptr) {
+    const bool require_host_packets = std::getenv("NINFER_TEST_HOST_PACKETS") != nullptr;
+    if (peer_access && (std::getenv("NINFER_TEST_PEER_OFF") != nullptr || require_host_packets)) {
         for (int rank = 0; rank < 2; ++rank) {
             set_device(ec, rank);
             cuda_check(cudaDeviceDisablePeerAccess(ec.dev[1 - rank]->device), "disable test peer access");
@@ -620,11 +973,34 @@ int main() {
               << (peer_access ? "enabled (direct P2P)"
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
-    const ops::PeerEvents events(ec, peer_access);
+    const ops::PeerEvents events(ec, peer_access, require_host_packets
+        ? ops::PeerEvents::HostPackets::Required : ops::PeerEvents::HostPackets::Auto);
+    if (events.host_packets()) std::cout << "small reductions: mapped-host packets\n";
 
     int failures = 0;
     failures += run_mapped_bytes(ec, events);
+    for (int columns : {1, 5, 8, 33}) {
+        failures += run_argmax_collective_case(columns, ec, events);
+        failures += run_argmax_collective_case(columns, ec, events, true);
+        const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);
+        failures += run_argmax_collective_case(columns, ec, dma_events);
+        failures += run_argmax_collective_case(columns, ec, dma_events, true);
+    }
     // Real decode shape first: 5120 is the hidden dimension all-reduced 128 times per token.
+    // Direct-read threshold, scalar tail, wide DMA fallback, graph replay and immutable inputs.
+    for (int count : {1, 4097, 5120, 25600, 40960, 40961}) {
+        failures += run_allreduce_case("allreduce_sum_to", count, 1, 121u, ec, events, true);
+        const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);
+        failures += run_allreduce_case("allreduce_sum_to forced DMA", count, 1, 122u,
+                                       ec, dma_events, true);
+    }
+    for (int tokens : {1, 4, 5, 8, 9}) {
+        for (unsigned seed : {141u, 142u}) {
+            failures += run_allreduce_case("sum + RMSNorm", 5120, tokens, seed, ec, events, true, true);
+            const ops::PeerEvents dma_events(ec, false, ops::PeerEvents::HostPackets::Disabled);
+            failures += run_allreduce_case("sum + RMSNorm DMA", 5120, tokens, seed, ec, dma_events, true, true);
+        }
+    }
     failures += run_allreduce_case("allreduce_sum [5120]", 5120, 1, 101u, ec, events);
     failures += run_allreduce_case("allreduce_sum [5120,4]", 5120, 4, 111u, ec, events);
     failures += run_allreduce_case("allreduce_sum [40959]", 40959, 1, 112u, ec, events);
@@ -648,6 +1024,10 @@ int main() {
                                               206u, ec, events);
 
     failures += run_chained_case(ec, events);
+    failures += run_chained_case(ec, events, true);
+    failures += run_chained_case(ec, events, true, true);
+    failures += run_varying_size_chain(ec, events);
+    failures += run_special_sum_inputs(ec, events);
     failures += run_microbenchmark(ec, events);
 
     std::cout << (failures ? "FAIL" : "OK") << " allreduce\n";

@@ -46,10 +46,12 @@ public:
         : instance_(instance), device_(device.device), max_concurrency_(options.max_concurrency),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
+          prefill_decode_rounds_(options.prefill_decode_rounds),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
           admission_capacity_(instance.program->admission_capacity()) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            options.max_pending_requests == 0 || pending_timeout_.count() <= 0 ||
+            prefill_decode_rounds_ == 0 || prefill_decode_rounds_ > 64) {
             throw std::invalid_argument("concurrent executor bounds are invalid");
         }
         if (admission_capacity_.active_lanes != max_concurrency_ ||
@@ -126,8 +128,10 @@ public:
 
     Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
-                      Clock::time_point pending_deadline = {}) {
+                      const PreparationControl& preparation = {}) {
         const Clock::time_point submitted = Clock::now();
+        Clock::time_point pending_deadline = preparation.deadline;
+        const bool explicit_deadline = pending_deadline != Clock::time_point{};
         if (pending_deadline == Clock::time_point{}) {
             pending_deadline = submitted + pending_timeout_;
         }
@@ -154,9 +158,16 @@ public:
         try {
             auto output = instance_.loaded->frontend.make_output_session(prompt, options.stop,
                                                                          options.output);
+            // CPU media work must not hold the device/execution mutex or stall active decode.
+            const double host_vision_seconds = instance_.program->prepare_media(
+                prompt, preparation);
+            // The default queue timeout begins after host encoding. A caller's explicit
+            // deadline still covers the entire submission, including CPU media work.
+            if (!explicit_deadline) { pending_deadline = Clock::now() + pending_timeout_; }
             request = std::make_shared<Request>(request_id, std::move(prompt), std::move(output),
                                                 prompt_summary, prepare_seconds, std::move(options),
                                                 pending_deadline, submitted);
+            request->host_vision_seconds = host_vision_seconds;
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -322,6 +333,7 @@ private:
         targets::qwen3_6::OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
+        double host_vision_seconds = 0.0;
         ResolvedRequestOptions options;
         Clock::time_point deadline;
         Clock::time_point submitted;
@@ -483,6 +495,7 @@ private:
                 request->prepare_seconds +
                 std::chrono::duration<double>(*request->first_token - request->submitted).count();
         }
+        result.timings.vision_seconds += request->host_vision_seconds;
         result.timings.total_seconds =
             request->prepare_seconds +
             std::chrono::duration<double>(Clock::now() - request->submitted).count();
@@ -1055,9 +1068,24 @@ private:
     }
 
     void run_decode_round(const RoundMembership& membership) {
+        const auto round_started = Clock::now();
         const std::span<const std::uint32_t> lanes = membership.lane_span();
+        std::array<std::array<std::uint64_t, 2>, kMaximumConcurrency> previous_speculative{};
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const auto& stats = instance_.program->speculative_stats_lane(lanes[row]);
+            previous_speculative[row] = {stats.drafted_tokens, stats.accepted_tokens};
+        }
         const BatchedGeneratedRound round =
             instance_.program->decode_batch(lanes, membership.budget_span());
+        // These are verification counters, not output-publication counters. Include
+        // work already performed even if a stop or cancellation truncates the round.
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const auto& current = instance_.program->speculative_stats_lane(lanes[row]);
+            cumulative_stats_.speculative_drafted_tokens +=
+                current.drafted_tokens - previous_speculative[row][0];
+            cumulative_stats_.speculative_accepted_tokens +=
+                current.accepted_tokens - previous_speculative[row][1];
+        }
 
         std::array<std::uint8_t, kMaximumConcurrency> cancelled{};
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -1172,6 +1200,8 @@ private:
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             if (!cancelled[row]) { cumulative_stats_.committed_decode_tokens += accepted[row]; }
         }
+        cumulative_stats_.decode_wall_seconds +=
+            std::chrono::duration<double>(Clock::now() - round_started).count();
         publish_runtime_stats();
     }
 
@@ -1201,6 +1231,7 @@ private:
 
     void worker_loop() noexcept {
         bool previous_unit_was_decode = false;
+        std::uint32_t decode_rounds_since_prefill = 0;
         for (;;) {
             {
                 std::unique_lock lock(queue_mutex_);
@@ -1229,11 +1260,14 @@ private:
                 const RoundMembership membership = build_round_membership();
 
                 if (prefill_lane_) {
-                    if (!membership.empty() && !previous_unit_was_decode) {
+                    if (!membership.empty() &&
+                        decode_rounds_since_prefill < prefill_decode_rounds_) {
                         run_decode_round(membership);
+                        ++decode_rounds_since_prefill;
                         previous_unit_was_decode = true;
                     } else {
                         run_prefill_step();
+                        decode_rounds_since_prefill = 0;
                         previous_unit_was_decode = false;
                     }
                     continue;
@@ -1242,6 +1276,7 @@ private:
                 if (have_pending && (membership.empty() || previous_unit_was_decode)) {
                     const AdmissionProgress progress = try_admit_one();
                     if (progress == AdmissionProgress::RanGpuUnit) {
+                        decode_rounds_since_prefill = 0;
                         previous_unit_was_decode = false;
                         continue;
                     }
@@ -1275,6 +1310,7 @@ private:
     const int device_;
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
+    const std::uint32_t prefill_decode_rounds_;
     const std::chrono::milliseconds pending_timeout_;
     const AdmissionResources admission_capacity_;
 

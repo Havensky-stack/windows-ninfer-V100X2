@@ -11,7 +11,10 @@ engineering for debugging modifications to the LGPL library is permitted by its 
 See ffmpeg.txt and ffmpeg.spdx.json for license and source identities.
 
 curl 8.21.0 and zlib 1.3.2 are dynamically linked; copyright/license texts and source identities
-are provided alongside this file. CUDA CUDART 12.8.90 is statically linked into the engine;
+are provided alongside this file. OpenBLAS 0.3.33 is dynamically linked for CPU Vision, built
+without its threading feature; its BSD license and source identity are in openblas.txt and
+openblas.spdx.json. The SM70 attention adaptation's license and author list are also included.
+CUDA CUDART 12.8.90 is statically linked into the engine;
 its redistributable terms are in NVIDIA-CUDA.txt. No NVIDIA driver is distributed.
 
 Microsoft Visual C++ 14.44.35112 x64 runtime DLLs are included app-locally under Microsoft's

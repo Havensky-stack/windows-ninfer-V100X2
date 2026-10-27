@@ -1,5 +1,6 @@
 #include "ninfer/ops/gated_rmsnorm.h"
 #include "ops/norm_test_common.h"
+#include "ops/quantized_weight.h"
 
 #include <cmath>
 #include <cstdint>
@@ -71,6 +72,26 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     int failures = verify_reduction(label, from_device_bf16(output_data, count), reference,
                                     gated_rmsnorm_bf16_criterion());
     failures += verify_output_storage(std::string(label) + " output", output, bf16x2_unaligned);
+    const auto bf16_output = from_device<std::uint16_t>(output_data, count);
+    std::vector<std::uint16_t> expected_image(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        expected_image[i] = quantized_weight::detail::f32_to_f16(bf16_to_f32(bf16_output[i]));
+    }
+    output.fill(0xff);
+    output_tensor.dtype = DType::FP16;
+    ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, output_tensor, nullptr);
+    cuda_synchronize();
+    const auto image_bits = from_device<std::uint16_t>(output_data, count);
+    std::vector<double> image(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        image[i] = quantized_weight::detail::f16_to_f32(image_bits[i]);
+    }
+    failures += verify_reduction((std::string(label) + " FP16 image FP64 oracle").c_str(), image,
+                                  reference, gated_rmsnorm_bf16_criterion());
+    failures += verify_exact((std::string(label) + " exact BF16-to-FP16 image").c_str(),
+                               image_bits, expected_image);
+    failures += verify_output_storage(std::string(label) + " FP16 image output", output,
+                                       bf16x2_unaligned);
     failures += verify_preserved(std::string(label) + " preserves input", device_input);
     failures += verify_preserved(std::string(label) + " preserves weight", device_weight);
     failures += verify_preserved(std::string(label) + " preserves gate", device_gate);
@@ -92,6 +113,13 @@ int main() {
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
     failures += run_case("gated_rmsnorm unaligned [128,48]", {128, 48}, 1405U, 4.0F, true);
+    for (int tokens : {1, 5, 8}) {
+        failures += run_case("gated_rmsnorm TP4 [128,12,T]", {128, 12, tokens}, 1500U + tokens);
+    }
+    failures += run_case("gated_rmsnorm TP4 near-zero [128,12,5]", {128, 12, 5}, 1510U, 1.0e-5F);
+    failures += run_case("gated_rmsnorm generic [65,12,5]", {65, 12, 5}, 1511U);
+    failures += run_case("gated_rmsnorm CTA256 [512,12]", {512, 12}, 1512U);
+    failures += run_case("gated_rmsnorm CTA512 [4096,3]", {4096, 3}, 1513U);
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
     return failures ? 1 : 0;
 }

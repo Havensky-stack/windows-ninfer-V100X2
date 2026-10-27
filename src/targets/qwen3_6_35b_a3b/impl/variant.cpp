@@ -3,6 +3,7 @@
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/sparse_moe.h"
 
@@ -346,7 +347,8 @@ void Variant::attention_output_projection(std::span<const Tensor>,
                                           std::span<const Tensor>,
                                           std::span<const Tensor>, qwen3_6::TextPhase,
                                           std::span<WorkspaceArena* const>,
-                                          const ExecutionContext&, const ops::PeerEvents&) {
+                                          const ExecutionContext&, const ops::PeerEvents&,
+                                    const ops::ReplicatedRmsNorm*) {
     reject_tensor_parallel("attention_output_projection");
 }
 
@@ -370,7 +372,8 @@ void Variant::gdn_input_projection_snapshot(
 void Variant::gdn_output_projection(std::span<const Tensor>, std::span<const Weight>,
                                     std::span<const Tensor>, std::span<const Tensor>,
                                     qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
-                                    const ExecutionContext&, const ops::PeerEvents&) {
+                                    const ExecutionContext&, const ops::PeerEvents&,
+                                    const ops::ReplicatedRmsNorm*) {
     reject_tensor_parallel("gdn_output_projection");
 }
 
@@ -382,11 +385,20 @@ void Variant::gdn_control_projection(std::span<const Tensor>,
     reject_tensor_parallel("gdn_control_projection");
 }
 
+DType Variant::gdn_output_input_dtype(const Weight&, int, int) {
+    return DType::BF16;
+}
+
+DType Variant::post_mixer_input_dtype(const PostMixerWeights&, int, int) {
+    return DType::BF16;
+}
+
 void Variant::post_mixer(std::span<const Tensor>,
                          std::span<const PostMixerWeights* const>,
                          std::span<const Tensor>, std::span<const Tensor>,
                          qwen3_6::TextPhase, std::span<WorkspaceArena* const>,
-                         const ExecutionContext&, const ops::PeerEvents&) {
+                         const ExecutionContext&, const ops::PeerEvents&,
+                         const ops::ReplicatedRmsNorm* norm) {
     reject_tensor_parallel("post_mixer");
 }
 

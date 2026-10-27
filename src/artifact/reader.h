@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -201,6 +202,7 @@ public:
     static constexpr std::size_t direct_io_alignment = 4096;
 
     explicit Reader(const std::filesystem::path& path);
+    explicit Reader(std::shared_ptr<const std::vector<std::byte>> image);
     ~Reader();
 
     Reader(Reader&&) noexcept;
@@ -217,6 +219,9 @@ public:
     PayloadSpan payload(const ObjectDescriptor& object) const;
     PayloadSpan payload(std::string_view name) const;
     std::size_t read_direct(std::uint64_t absolute_offset, std::span<std::byte> destination) const;
+    // Immutable original container bytes, independent of the file and CUDA allocations.
+    std::shared_ptr<const std::vector<std::byte>> retain_in_memory(
+        const std::function<void(std::uint64_t, std::uint64_t)>& progress = {}) const;
 
 private:
     struct Impl;

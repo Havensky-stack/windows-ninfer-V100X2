@@ -13,6 +13,44 @@ history behavior and the advertised OpenAI/Anthropic request schemas are unchang
 `build/apps/ninfer-serve` loads one registered artifact and exposes OpenAI- and
 Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
 
+## Model residency
+
+The GUI/TUI can release GPU residency while retaining one immutable copy of the original `.ninfer`
+container in host RAM. These NInfer control endpoints use the server's configured bearer or
+`x-api-key` authentication; they do not change the OpenAI/Anthropic request formats:
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| GET | `/ninfer/model` | Return model state, retained bytes, progress and active request count |
+| POST | `/ninfer/model/offload` | Copy original container to RAM once, then destroy the GPU Engine |
+| POST | `/ninfer/model/load` | Reconstruct the same configured Engine directly from RAM |
+
+Example status: `{"state":"ram","retained_host_bytes":19782432752,"phase":"ready",`
+`"done":0,"total":0,"active_requests":0,"cache_preserved":false}`. The four states are `gpu`,
+`offloading`, `ram`, `loading`; `done`/`total` are phase-local bytes or work units (zero total means
+indeterminate progress). POST waits until the transition completes; launchers issue it in a worker
+and poll GET separately. Repeating offload in `ram` or load in `gpu` succeeds without doing work.
+
+An active request owns its reservation through response consumption and generation-handle
+destruction. Offload returns **409 `model_busy`** while any such reservation exists; competing
+transitions also return 409. New inference/token-count requests return **503 `model_not_loaded`**
+while offloaded or transitioning. `/health` remains process liveness (`{"status":"ok"}`), including
+in RAM state. Model listing and stored Responses remain accessible. No inference is auto-reloaded.
+
+First offload requires the artifact still on disk and available host RAM covering the complete file
+plus 1 GiB headroom (otherwise **507 `insufficient_host_memory`**). A failed copy leaves the active
+GPU Engine intact. Successful offload releases its model allocations, KV/GDN, workspace and graphs;
+CUDA driver context/module overhead can remain. Recreate uses original codes/scales/divisors and
+the same artifact materialization route, with no disk fallback or requantization. RAM is retained
+after load for subsequent unloads and freed when the server stops. It is ordinary pageable RAM,
+not pinned/locked memory or an RSS limit. Reload failure returns an error and keeps the RAM state
+retryable. Runtime throughput counters remain cumulative across residency cycles.
+
+This is model residency control, **not request pause/resume**: KV, archived prefixes and processed
+media caches are discarded, and the next request starts cold. TP/PP, capacity, Vision placement,
+speculation and all other startup settings remain fixed. Reload rebuilds runtime allocations and
+CUDA Graphs; it is faster storage access, not an instant GPU context restoration.
+
 ## Start the server
 
 ```bash
@@ -53,7 +91,7 @@ omitted at startup.
 `--tp 2` splits one model across two GPUs and requires an explicit `--devices A,B` naming one
 distinct device per rank. The 27B package supports `--spec mtp` and optional Qwen3.8 DFlash2.
 Experimental `--vision` is available at TP2 for artifacts with execution-qualified Vision weights;
-QUASAR and GGUF-derived Q4_K_M still reject it. Vision weights and encoding reside only on the primary
+QUASAR NVFP4 admits TP2 None/MTP; GGUF-derived Q4_K_M rejects it. Vision weights and encoding reside only on the primary
 rank; composed embeddings are copied to the peer before split text prefill, and both ranks use
 the same three-axis positions and per-request RoPE delta. Vision requests participate in the
 same compact concurrent decode batches as text requests. Vision requires additional startup
@@ -147,6 +185,13 @@ INT8 KV). `--kv-dtype int8` is mandatory at that window.
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
+The HTTP server enables `TCP_NODELAY` so small SSE frames following the headers are sent
+without Nagle/delayed-ACK stalls on persistent connections. SSE responses also set
+`Cache-Control: no-cache` and `X-Accel-Buffering: no`. Clients should read incrementally;
+proxy buffering and remote network latency can still delay visible output. The local
+[fully cached HTTP TTFT measurement](performance.md#http-fully-cached-first-token-latency-2026-10-19)
+times the first nonempty text delta, not the initial role or lifecycle event.
+
 ## OpenAI Chat Completions
 
 ```bash
@@ -188,9 +233,9 @@ artifact template's existing tool/reasoning-instruction composition.
 At startup, NInfer resolves prompt capabilities from the exact `frontend/chat_template.jinja`
 resource embedded in the loaded artifact. It does not infer them from the request's `model` field,
 the artifact identity, or a target profile. A recognized effort-capable template exposes `low`,
-`medium`, and `xhigh`; omitting effort uses that template's declared default. An explicit effort
-not exposed by the loaded template returns HTTP 400 with code
-`reasoning_effort_not_supported` before prompt preparation.
+`medium`, and `xhigh`; omitting effort uses that template's declared default. After any
+protocol-specific mapping described below, an effort not exposed by the loaded template
+returns HTTP 400 with code `reasoning_effort_not_supported` before prompt preparation.
 
 For Chat Completions, `reasoning_effort: "none"` disables thinking. `low`, `medium`, and `xhigh`
 select the corresponding template effort when available. The other OpenAI protocol values
@@ -206,6 +251,27 @@ both OpenAI spellings are present they must carry the same boolean value. Unknow
 Streaming begins with an assistant-role chunk, sends separate reasoning and content deltas, then a
 finish-reason chunk and `[DONE]`. When `stream_options.include_usage` is true, a final empty
 `choices` chunk contains completed usage.
+
+Chat Completions usage includes `prompt_tokens_details.cached_tokens`: the actual input tokens
+restored from the Engine's prefix cache, including resident-frontier and saved-checkpoint reuse.
+`prompt_tokens` still includes these tokens; neither completion nor speculative draft tokens count
+as cache hits. Cold requests and `--no-prefix-reuse` return zero. Non-streaming text and tool-call
+responses return this field in `usage`; streaming clients must request
+`"stream_options":{"include_usage":true}` and read it from the final usage chunk before `[DONE]`.
+
+```json
+{
+  "usage": {
+    "prompt_tokens": 1000,
+    "completion_tokens": 128,
+    "total_tokens": 1128,
+    "prompt_tokens_details": {"cached_tokens": 900}
+  }
+}
+```
+
+The token cache-hit rate for this request is `900 / 1000 = 90%`. It is not the fraction of requests
+with a hit. The Responses API reports the same reuse as `usage.input_tokens_details.cached_tokens`.
 
 ### Multimodal request
 
@@ -308,7 +374,7 @@ wire response contains typed `output` Items.
 | `temperature` | finite number in `[0,2]` |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
-| `reasoning.effort` | `none` disables thinking; `low`, `medium`, or `xhigh` selects an effort exposed by the loaded chat template; `minimal`, `high`, and `max` return `reasoning_effort_not_supported` for the registered templates |
+| `reasoning.effort` | `none` disables thinking. On graded Qwen templates, `minimal`/`low` map to `low`, `medium` to `medium`, and `high`/`xhigh`/`max` to `xhigh`. On toggle-only templates, every non-`none` value enables thinking without a graded budget. |
 | `chat_template_kwargs.preserve_thinking` | optional boolean controlling whether closed-turn reasoning remains in reconstructed prompts |
 | `preserve_thinking` | top-level alias for the same option; conflicting values are rejected |
 | `text.format` | omitted or `{"type":"text"}` only |
@@ -324,6 +390,10 @@ wire response contains typed `output` Items.
 
 Unknown top-level fields fail with `unknown_parameter`. Recognized but unsupported features fail
 with a field-specific 400 error instead of being silently ignored.
+
+For example, use `"reasoning":{"effort":"high"}` in a Responses request. This is a local
+mapping to the checkpoint's template controls, not an OpenAI-equivalent reasoning token budget.
+The response echoes the requested effort. `reasoning.summary` remains unsupported.
 
 ### Input Item contract
 
@@ -520,6 +590,13 @@ an effort with `thinking.type: "disabled"` is rejected as contradictory.
 
 Anthropic's `model` field is treated as a response label and does not select the loaded artifact.
 
+Messages usage reports `cache_read_input_tokens` for actual prefix-cache reuse and `input_tokens`
+for the remaining uncached input. Their sum is the complete templated input-token count.
+`cache_creation_input_tokens` is zero: NInfer does not expose a separate cache-creation accounting
+category. For SSE, `message_start.usage.input_tokens` is provisional (the prepared full input);
+the terminal `message_delta.usage` contains authoritative cumulative input, cache-read and output
+counts. Replace the initial counts with these final values rather than adding them.
+
 `POST /v1/messages/count_tokens` uses the artifact's tokenizer, chat template, and media expansion
 without running GPU generation:
 
@@ -561,6 +638,7 @@ curl http://127.0.0.1:8080/v1/models \
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--prefill-decode-rounds N` | experimental decode rounds between prefill steps while both phases are runnable; `1..64`; larger values favor existing streams and delay the prefilling request's first token | `1` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--device N` | CUDA device index | `0` |
 | `--tp 1\|2` | tensor-parallel width; `2` splits the model across two GPUs | `1` |
@@ -576,12 +654,16 @@ curl http://127.0.0.1:8080/v1/models \
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--kv-dtype bf16\|int8` | KV-cache storage | `bf16` |
-| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/PP1, concurrency 1, INT8 KV, Text/None/MTP; excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--prefix-cache-tokens N` | historical host KV budget in unique page-rounded Main Text tokens; `0` disables historical branches, preserving current GPU-prefix reuse | `384000` |
+| `--volta-long-attention` | startup-fixed experimental complete-history attention; SM70 27B TP2/TP4, PP1, experimental concurrency 1–8, INT8 KV, Text/None/MTP (Vision on TP2 only); excludes RAM-KV; floating-point association and output IDs may change | off |
+| `--volta-fast-decode` | experimental QUASAR SM70 TP2/TP4 Text/None/MTP numeric profile: packed NVFP4 FP32 epilogue and MTP W8 reductions; may change logits, acceptance and output; excludes Vision/DFlash/PP2 | off |
 | `--spec mtp\|dflash` | speculative backend | off |
 | `--draft-tokens N` | MTP `1..5`; DFlash `1..7` on 27B, `1..15` on 35B-A3B | unset |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--default-max-tokens N` | output limit when omitted by a request | `65536` |
+| `--max-output-tokens N` | server-wide hard output limit for Chat Completions, Responses and Messages; `0` disables it | `0` |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--vision-device gpu\|cpu` | visual encoder placement; requires `--vision` for CPU; CPU weights remain in host RAM, final BF16 embeddings upload; may change numerical outputs | `gpu` |
 | `--vision-max-tokens N` | merged visual-token limit per prompt and reserved Vision workspace bound, independent of the text context ceiling; `1..32768` | `32768` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
@@ -596,6 +678,11 @@ curl http://127.0.0.1:8080/v1/models \
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
 | `--greedy` | force exact argmax for all requests | off |
+
+Requests above `--max-output-tokens` return HTTP 400 with code `max_output_tokens_exceeded`
+before model preparation. An omitted default output budget is lowered to this ceiling when needed;
+an explicit `--default-max-tokens` above it is rejected at startup. The Engine additionally limits
+generation to the remaining total context capacity.
 
 Engine selects sampling defaults from the loaded model and the request's resolved thinking mode.
 Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
@@ -631,7 +718,7 @@ they do not infer request behavior from process-global counter deltas.
 | `request_rejected` | parsed request shape, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, unrounded phase seconds, and complete speculative-decoding counters |
 | `request_error` | the resolved request configuration and generation error message |
-| `throughput` | interval token deltas and rates, scheduler occupancy, and decode-round batch statistics |
+| `throughput` | interval token deltas and rates, drafted/accepted draft deltas, scheduler occupancy, and decode-round batch statistics |
 
 At `--tp 2` every other `engine` and `memory` field in `server_start` is the primary rank's; `tp`
 and `devices` are what identify the record as a dual-device run and name the second GPU. Per-device
@@ -641,6 +728,9 @@ memory rows remain a console load-summary table rather than structured-log field
 as full-precision JSON numbers. Its `speculative` object contains `backend`, `draft_window`, `rounds`,
 `drafted_tokens`, `accepted_tokens`, `fallback_steps`, and `accepted_per_position`. Rates can be
 derived downstream from raw token counts and seconds instead of rounded stderr strings.
+`throughput.speculative` contains interval `drafted_tokens` and `accepted_tokens` deltas for
+live draft acceptance (`accepted / drafted`, undefined when drafted is zero). These count
+target-accepted drafts, excluding bonus tokens, not all committed output tokens.
 
 The JSONL file contains no generated response text and never records an API-key value; `argv`
 replaces that value with `<redacted>`. The existing stderr summaries remain available for operators
@@ -678,6 +768,12 @@ capacity returns HTTP 429 with code `server_overloaded`. The absolute
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
 There is no admission ETA or unbounded overflow queue.
 
+When prefill and decode are both runnable, `--prefill-decode-rounds N` runs up to `N`
+compact decode rounds between bounded prefill steps. The default `1` retains alternation;
+larger values favor existing streams and increase the prefilling request's TTFT. Each round
+still includes every decode-ready lane and processes completion/cancellation at its boundary.
+With one active request, or when only one phase is runnable, this option has no effect.
+
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
 media request retains the same cancellation and timeout deadline. Model output is bounded by the
@@ -713,13 +809,38 @@ therefore resets the prefix instead of reusing placeholder-token KV. Media wholl
 prefix skips Vision execution, while new suffix media is encoded normally. The completion log
 reports the reused token count as `cache=`.
 
-The prefix cache is process-local retained Engine state. Restarting the server clears it. With one
-active slot, serving an unrelated conversation can replace the retained entry; it is not a persistent
-cache of every conversation. Only the current resident frontier and a saved complete turn/response
-checkpoint are eligible reuse positions, rather than an arbitrary longest common token prefix.
+The prefix cache is process-local Engine state; restarting the server clears it. Text/None/MTP
+with complete GPU KV also retains historical branches and multiple conversation trees in host RAM.
+Before an old resident branch is overwritten or its lane evicted, its original Main/MTP KV and
+complete continuation checkpoints can be archived. `--prefix-cache-tokens` defaults to **384000**
+unique page-rounded Main Text tokens, shared across all trees; overflow evicts the oldest archived
+branch first. A historical hit restores private writable GPU pages and exact state, including
+completed-sibling fan-out. `ABD → ABC → ABDE` can therefore recover ABD. Setting the budget
+to zero keeps current resident reuse but disables historical retention. This is not disk persistence
+or a process RSS cap: QUASAR INT8 Main KV plus MTP can use about **12.8 GiB RAM** at the 384K default
+(about **33.4 GiB RAM** at 1M tokens),
+plus state images and transfer headroom. In addition to the current resident frontier and a saved complete
+turn/response checkpoint, reusable text requests with None/MTP speculation and complete GPU KV
+retain bounded RAM checkpoints of every rank's exact GDN state and the target tail hidden.
+Shorter prompts or edits to a later suffix restore the longest saved frontier within their common
+token/position prefix and recompute only the remaining suffix. Cache usage counts only tokens
+whose computation was actually skipped. There is no arbitrary substring reuse or guarantee that
+every common-prefix token has a saved recurrent state.
+
+Active-lane state images have a 2 GiB per-Program budget divided among configured lanes;
+archived state has a separate 2 GiB cap, in addition to the historical KV token budget. Capture uses
+one early boundary (half the prompt, capped at 64 tokens), then
+budget-spaced actual prefill chunk ends and the final prompt boundary. The early split rejoins
+the ordinary chunk grid; not every small GPU chunk is copied to RAM. Under the budget, older
+redundant images are evicted, preserving a first and recent checkpoint when two images fit.
+Capture/restore transfer time is included
+in prefill timing. `--no-prefix-reuse` also skips these captures. Vision, DFlash and sparse RAM-KV
+keep the existing frontier/turn/response rules and do not archive historical branches.
+See [prefix state ownership](maintainer/paged-kv-cache.md#10-prefix-reuse).
 
 The shared family runtime distinguishes `full_reset`, `append_frontier`,
-`restore_turn_checkpoint`, and `restore_response_checkpoint`. Both checkpoint kinds include the
+`restore_turn_checkpoint`, `restore_response_checkpoint`, and `restore_prefix_checkpoint`.
+Every restored checkpoint includes the
 recurrent, hidden, and selected speculative-backend continuation state required to recompute a
 rewritten suffix; matching KV tokens alone never authorize a partial hit. With stable
 `preserve_thinking=true`, the auxiliary checkpoint rolls to the prompt frontier after the current
@@ -764,3 +885,28 @@ can neither begin nor continue a code point, or a code point cut short by the ou
 is published as one U+FFFD replacement character per ill-formed sequence. This is a per-request
 text outcome: it never fails the request and never takes the server out of service. Token
 accounting is unaffected, since the generated token IDs remain exactly what the model produced.
+
+## CPU visual encoding (0.1.2)
+
+Use `--vision --vision-device cpu` to trade visual encoding latency and host RAM for lower GPU
+residency. Source codes and FP16 group scales are decoded exactly to one FP32 host copy on load;
+there is no new weight quantization. CPU Ops retain BF16 activation/result boundaries, 2-D RoPE,
+all causally permitted language keys and all keys within each temporal vision segment. CPU and
+CUDA reduction/GEMM arithmetic are not bit-identical, so embeddings and output can differ.
+No new GPQA or task-accuracy percentage is available.
+
+CPU visual encoding runs in the submitting thread after the bounded ingress slot is reserved,
+before the request joins the GPU FIFO. It reads immutable weights and does not hold the GPU
+execution lock; other requests may continue decoding. Explicit submission deadlines and cancellation also bound
+CPU work; the ordinary Engine default queue timeout begins after encoding. Request references are
+freed after their GPU consumers finish. A Program-local immutable embedding cache retains at most 128 MiB in FIFO order, keyed by media digest, modality and grid;
+repeated images do not rerun the CPU tower. This cache is separate from the text KV history budget. Large media still consumes host scratch
+space in addition to resident tower weights. CPU placement does not enable Vision on unsupported
+artifacts, TP4, PP2, DFlash or sparse RAM-KV.
+For serving large CPU media, increase `--pending-timeout-ms` (for example `600000`); the server
+default of 30 seconds still covers preparation and can expire during CPU encoding. GUI/TUI select
+600000 ms when CPU Vision is enabled. The deadline is finite and can still reject oversized work.
+
+`--volta-long-attention` can be combined with GPU or CPU Vision on SM70 27B TP2/PP1, complete
+INT8 group-64 KV, None/MTP and experimental concurrency 1–8. It remains default-off and changes
+floating-point association. `--volta-fast-decode` remains incompatible with Vision.

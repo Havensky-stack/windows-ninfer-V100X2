@@ -4,6 +4,7 @@
 // consumed by external OpenAI clients.
 
 #include "serve/openai_schema.h"
+#include "serve/generation_service.h"
 #include "serve/request.h"
 #include "serve/translate.h"
 
@@ -686,6 +687,32 @@ int test_tool_chunk_serialization() {
     return failures;
 }
 
+int test_cache_usage_serialization() {
+    int failures = 0;
+    for (const int cached : {0, 37, 100}) {
+        GenerationOutcome outcome;
+        outcome.prompt_tokens = 100;
+        outcome.completion_tokens = 9;
+        outcome.metrics.prefix_cache_hit_tokens = cached;
+        const CompletionUsage usage = outcome.usage();
+        const Json expected = {{"prompt_tokens", 100}, {"completion_tokens", 9},
+                               {"total_tokens", 109},
+                               {"prompt_tokens_details", Json{{"cached_tokens", cached}}}};
+        const Json response = Json::parse(make_chat_completion_response(
+            "id-cache", "m", 1, "answer", "", "stop", usage));
+        failures += check(response.at("usage") == expected,
+                          "chat usage must report actual reuse without subtracting input tokens");
+        const std::vector<ToolCall> calls = {ToolCall{"call_1", "lookup", "{}"}};
+        const Json tool = Json::parse(make_chat_completion_tool_response(
+            "id-cache", "m", 1, "", "", calls, usage));
+        failures += check(tool.at("usage") == expected, "tool response cached-token usage");
+        const Json chunk = parse_sse(make_chat_chunk_usage("id-cache", "m", 1, usage));
+        failures += check(chunk.at("usage") == expected && chunk.at("choices").empty(),
+                          "streaming usage must match non-streaming cached-token usage");
+    }
+    return failures;
+}
+
 int test_models_and_error() {
     int failures    = 0;
     const Json list = Json::parse(make_models_list("qwen3.6-27b", 1));
@@ -723,10 +750,50 @@ int test_finish_reason_wire() {
     return failures;
 }
 
+int test_output_token_cap() {
+    RequestLimits cap;
+    cap.default_max_tokens = 64;
+    cap.max_output_tokens = 64;
+    Json body = {{"model", "m"}, {"messages", Json::array({{{"role", "user"}, {"content", "hello"}}})}};
+    int failures = 0;
+    for (int tokens : {32, 64}) {
+        body["max_tokens"] = tokens;
+        const auto out = parse_chat_completion_request(body, cap);
+        failures += check(out.max_tokens == tokens, "output cap rejected a supported budget");
+    }
+    body["max_tokens"] = 65;
+    bool rejected = false;
+    try { (void)parse_chat_completion_request(body, cap); }
+    catch (const ApiException& error) {
+        rejected = error.error().status == 400 &&
+                   error.error().code == "max_output_tokens_exceeded" &&
+                   error.error().param == "max_tokens";
+    }
+    failures += check(rejected, "output cap did not reject an oversized request");
+    body.erase("max_tokens");
+    auto out = parse_chat_completion_request(body, cap);
+    failures += check(out.max_tokens == 64, "output cap changed the default budget");
+    body["max_completion_tokens"] = 65;
+    rejected = false;
+    try { (void)parse_chat_completion_request(body, cap); }
+    catch (const ApiException& error) {
+        rejected = error.error().code == "max_output_tokens_exceeded" &&
+                   error.error().param == "max_completion_tokens";
+    }
+    failures += check(rejected, "max_completion_tokens bypassed the output cap");
+    body.erase("max_completion_tokens");
+    cap.max_output_tokens = 0;
+    body["max_tokens"] = 65;
+    out = parse_chat_completion_request(body, cap);
+    failures += check(out.max_tokens == 65, "disabled output cap still limits requests");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_output_token_cap();
     failures += test_parse_string_content();
     failures += test_preserve_thinking_options();
     failures += test_reasoning_effort();
@@ -742,6 +809,7 @@ int main() {
     failures += test_tool_response_serialization();
     failures += test_chunk_serialization();
     failures += test_tool_chunk_serialization();
+    failures += test_cache_usage_serialization();
     failures += test_models_and_error();
     failures += test_finish_reason_wire();
     if (failures == 0) { std::cout << "ok\n"; }

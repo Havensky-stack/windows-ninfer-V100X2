@@ -50,6 +50,11 @@ struct GenerationOutcome {
     std::size_t streamed_content_bytes = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     GenerationMetrics metrics;
+
+    [[nodiscard]] CompletionUsage usage() const {
+        return {prompt_tokens, completion_tokens,
+                static_cast<int>(metrics.prefix_cache_hit_tokens)};
+    }
 };
 
 struct StreamSink {
@@ -65,6 +70,8 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    // Destroy the generation handle before releasing the lifecycle reservation.
+    std::shared_ptr<RequestLifetime> lifetime;
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
@@ -77,7 +84,15 @@ struct PreparedRequest {
     bool enable_thinking                   = true;
     bool preserve_thinking                 = false;
     bool preserve_thinking_semantic_change = false;
-    std::shared_ptr<RequestLifetime> lifetime;
+};
+
+struct ModelResidency {
+    std::string state = "gpu"; // gpu, offloading, ram, loading
+    std::uint64_t retained_host_bytes = 0;
+    std::string phase;
+    std::uint64_t done = 0;
+    std::uint64_t total = 0;
+    std::size_t active_requests = 0;
 };
 
 class GenerationService {
@@ -86,19 +101,21 @@ public:
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
-    [[nodiscard]] ninfer::LoadSummary load_summary() const { return engine_->load_summary(); }
+    [[nodiscard]] ninfer::LoadSummary load_summary() const { return load_; }
 
-    [[nodiscard]] ninfer::MemorySummary memory_summary() const { return engine_->memory_summary(); }
+    [[nodiscard]] ninfer::MemorySummary memory_summary() const;
 
-    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
+    [[nodiscard]] ninfer::RuntimeStats runtime_stats() const;
 
-    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
-        return engine_->media_cache_summary();
-    }
+    [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const;
 
     [[nodiscard]] ninfer::ModelSamplingDefaults sampling_defaults() const {
-        return engine_->sampling_defaults();
+        return sampling_defaults_;
     }
+
+    [[nodiscard]] ModelResidency model_residency() const;
+    void offload_to_memory();
+    void load_from_memory();
 
     [[nodiscard]] PreparedRequest prepare(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
@@ -118,6 +135,13 @@ private:
     std::unique_ptr<ninfer::Engine> engine_;
     ninfer::PromptCapabilities prompt_capabilities_;
     std::shared_ptr<RequestCapacity> request_capacity_;
+    ninfer::EngineOptions engine_options_;
+    ninfer::LoadSummary load_;
+    ninfer::ModelSamplingDefaults sampling_defaults_;
+    ninfer::ModelMemory host_model_;
+    ModelResidency residency_;
+    ninfer::RuntimeStats completed_stats_;
+    void update_load_progress(std::string_view phase, std::uint64_t done, std::uint64_t total);
 };
 
 } // namespace ninfer::serve

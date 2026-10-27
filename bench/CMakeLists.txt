@@ -80,6 +80,16 @@ target_include_directories(ninfer_v100_task_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
 target_link_libraries(ninfer_v100_task_bench PRIVATE ninfer_engine)
 
+add_executable(ninfer_v100_ttft_bench ${PROJECT_SOURCE_DIR}/tools/v100/bench_ttft.cpp)
+target_include_directories(ninfer_v100_ttft_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_v100_ttft_bench PRIVATE ninfer_engine)
+
+add_executable(ninfer_v100_concurrency_bench ${PROJECT_SOURCE_DIR}/tools/v100/bench_concurrency.cpp)
+target_include_directories(ninfer_v100_concurrency_bench PRIVATE
+  ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/third_party)
+target_link_libraries(ninfer_v100_concurrency_bench PRIVATE ninfer_engine)
+
 add_executable(ninfer_v100_corpus ${PROJECT_SOURCE_DIR}/tools/v100/prepare_corpus.cpp)
 target_include_directories(ninfer_v100_corpus PRIVATE
   ${PROJECT_SOURCE_DIR}/src

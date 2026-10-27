@@ -37,6 +37,10 @@ class MaterializedArtifact;
                                          ObjectHandle handle, NumericFormat format,
                                          std::int32_t rows, std::int32_t columns, int device = 0);
 
+// Complete, host-resident row-split tensors. These never expose a device pointer.
+[[nodiscard]] Weight materialized_host_weight(const MaterializedArtifact& materialized,
+    ObjectHandle handle, NumericFormat format, std::int32_t rows, std::int32_t columns);
+
 // Shared shape-vs-placement guard, exposed so target-owned wrappers (NVFP4 weights, which the
 // generic `materialized_weight` refuses) can discharge the same obligation.
 void require_placement_bytes(const MaterializedArtifact& materialized, ObjectHandle handle,

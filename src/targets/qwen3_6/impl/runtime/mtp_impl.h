@@ -42,7 +42,6 @@ struct MtpRoundView {
     Tensor alignment_ids;
     Tensor alignment_hidden;
     Tensor ar_hidden;
-    Tensor next_hidden;
     Tensor ar_positions;
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
@@ -77,7 +76,6 @@ MtpRoundView slice_mtp_frame(qwen3_6::MtpDecodeState& frame, std::int32_t batch_
     out.alignment_ids     = frame.alignment_ids.slice(1, 0, batch_size);
     out.alignment_hidden  = frame.alignment_hidden.slice(2, 0, batch_size);
     out.ar_hidden         = frame.ar_hidden.slice(1, 0, batch_size);
-    out.next_hidden       = frame.next_hidden.slice(1, 0, batch_size);
     out.ar_positions      = frame.ar_positions.slice(0, 0, batch_size);
     out.ar_rope_positions = frame.ar_rope_positions.slice(0, 0, batch_size);
     out.ar_valid_columns  = frame.ar_valid_columns.slice(0, 0, batch_size);
@@ -164,17 +162,10 @@ void mtp_bridge_tp2(PrefillContext& state, const Tensor& next_token,
         for (int index = 1; index < static_cast<int>(state.mtp_proposal_extent); ++index) {
             Tensor previous = state.execution.io.mtp->draft_tokens.slice(0, index - 1, 1);
             Tensor next = state.execution.io.mtp->draft_tokens.slice(0, index, 1);
-            const auto next_hidden = rank_views(state.execution, [&](int rank) {
-                return rank == 0 ? state.execution.prefill_hidden.slice(1, index, 1)
-                                 : tp[rank - 1].prefill_hidden->slice(1, index, 1);
-            });
             const auto ar_visible = static_cast<std::uint32_t>(position + index + 1);
             card.mtp_forward_ar_step(previous, ar_hidden, ar_positions, {ar_visible, ar_visible},
-                                     next_hidden, logits, next);
+                                     ar_hidden, logits, next);
             for_each_rank(ec, [&](int rank) {
-                CUDA_CHECK(cudaMemcpyAsync(ar_hidden[rank].data, next_hidden[rank].data,
-                                           ar_hidden[rank].bytes(), cudaMemcpyDeviceToDevice,
-                                           ec.dev[rank]->stream));
                 ops::increment_i32_scalar(ar_positions[rank], ec.dev[rank]->stream);
             });
         }
@@ -240,14 +231,10 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
     for (int i = 1; i < static_cast<int>(state.mtp_proposal_extent); ++i) {
         Tensor previous_token = state.execution.io.mtp->draft_tokens.slice(0, i - 1, 1);
         Tensor next_draft     = state.execution.io.mtp->draft_tokens.slice(0, i, 1);
-        Tensor next_hidden    = state.execution.prefill_hidden.slice(1, i, 1);
         const auto visible    = static_cast<std::uint32_t>(position + i + 1);
         const ops::GqaExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
-                                 envelope, next_hidden, logits, next_draft);
-        CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
-                                   state.execution.io.mtp->ar_hidden.bytes(),
-                                   cudaMemcpyDeviceToDevice, state.execution.device.stream));
+                                 envelope, state.execution.io.mtp->ar_hidden, logits, next_draft);
         ops::increment_i32_scalar(ar_position, state.execution.device.stream);
     }
 }
@@ -324,13 +311,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                                    .view({batch_size});
                 Tensor previous_batch    = previous.view({1, batch_size});
                 Tensor hidden_batch      = v.ar_hidden.view({TextConfig::hidden, 1, batch_size});
-                Tensor next_hidden_batch = v.next_hidden.view({TextConfig::hidden, 1, batch_size});
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
-                                              v.mtp_rows, envelopes.ar[step], next_hidden_batch);
-                card.mtp_propose_batch(v.next_hidden, v.proposal_logits, next);
-                CUDA_CHECK(cudaMemcpyAsync(v.ar_hidden.data, v.next_hidden.data,
-                                           v.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
-                                           state.execution.device.stream));
+                                              v.mtp_rows, envelopes.ar[step], hidden_batch);
+                card.mtp_propose_batch(v.ar_hidden, v.proposal_logits, next);
             }
         } else {
             const auto& ec = *tp[0].execution;
@@ -391,19 +374,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                 const auto hidden = rank_views(state.execution, [&](int rank) {
                     return views[rank].ar_hidden.view({TextConfig::hidden, 1, batch_size});
                 });
-                const auto output = rank_views(state.execution, [&](int rank) {
-                    return views[rank].next_hidden.view({TextConfig::hidden, 1, batch_size});
-                });
                 card.mtp_forward_decode_batch(previous, hidden, positions, rope, valid,
                                               field(&MtpRoundView::mtp_rows),
-                                              envelopes.ar[step], output);
-                card.mtp_propose_batch(field(&MtpRoundView::next_hidden), proposal_logits, next);
-                for_each_rank(ec, [&](int rank) {
-                    auto& value = views[rank];
-                    CUDA_CHECK(cudaMemcpyAsync(value.ar_hidden.data, value.next_hidden.data,
-                                               value.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
-                                               ec.dev[rank]->stream));
-                });
+                                              envelopes.ar[step], hidden);
+                card.mtp_propose_batch(field(&MtpRoundView::ar_hidden), proposal_logits, next);
             }
         }
 

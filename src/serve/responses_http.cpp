@@ -209,6 +209,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_output_tokens = options_.max_output_tokens;
         request                   = parse_responses_request(parse_json_body(req), limits);
         validate_model(request.generation.model, public_model_id_);
         if (request.previous_response_id) {
@@ -358,6 +359,7 @@ void HttpServer::handle_response_input_tokens(const httplib::Request& req, httpl
     try {
         RequestLimits limits;
         limits.default_max_tokens = options_.default_max_tokens;
+        limits.max_output_tokens = options_.max_output_tokens;
         ResponsesRequest request =
             parse_response_input_tokens_request(parse_json_body(req), limits);
         validate_model(request.generation.model, public_model_id_);

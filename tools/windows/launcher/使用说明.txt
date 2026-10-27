@@ -1,4 +1,4 @@
-NInfer Windows 双 V100 · 0.1.3 预览版
+NInfer Windows 双 V100 · 0.1.4 预览版
 
 1. 安装适合自己显卡的 NVIDIA 驱动。本机验证：Windows 11 + GRID 553.62 + 两张 V100-SXM2 16GB，WDDM/TCC。
 2. 完整解压 ZIP 到自己有写权限的目录，双击 NInfer.exe。不要在压缩包内直接运行，不要单独复制 EXE。
@@ -29,6 +29,8 @@ TCC不能承担游戏图形渲染；RX550仍可显示。TCC不保证P2P，本机
 模型：Merkyor 发布的 Qwen3.8-27B-Coder390-EfficientThink-W4A4-MTP-DFlash2.ninfer v3。
 仅支持本项目登记的模型，不能直接加载普通 GGUF、safetensors 或任意同后缀文件。
 MTP与DFlash严格校验均有1/64位置不一致，默认普通解码，投机功能需手动启用。Vision未验收。
+0.1.4同步上游历史前缀、RAM模型卸载/重载等能力，新增配置通过CLI/API使用，中文启动器选项范围不变。
+修复DFlash Graph地址更新启动失败，补齐OpenBLAS运行依赖；本轮未证明吞吐或模型质量提升。
 20万容量完成了分配及短问答，不代表填满上下文后的速度和质量；游戏会减少可用显存。
 本包未做代码签名。首次运行可能显示未知发布者；请从本仓库Release下载并核对SHA256SUMS.txt。
 

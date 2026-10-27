@@ -24,9 +24,12 @@ struct Profile {
 };
 
 int run_profile(std::string_view label, const Profile& profile,
-                std::span<const std::int32_t> token_cases);
+                std::span<const std::int32_t> token_cases,
+                bool volta_prepacked = false, bool volta_fp32_scale = false);
 
 int run_column_parallel_profile(std::string_view label, const Profile& shard_profile,
-                                std::span<const std::int32_t> token_cases);
+                                std::span<const std::int32_t> token_cases,
+                                bool volta_prepacked = false, bool volta_fp32_scale = false,
+                                bool fp16_image = false, bool fp16_output_image = false);
 
 } // namespace ninfer::test::linear_swiglu

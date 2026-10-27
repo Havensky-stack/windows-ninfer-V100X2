@@ -93,38 +93,65 @@ load, graph construction, and warmup do not enter topology counts.
 
 ## Stop-aware V100 task probes
 
-`ninfer_v100_task_bench` uses the public Engine and saved exact-token workload cases, selected
-by task and occupancy (`all` selects every matching case). It uses TP2, 98304 capacity, chunk
-1024, full INT8 KV, text-only greedy CUDA Graphs, one complete warmup per case, the corpus's
-repetition count and no prefix reuse. Model-default stopping is enabled. JSONL answers are
-checked for exactly 32 JSON records,
-field order and the requested numeric/string values. `decode_tok_s` counts committed output
-after the first token over request wall time; `decode_phase_tok_s` retains the Engine phase rate.
+`ninfer_v100_task_bench` measures speed through the public Engine using saved exact-token
+workload cases and a named GUI configuration. The retained matrix uses QUASAR TP2 devices
+0,1, MTP4, full INT8 KV and one active request. Context/KV capacity, prefill chunk, Vision
+startup, CUDA Graphs, proposal head and experimental decode switches come from the selected
+configuration. Measurements override sampling to greedy with zero presence/frequency penalties
+and disable prefix reuse. Input tokens retain the corpus's thinking setting.
 
 ```bash
-cmake --build build-v100-tp4 --target ninfer_v100_task_bench -j4
+cmake --build build-v100-tp4 --target ninfer_v100_task_bench -j8
 build-v100-tp4/bench/ninfer_v100_task_bench \
   /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
   profiles/bench/other_inputs_20261001/cases.json \
-  profiles/bench/quasar-qpn-projections/all-dflash7.json dflash all all 600 180
+  profiles/bench/quasar-mtp4-speed-20261019/text-long.json \
+  tools/v100/configs/defaults.json \
+  '无视觉-mtp4-满上下文-长上下文速度优化' all all 30 65536
 ```
 
-The cases file is an existing local measurement prerequisite, not a downloaded model. Use
-`mtp` instead of `dflash` and another report path for matched MTP3. For a single probe, replace
-`all all` with e.g. `structured_jsonl 85000`. Both modes preserve output
-IDs, content, checks, acceptance counts and phase times. A failed task check returns nonzero
-after saving measurements, so high throughput cannot silently qualify malformed JSONL answers.
-Other tasks retain their content for task-specific evaluation; throughput is not a quality score.
-The final arguments bound the active window and rest interval. At request boundaries, the runner
-reserves 120 seconds for the next request, then rests outside inference timing (600/180 means
-roughly 8–10 minutes active, three minutes idle). Reports are atomically replaced and synced after
-each measured request. An existing matching report resumes only its missing repetitions; a
-different artifact/backend/runtime profile is rejected instead of mixing results.
-JSON event lines on stdout identify load, graph priming, each warmup and measured request,
-and cooldown boundaries with UTC epoch and monotonic timestamps. Per-second cumulative Engine counters
-show actual prefill/decode progress without additional CUDA synchronization. Attach the read-only
-[`health_log.py`](../tools/v100/health_log.py) collector to the benchmark PID to preserve GPU,
-host and workload-thread telemetry alongside these events.
+The cases file is an existing local measurement prerequisite. Task and occupancy select cases;
+`all all` selects the full matrix, while `structured_jsonl 85000` selects one probe. Each case
+receives one full warmup and its saved repetition count. Model-default stopping is enabled.
+`decode_tok_s` counts committed output after the first token over request wall time;
+`decode_phase_tok_s` retains the Engine phase rate. Reports also record prefill throughput,
+first-token latency, total request time, actual token counts and speculative acceptance.
+These are speed measurements; the runner does not grade generated answers.
+
+Load, graph priming and warmup are outside measured request timing. The final `REST_SECONDS` and
+`REST_MIN_PROMPT_TOKENS` arguments set an idle interval before requests at or above the given
+input length, including warmup and measured requests. `30 65536` leaves 30 seconds idle
+for 64K/85K inputs and runs shorter inputs without an interval. `0 0` disables it. Idle time
+is excluded from request timings and recorded per measurement, including resumed campaigns.
+Reports retain the configuration and are atomically replaced and synced after every measured
+request. An existing matching report resumes only its missing repetitions; mismatched runtime
+profiles are rejected. JSON event lines identify load, graph priming, warmup and measured
+requests with UTC epoch and monotonic timestamps. Per-second cumulative Engine counters show
+prefill/decode progress without additional CUDA synchronization. Attach the read-only
+[`health_log.py`](../tools/v100/health_log.py) collector to the benchmark PID for GPU, host
+and workload-thread telemetry.
+
+## Fully cached V100 TTFT
+
+`ninfer_v100_ttft_bench WEIGHTS REPORT CONFIG_LIBRARY PROFILE` measures the public Engine
+with exactly 300 prompt tokens, MTP4 and the selected configuration's resident-model settings.
+It runs raw-token RAM checkpoints and chat GPU rewrite checkpoints separately, verifies 300
+reused tokens and zero computed prefill tokens, and records 15 warmed repetitions per path.
+`stream_first_ms` is measured from `generate()` to the first nonempty `OutputSink` delta;
+prompt preparation, model load and graph priming are outside this interval. Engine TTFT also
+includes the separately recorded preparation time. Requests produce 64 output tokens, with
+an additional single-output control. Untimed greedy, single-output and seeded sampled controls
+retain IDs, MTP counters and BF16 logits for comparison across builds. Prefix capture is part
+of setup; debug logit copies are disabled during timing.
+
+```bash
+cmake --build build-v100-tp4 --target ninfer_v100_ttft_bench -j8
+build-v100-tp4/bench/ninfer_v100_ttft_bench \
+  /Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  profiles/bench/quasar-cached-ttft-20261019/final.json \
+  tools/v100/configs/defaults.json \
+  '无视觉-mtp4-满上下文-长上下文速度优化'
+```
 
 ## Linear Op benchmark
 

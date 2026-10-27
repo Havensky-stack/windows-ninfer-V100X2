@@ -77,6 +77,11 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash,
 };
 
+enum class VisionDevice : std::uint8_t {
+    Gpu,
+    Cpu,
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     std::uint32_t draft_tokens = 0;
@@ -98,9 +103,9 @@ struct EngineOptions {
     std::filesystem::path artifact_path;
     int device = 0;
     // Tensor-parallel degree: 1, 2 or 4. Parallel execution requires `devices` to name exactly
-    // tp distinct ids of the same compute capability. The 27B package supports TP2 Text/MTP
-    // its optional DFlash2 backend, and Vision; TP4 supports SM70 Qwen3.8 NVFP4/native FP8
-    // Text/MTP without Vision. The 35B-A3B package requires TP1.
+    // tp distinct ids of the same compute capability. The 27B package supports TP2 Text/MTP,
+    // its optional DFlash2 backend, and Vision; TP4 supports SM70 Qwen3.8 official NVFP4,
+    // QUASAR NVFP4 and native FP8 Text/MTP without Vision. The 35B-A3B package requires TP1.
     int tp = 1;
     // Pipeline degree. PP2 owns complete consecutive layer ranges on two SM70 devices;
     // it requires TP1, one active request, Text, and None/MTP speculation.
@@ -124,14 +129,22 @@ struct EngineOptions {
     double yarn_factor                 = 4.0;
     std::uint32_t yarn_origin          = 262144;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
+    // Host historical branch KV budget; page-rounded unique tokens. Zero disables history.
+    std::uint32_t prefix_cache_tokens  = 384000;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Decode rounds between bounded prefill steps when both phases are runnable (1..64).
+    // More rounds favor active streams at the cost of the prefilling request's TTFT.
+    std::uint32_t prefill_decode_rounds = 1;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
-    // Complete-history SM70 TP2 long attention with coarser KV partitions and FP32 PV.
+    // Complete-history SM70 TP2/TP4 long attention with coarser KV partitions and FP32 PV.
     // Numerically qualified, not output-bit-equivalent to the default profile.
     bool volta_long_attention          = false;
+    // QUASAR SM70 TP2/TP4 Text/None/MTP: packed NVFP4 FP32 epilogues and MTP W8 reductions.
+    // Changes arithmetic; independent of the optional complete-history attention profile.
+    bool volta_fast_decode             = false;
     RamKvOptions ram_kv;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -139,6 +152,8 @@ struct EngineOptions {
     // Zero selects a bounded worker count from the detected host concurrency.
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
+    // CPU keeps the complete visual encoder in host RAM; only embeddings reach the GPU.
+    VisionDevice vision_device             = VisionDevice::Gpu;
     // Aggregate merged visual tokens per prompt; startup Vision scratch and transient allocations
     // use min(max_context, vision_max_tokens), independent of the text context ceiling.
     std::uint32_t vision_max_tokens         = kMaximumVisionTokenBudget;
@@ -442,6 +457,7 @@ enum class PrefixReusePath : std::uint8_t {
     AppendAtFrontier,
     RestoreTurnCheckpoint,
     RestoreResponseCheckpoint,
+    RestorePrefixCheckpoint,
 };
 
 struct GenerationResult {
@@ -536,6 +552,11 @@ struct RuntimeStats {
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds         = 0;
     std::uint64_t decode_row_rounds     = 0;
+    // Sum of executor decode-round wall time, including commit/publication, excluding prefill.
+    double decode_wall_seconds = 0.0;
+    // Draft proposals and target-accepted drafts; bonus tokens are not accepted drafts.
+    std::uint64_t speculative_drafted_tokens  = 0;
+    std::uint64_t speculative_accepted_tokens = 0;
     std::uint32_t running_requests      = 0;
     std::uint32_t prefilling_requests   = 0;
     std::uint32_t decode_ready_requests = 0;

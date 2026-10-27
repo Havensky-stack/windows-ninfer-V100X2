@@ -123,6 +123,67 @@ int expect_zeroed_pages(ninfer::PagedKVPool& pool, ninfer::PagedKVPlaneOrder ord
     return 1;
 }
 
+// Exact oracle: byte value is a function of plane, head, physical page and byte.
+// The restored logical sequence uses different fragmented physical page IDs.
+int check_host_snapshot(ninfer::PagedKVPlaneOrder order, cudaStream_t stream) {
+    auto plan = plan_paged_cache(12, 12, 2,
+        {{ninfer::DType::I8, 64, 3}, {ninfer::DType::FP16, 1, 3}}, order);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::PagedKVPool pool({arena.base(), arena.capacity()}, plan.layout);
+    auto first = pool.reserve(3); first.materialize_pages(3);
+    auto blocker = pool.reserve(2); blocker.materialize_pages(2);
+    first.release();
+    auto source = pool.reserve(5); source.materialize_pages(5);
+    auto destination = pool.reserve(4); destination.materialize_pages(4);
+    std::vector<std::vector<std::byte>> original;
+    for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+        const auto& plane = pool.plane(p);
+        auto& bytes = original.emplace_back(plane.bytes());
+        for (std::size_t i = 0; i < bytes.size(); ++i) {
+            bytes[i] = std::byte((i * 131 + i / 97 + p * 19) % 251);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(plane.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice, stream));
+    }
+    std::vector<std::byte> image(source.snapshot_bytes(4));
+    source.export_pages(1, 4, image, stream);
+    std::size_t image_offset = 0;
+    for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+        const auto& plane = pool.plane(p);
+        const auto slab = order == ninfer::PagedKVPlaneOrder::PageMajor ? plane.nb[3] : plane.nb[2];
+        const auto heads = order == ninfer::PagedKVPlaneOrder::PageMajor ? 1 : plane.ne[3];
+        for (int head = 0; head < heads; ++head) {
+            for (std::size_t page = 0; page < 4; ++page) {
+                const auto physical = source.page_ids()[page + 1];
+                const auto offset = (heads == 1 ? 0 : head * plane.nb[3]) + physical * slab;
+                if (!std::equal(original[p].begin() + offset, original[p].begin() + offset + slab,
+                                image.begin() + image_offset)) {
+                    return fail("host KV export differs from independent physical-page oracle");
+                }
+                image_offset += slab;
+            }
+        }
+    }
+    destination.import_page_prefix(1, 2, 4, image, stream);
+    for (std::size_t p = 0; p < pool.plane_count(); ++p) {
+        const auto& plane = pool.plane(p);
+        auto expected = original[p];
+        const auto slab = order == ninfer::PagedKVPlaneOrder::PageMajor ? plane.nb[3] : plane.nb[2];
+        const auto heads = order == ninfer::PagedKVPlaneOrder::PageMajor ? 1 : plane.ne[3];
+        for (int head = 0; head < heads; ++head) {
+            const auto head_base = heads == 1 ? 0 : head * plane.nb[3];
+            for (int page = 0; page < 2; ++page) {
+                const auto from = head_base + source.page_ids()[page + 1] * slab;
+                const auto to = head_base + destination.page_ids()[page + 1] * slab;
+                std::copy_n(original[p].begin() + from, slab, expected.begin() + to);
+            }
+        }
+        std::vector<std::byte> actual(plane.bytes());
+        CUDA_CHECK(cudaMemcpy(actual.data(), plane.data, actual.size(), cudaMemcpyDeviceToHost));
+        if (actual != expected) { return fail("host KV restore changed a tail/head/sibling page"); }
+    }
+    return 0;
+}
+
 } // namespace
 
 int main() {
@@ -139,6 +200,8 @@ int main() {
 
     int failures = 0;
     ninfer::DeviceContext ctx(0);
+    failures += check_host_snapshot(ninfer::PagedKVPlaneOrder::PageMajor, ctx.stream);
+    failures += check_host_snapshot(ninfer::PagedKVPlaneOrder::HeadMajor, ctx.stream);
 
     auto paged_plan = plan_paged_cache(10, 10, 2,
                                        {{ninfer::DType::I8, 64, 2},

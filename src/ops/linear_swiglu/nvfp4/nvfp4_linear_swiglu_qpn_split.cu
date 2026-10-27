@@ -33,43 +33,67 @@ void nvfp4_linear_swiglu_qpn_split_launch(const Tensor& x, const Weight& weight,
     const std::int32_t kIntermediate = weight.n / 2;
     const std::int32_t kMTileOffset  = kIntermediate / 128;
     const float inverse_weight_divisor = 1.0F / weight.weight_scale_divisor;
-    auto* x_fp16 = static_cast<half*>(activation_scratch);
+    const auto* x_fp16 = x.dtype == DType::FP16 ? static_cast<const half*>(x.data)
+                                               : static_cast<const half*>(activation_scratch);
     const std::int64_t activation_count = static_cast<std::int64_t>(k) * t;
-    bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), x_fp16, activation_count);
-
-    if (weight.layout == QuantLayout::VoltaQpnPrepacked && kIntermediate == 8704 &&
-        k == 5120 && t >= 4 && t <= 6) {
-        nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4PairedSwiGluOutput, half, true>
-            <<<kIntermediate / 32, 512, 0, stream>>>(
-                static_cast<const std::uint8_t*>(weight.qdata),
-                static_cast<const std::uint8_t*>(weight.scales), x_fp16,
-                kIntermediate, k, t, inverse_weight_divisor,
-                Nvfp4PairedSwiGluOutput{static_cast<__nv_bfloat16*>(out.data), kIntermediate});
-        CUDA_CHECK(cudaGetLastError());
-        return;
+    if (x.dtype == DType::BF16) {
+        bf16_to_fp16_kernel<<<static_cast<int>((activation_count + 255) / 256), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<half*>(activation_scratch),
+            activation_count);
     }
 
-    Weight gate_weight = weight;
-    gate_weight.n      = kIntermediate;
+    auto launch_output = [&]<bool Fp16Image>() {
+        if (weight.layout == QuantLayout::VoltaQpnPrepacked &&
+            (kIntermediate == 8704 || kIntermediate == 4352) &&
+            k == 5120 && t >= 4 && t <= 6) {
+            auto launch = [&]<bool Fp32Scale>() {
+                if (kIntermediate == 4352) {
+                    nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4PairedSwiGluOutput<Fp16Image>, half,
+                                                    true, true, false, Fp32Scale, 4>
+                        <<<kIntermediate / 32, 512, 0, stream>>>(
+                            static_cast<const std::uint8_t*>(weight.qdata),
+                            static_cast<const std::uint8_t*>(weight.scales), x_fp16,
+                            kIntermediate, k, t, inverse_weight_divisor,
+                            Nvfp4PairedSwiGluOutput<Fp16Image>{out.data, kIntermediate});
+                    return;
+                }
+                nvfp4_volta_qpn_prepacked_kernel<1, 8, 2, Nvfp4PairedSwiGluOutput<Fp16Image>, half,
+                                                true, false, false, Fp32Scale>
+                    <<<kIntermediate / 32, 512, 0, stream>>>(
+                        static_cast<const std::uint8_t*>(weight.qdata),
+                        static_cast<const std::uint8_t*>(weight.scales), x_fp16,
+                        kIntermediate, k, t, inverse_weight_divisor,
+                        Nvfp4PairedSwiGluOutput<Fp16Image>{out.data, kIntermediate});
+            };
+            if (weight.volta_fp32_scale) { launch.template operator()<true>(); }
+            else { launch.template operator()<false>(); }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
 
-    Weight up_weight = weight;
-    up_weight.n       = kIntermediate;
-    up_weight.qdata   = static_cast<const std::uint8_t*>(weight.qdata) +
-                       static_cast<std::int64_t>(kIntermediate) * (k / 2);
-    up_weight.scales = static_cast<const std::uint8_t*>(weight.scales) +
-        (weight.layout == QuantLayout::VoltaQpnPrepacked
-             ? static_cast<std::int64_t>(kIntermediate) * (k / 16)
-             : static_cast<std::int64_t>(kMTileOffset) * (k / 64) * 512);
+        Weight gate_weight = weight;
+        gate_weight.n      = kIntermediate;
 
-    launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
-        kIntermediate, inverse_weight_divisor, stream);
-    launch_nvfp4_volta_qpn_with_fp16_activation(
-        x, up_weight, x_fp16,
-        Nvfp4SwiGluFromGateOutput{gate_scratch, static_cast<__nv_bfloat16*>(out.data),
-                                  kIntermediate},
-        kIntermediate, inverse_weight_divisor, stream);
+        Weight up_weight = weight;
+        up_weight.n       = kIntermediate;
+        up_weight.qdata   = static_cast<const std::uint8_t*>(weight.qdata) +
+                           static_cast<std::int64_t>(kIntermediate) * (k / 2);
+        up_weight.scales = static_cast<const std::uint8_t*>(weight.scales) +
+            (weight.layout == QuantLayout::VoltaQpnPrepacked
+                 ? static_cast<std::int64_t>(kIntermediate) * (k / 16)
+                 : static_cast<std::int64_t>(kMTileOffset) * (k / 64) * 512);
+
+        launch_nvfp4_volta_qpn_with_fp16_activation(
+            x, gate_weight, x_fp16, Nvfp4Fp32ContiguousOutput{gate_scratch, kIntermediate},
+            kIntermediate, inverse_weight_divisor, stream);
+        launch_nvfp4_volta_qpn_with_fp16_activation(
+            x, up_weight, x_fp16,
+            Nvfp4SwiGluFromGateOutput<Fp16Image>{gate_scratch, out.data,
+                                      kIntermediate},
+            kIntermediate, inverse_weight_divisor, stream);
+    };
+    if (out.dtype == DType::FP16) { launch_output.template operator()<true>(); }
+    else { launch_output.template operator()<false>(); }
     CUDA_CHECK(cudaGetLastError());
 }
 

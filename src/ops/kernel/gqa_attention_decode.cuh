@@ -154,10 +154,12 @@ template <typename Geometry>
 __host__ __device__ inline constexpr int gqa_volta_long_i8_splits(int window, int tokens,
                                                                 bool enabled = false) {
 #ifdef NINFER_VOLTA_BUILD
-    if constexpr (Geometry::QHeads == 12) {
+    if constexpr (Geometry::QHeads == 12 || Geometry::QHeads == 6) {
         if (enabled && window > 65536 && (tokens == 1 || tokens == 5 || tokens == 6)) {
-            // Eight-warp TC attention amortizes staging better over longer KV partitions.
-            const int splits = div_up(window, kGqaVoltaLongKeysPerSplit);
+            // TP4 has one local KV head, so shorter partitions supply enough CTAs.
+            constexpr int keys_per_split = Geometry::QHeads == 6
+                ? kGqaVoltaLongKeysPerSplit / 2 : kGqaVoltaLongKeysPerSplit;
+            const int splits = div_up(window, keys_per_split);
             return splits < Geometry::DecodeSplits ? splits : Geometry::DecodeSplits;
         }
     }
@@ -218,7 +220,7 @@ __device__ __forceinline__ void gqa_small_t_tc_row_to_qt(int row, int tokens, in
 }
 
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset,
-          int SplitTile = 256 / DChunk>
+          int SplitTile = 256 / DChunk, bool DirectNumerator = false>
 __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kernel(
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
@@ -274,8 +276,21 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     reduce[tid] = local_m;
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    constexpr int kSharedTreeEnd = DirectNumerator ? 32 : 1;
+    for (int stride = blockDim.x / 2; stride >= kSharedTreeEnd; stride >>= 1) {
         if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
+        __syncthreads();
+    }
+    if constexpr (DirectNumerator) {
+        // Preserve the shared tree's pairing, using warp exchange for its last five levels.
+        if (tid < 32) {
+            float value = reduce[tid];
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                const float peer = __shfl_down_sync(0xffffffffu, value, stride);
+                if (tid < stride) { value = fmaxf(value, peer); }
+            }
+            if (tid == 0) { reduce[0] = value; }
+        }
         __syncthreads();
     }
     const float head_m = reduce[0];
@@ -304,8 +319,19 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     reduce[tid] = local_l;
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    for (int stride = blockDim.x / 2; stride >= kSharedTreeEnd; stride >>= 1) {
         if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
+        __syncthreads();
+    }
+    if constexpr (DirectNumerator) {
+        if (tid < 32) {
+            float value = reduce[tid];
+            for (int stride = 16; stride > 0; stride >>= 1) {
+                const float peer = __shfl_down_sync(0xffffffffu, value, stride);
+                if (tid < stride) { value += peer; }
+            }
+            if (tid == 0) { reduce[0] = value; }
+        }
         __syncthreads();
     }
     const float head_l = reduce[0];
@@ -320,28 +346,54 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
     const int d = d_start + local_d;
     float numerator = 0.0f;
     if (head_l > 0.0f) {
-        for (int first = 0; first < active_split_count; first += kSplitTile) {
-            for (int item = tid; item < kSplitTile * DChunk; item += blockDim.x) {
-                const int split = first + item / DChunk;
-                const int source_d = d_start + item % DChunk;
-                float value = 0.0f;
-                if (split < active_split_count && weights[split] >= 0.0f) {
-                    value = __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
-                        q_head, source_d, token, split, tokens)]);
-                }
-                values[item] = value;
-            }
-            __syncthreads();
+        if constexpr (DirectNumerator) {
+            // A dimension-owning warp consumes contiguous vectors directly, as in
+            // 1Cat's grouped combine. Keep the existing FP32 split order and divisor.
             if (group == 0) {
+                constexpr int kPrefetchSplits = 4;
+                for (int first = 0; first < active_split_count; first += kPrefetchSplits) {
+                    float prefetched[kPrefetchSplits], weight[kPrefetchSplits];
 #pragma unroll
-                for (int item = 0; item < kSplitTile; ++item) {
-                    const int source = first + item;
-                    if (source < active_split_count && weights[source] >= 0.0f) {
-                        numerator += values[item * DChunk + local_d] * weights[source];
+                    for (int item = 0; item < kPrefetchSplits; ++item) {
+                        const int split = first + item;
+                        weight[item] = split < active_split_count ? weights[split] : -1.0f;
+                        prefetched[item] = weight[item] >= 0.0f
+                            ? __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
+                                  q_head, d, token, split, tokens)])
+                            : 0.0f;
+                    }
+#pragma unroll
+                    for (int item = 0; item < kPrefetchSplits; ++item) {
+                        if (weight[item] >= 0.0f) {
+                            numerator += prefetched[item] * weight[item];
+                        }
                     }
                 }
             }
-            __syncthreads();
+        } else {
+            for (int first = 0; first < active_split_count; first += kSplitTile) {
+                for (int item = tid; item < kSplitTile * DChunk; item += blockDim.x) {
+                    const int split = first + item / DChunk;
+                    const int source_d = d_start + item % DChunk;
+                    float value = 0.0f;
+                    if (split < active_split_count && weights[split] >= 0.0f) {
+                        value = __bfloat162float(partial_acc[gqa_partial_acc_index<Geometry>(
+                            q_head, source_d, token, split, tokens)]);
+                    }
+                    values[item] = value;
+                }
+                __syncthreads();
+                if (group == 0) {
+#pragma unroll
+                    for (int item = 0; item < kSplitTile; ++item) {
+                        const int source = first + item;
+                        if (source < active_split_count && weights[source] >= 0.0f) {
+                            numerator += values[item * DChunk + local_d] * weights[source];
+                        }
+                    }
+                }
+                __syncthreads();
+            }
         }
     }
     if (group != 0) { return; }

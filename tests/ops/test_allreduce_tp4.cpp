@@ -6,6 +6,8 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cmath>
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -128,8 +130,142 @@ int reduce_case(const ExecutionContext& ec, const ops::PeerEvents& events, int c
         executable.launch(ec.dev[0]->stream);
         failures += verify(twice);
     }
+    // Decode alternates one-token, MTP verification and partially filled blocks.
+    // Reuse one transport across a long captured chain with changing message sizes.
+    // The oracle applies each public BF16 output boundary independently.
+    if (count == 5120 * 8) {
+        const std::array<int, 5> sizes{5120, 5120 * 5, count, 5128, count};
+        std::array<std::vector<std::uint16_t>, 4> logical = inputs;
+        for (int round = 0; round < 8; ++round) {
+            for (int size : sizes) {
+                for (int i = 0; i < size; ++i) {
+                    double sum = 0;
+                    for (int r = 0; r < 4; ++r) { sum += represented(logical[r][guard + i]); }
+                    for (int r = 0; r < 4; ++r) { logical[r][guard + i] = bf16(sum); }
+                }
+            }
+        }
+        std::vector<std::uint16_t> mixed_oracle(logical[0].begin() + guard,
+                                                logical[0].begin() + guard + count);
+        auto mixed = capture(ec, [&] {
+            for (int round = 0; round < 8; ++round) {
+                for (int size : sizes) {
+                    auto views = buffers;
+                    for (int r = 0; r < 4; ++r) {
+                        views[r] = Tensor(buffers[r].data, DType::BF16, {size});
+                    }
+                    ops::allreduce_sum(views, staging, ec, events);
+                }
+            }
+        });
+        DecodeGraphExecutable mixed_executable;
+        mixed_executable.instantiate(mixed);
+        for (int replay = 0; replay < 3; ++replay) {
+            reset();
+            CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+            mixed_executable.launch(ec.dev[0]->stream);
+            failures += verify(mixed_oracle);
+        }
+    }
     std::cout << "TP4 reduce count=" << count << " direct=" << events.direct_peer_access()
               << " failures=" << failures << '\n';
+    return failures;
+}
+
+int norm_case(const ExecutionContext& ec, const ops::PeerEvents& events, bool unit_offset) {
+    constexpr int width = 5120, rows = 8, count = width * rows;
+    std::array<std::unique_ptr<Allocation>, 4> data, scratch, weights, norms;
+    std::array<Tensor, 4> buffers, staging, weight, output;
+    std::array<std::vector<std::uint16_t>, 4> input;
+    std::vector<std::uint16_t> host_weight(width), oracle(count);
+    for (int i = 0; i < width; ++i) host_weight[i] = bf16((i % 23 - 11) / 16.);
+    for (int r = 0; r < 4; ++r) {
+        data[r] = std::make_unique<Allocation>(ec.dev[r]->device, count * 2);
+        scratch[r] = std::make_unique<Allocation>(ec.dev[r]->device, count * 8);
+        weights[r] = std::make_unique<Allocation>(ec.dev[r]->device, width * 2);
+        norms[r] = std::make_unique<Allocation>(ec.dev[r]->device, count * 2);
+        buffers[r] = Tensor(data[r]->pointer, DType::BF16, {width, rows});
+        staging[r] = Tensor(scratch[r]->pointer, DType::BF16, {width, rows, 4});
+        weight[r] = Tensor(weights[r]->pointer, DType::BF16, {width});
+        output[r] = Tensor(norms[r]->pointer, DType::BF16, {width, rows});
+        input[r].resize(count);
+        for (int i = 0; i < count; ++i) input[r][i] = bf16(((i * (r+3) + 17*r) % 1021 - 510) / 64.);
+        CUDA_CHECK(cudaMemcpyAsync(weight[r].data, host_weight.data(), width * 2,
+                                   cudaMemcpyHostToDevice, ec.dev[r]->stream));
+    }
+    const auto reset = [&] {
+        for (int r = 0; r < 4; ++r) {
+            CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
+            CUDA_CHECK(cudaMemcpyAsync(buffers[r].data, input[r].data(), count * 2,
+                                       cudaMemcpyHostToDevice, ec.dev[r]->stream));
+        }
+        synchronize(ec);
+    };
+    const std::array<int, 6> widths{1, 5, 8, 3, 7, 8};
+    const auto run = [&] {
+        for (std::size_t call = 0; call < widths.size(); ++call) {
+            auto b = buffers, n = output;
+            for (int r = 0; r < 4; ++r) {
+                b[r] = b[r].slice(1, 0, widths[call]);
+                n[r] = n[r].slice(1, 0, widths[call]);
+            }
+            if (call == 2) ops::allreduce_sum(b, staging, ec, events);
+            else ops::allreduce_sum_rmsnorm(b, staging,
+                ops::ReplicatedRmsNorm{weight, n, 1.e-6f, unit_offset}, ec, events);
+        }
+    };
+    auto logical = input;
+    for (int tokens : widths) {
+        for (int i = 0; i < width * tokens; ++i) {
+            double sum = 0.;
+            for (int r = 0; r < 4; ++r) sum += represented(logical[r][i]);
+            for (int r = 0; r < 4; ++r) logical[r][i] = bf16(sum);
+        }
+    }
+    oracle = logical[0];
+    std::vector<double> norm_oracle(count);
+    for (int row = 0; row < rows; ++row) {
+        double sum = 0.;
+        for (int i = 0; i < width; ++i) {
+            const double v = represented(oracle[row * width + i]);
+            sum += v*v;
+        }
+        const double inv = 1. / std::sqrt(sum / width + 1.e-6);
+        for (int i = 0; i < width; ++i) norm_oracle[row*width+i] =
+            represented(oracle[row*width+i]) * inv *
+            (represented(host_weight[i]) + (unit_offset ? 1. : 0.));
+    }
+    const auto verify = [&] {
+        synchronize(ec);
+        int failures = 0;
+        for (int r = 0; r < 4; ++r) {
+            CUDA_CHECK(cudaSetDevice(ec.dev[r]->device));
+            std::vector<std::uint16_t> sum(count), norm(count);
+            CUDA_CHECK(cudaMemcpy(sum.data(), buffers[r].data, count*2, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(norm.data(), output[r].data, count*2, cudaMemcpyDeviceToHost));
+            if (sum != oracle) ++failures;
+            for (int i = 0; i < count; ++i) {
+                const double ideal = norm_oracle[i];
+                if (std::abs(represented(norm[i]) - ideal) > 0.004 * std::abs(ideal) + 2.e-5) {
+                    ++failures; break;
+                }
+            }
+        }
+        return failures;
+    };
+    reset(); run();
+    int failures = verify();
+    auto graph = capture(ec, run);
+    DecodeGraphExecutable executable;
+    executable.instantiate(graph);
+    for (int replay = 0; replay < 3; ++replay) {
+        reset();
+        CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+        executable.launch(ec.dev[0]->stream);
+        failures += verify();
+    }
+    std::cout << "TP4 mixed-width sum/RMSNorm direct=" << events.direct_peer_access()
+              << " unit_offset=" << unit_offset << " failures=" << failures << '\n';
     return failures;
 }
 
@@ -202,27 +338,37 @@ int gather_cases(const ExecutionContext& ec, const ops::PeerEvents& events) {
     return failures;
 }
 
-int broadcast_case(const ExecutionContext& ec, const ops::PeerEvents& events) {
-    constexpr int count = 5120;
-    std::array<std::unique_ptr<Allocation>, 4> storage;
+int broadcast_case(const ExecutionContext& ec, const ops::PeerEvents& events, int count) {
+    constexpr int guard = 16;
+    constexpr std::uint32_t sentinel = 0x5a5aa5a5;
+    std::array<std::unique_ptr<Allocation>, 4> storage, history;
     std::array<Tensor, 4> views;
-    std::vector<std::int32_t> oracle(count);
-    for (int i = 0; i < count; ++i) { oracle[i] = 10000 + i * 17; }
+    const auto data = [](const auto& allocation) {
+        return static_cast<std::uint32_t*>(allocation->pointer) + guard;
+    };
     for (int rank = 0; rank < 4; ++rank) {
-        storage[rank] = std::make_unique<Allocation>(ec.dev[rank]->device, count * 4);
-        views[rank] = Tensor(storage[rank]->pointer, DType::I32, {count});
+        storage[rank] = std::make_unique<Allocation>(ec.dev[rank]->device, (count + 2 * guard) * 4);
+        history[rank] = std::make_unique<Allocation>(ec.dev[rank]->device, (2 * count + 2 * guard) * 4);
+        views[rank] = Tensor(data(storage[rank]), DType::I32, {count});
+        std::vector<std::uint32_t> initial(count + 2 * guard, sentinel);
+        CUDA_CHECK(cudaMemcpy(storage[rank]->pointer, initial.data(), initial.size() * 4,
+                               cudaMemcpyHostToDevice));
+        initial.assign(2 * count + 2 * guard, sentinel);
+        CUDA_CHECK(cudaMemcpy(history[rank]->pointer, initial.data(), initial.size() * 4,
+                               cudaMemcpyHostToDevice));
     }
-    CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
-    CUDA_CHECK(cudaMemcpyAsync(views[0].data, oracle.data(), count * 4,
-                               cudaMemcpyHostToDevice, ec.dev[0]->stream));
-    synchronize(ec);
     const auto body = [&] {
         for (int round = 0; round < 2; ++round) {
             ops::broadcast_rank0(views[0], std::span(views).subspan(1), ec, events);
-            // The source is reused immediately: every destination must finish its read before
-            // this overwrite, including across repeated broadcasts in a captured graph.
-            CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
-            CUDA_CHECK(cudaMemsetAsync(views[0].data, 0x23, count * 4, ec.dev[0]->stream));
+            // Consume each result on its owner's stream before the next call writes it.
+            // Rank zero also overwrites the source immediately after saving the result.
+            for (int rank = 0; rank < 4; ++rank) {
+                CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+                CUDA_CHECK(cudaMemcpyAsync(data(history[rank]) + round * count, views[rank].data,
+                                           count * 4, cudaMemcpyDeviceToDevice, ec.dev[rank]->stream));
+                CUDA_CHECK(cudaMemsetAsync(views[rank].data, rank == 0 ? 0x23 : 0x44,
+                                           count * 4, ec.dev[rank]->stream));
+            }
         }
     };
     auto graph = capture(ec, body);
@@ -230,31 +376,188 @@ int broadcast_case(const ExecutionContext& ec, const ops::PeerEvents& events) {
     executable.instantiate(graph);
     int failures = 0;
     for (int replay = 0; replay < 3; ++replay) {
-        CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
-        CUDA_CHECK(cudaMemsetAsync(views[0].data, 0x11, count * 4, ec.dev[0]->stream));
-        // Replay gate must order origin after independent outstanding work on all peers.
-        std::array<std::unique_ptr<DecodeGraphPeerBridge>, 3> gates;
-        for (int rank = 1; rank < 4; ++rank) {
-            gates[rank - 1] = std::make_unique<DecodeGraphPeerBridge>(ec.dev[0]->device,
-                                                                     ec.dev[rank]->device);
-            CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
-            CUDA_CHECK(cudaMemsetAsync(views[rank].data, 0, count * 4, ec.dev[rank]->stream));
-            gates[rank - 1]->gate_launch(ec.dev[rank]->stream, ec.dev[0]->stream);
+        std::vector<std::uint32_t> expected(2 * count, 0x23232323);
+        for (int i = 0; i < count; ++i) {
+            expected[i] = 0x80000000U ^ (std::uint32_t(i) * 65537U + replay * 1234567U);
         }
         CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
-        executable.launch(ec.dev[0]->stream);
+        CUDA_CHECK(cudaMemcpyAsync(views[0].data, expected.data(), count * 4,
+                                   cudaMemcpyHostToDevice, ec.dev[0]->stream));
+        if (replay == 0) { body(); }
+        else {
+            // Replay must also order the origin after independently queued peer work.
+            std::array<std::unique_ptr<DecodeGraphPeerBridge>, 3> gates;
+            for (int rank = 1; rank < 4; ++rank) {
+                gates[rank - 1] = std::make_unique<DecodeGraphPeerBridge>(ec.dev[0]->device,
+                                                                         ec.dev[rank]->device);
+                CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+                CUDA_CHECK(cudaMemsetAsync(views[rank].data, 0, count * 4, ec.dev[rank]->stream));
+                gates[rank - 1]->gate_launch(ec.dev[rank]->stream, ec.dev[0]->stream);
+            }
+            CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+            executable.launch(ec.dev[0]->stream);
+            synchronize(ec);
+        }
         synchronize(ec);
         for (int rank = 0; rank < 4; ++rank) {
             CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
-            std::vector<std::int32_t> actual(count);
-            CUDA_CHECK(cudaMemcpy(actual.data(), views[rank].data, count * 4,
+            std::vector<std::uint32_t> actual(2 * count);
+            CUDA_CHECK(cudaMemcpy(actual.data(), data(history[rank]), actual.size() * 4,
                                    cudaMemcpyDeviceToHost));
-            for (auto word : actual) { if (word != 0x23232323) { ++failures; break; } }
+            failures += actual != expected;
+            const auto verify_guards = [&](const auto& allocation, int words) {
+                std::array<std::uint32_t, guard> edge;
+                for (int offset : {0, words + guard}) {
+                    CUDA_CHECK(cudaMemcpy(edge.data(), static_cast<std::uint32_t*>(allocation->pointer) + offset,
+                                           sizeof(edge), cudaMemcpyDeviceToHost));
+                    for (auto word : edge) failures += word != sentinel;
+                }
+            };
+            verify_guards(storage[rank], count);
+            verify_guards(history[rank], 2 * count);
         }
     }
-    std::cout << "TP4 broadcast/replay gates failures=" << failures << '\n';
+    std::cout << "TP4 exact broadcast T=" << count << " direct=" << events.direct_peer_access()
+              << " failures=" << failures << '\n';
     return failures;
 }
+
+int argmax_case(const ExecutionContext& ec, const ops::PeerEvents& events, int columns, bool mapped) {
+    constexpr int rounds = 16, shard = 62080, guard = 16;
+    constexpr std::uint32_t sentinel = 0x5a5aa5a5;
+    const std::size_t bytes = columns * sizeof(std::uint32_t);
+    const auto allocate = [&](int rank, int words) {
+        auto allocation = std::make_unique<Allocation>(ec.dev[rank]->device, (words + 2 * guard) * 4);
+        std::vector<std::uint32_t> initial(words + 2 * guard, sentinel);
+        CUDA_CHECK(cudaMemcpy(allocation->pointer, initial.data(), initial.size() * 4,
+                               cudaMemcpyHostToDevice));
+        return allocation;
+    };
+    const auto data = [](const auto& allocation) {
+        return static_cast<std::uint32_t*>(allocation->pointer) + guard;
+    };
+    std::array<std::unique_ptr<Allocation>, 4> score, index, output, history, seed;
+    std::array<Tensor, 4> scores, indices, outputs;
+    std::array<std::vector<std::uint32_t>, 4> host_seed;
+    for (int rank = 0; rank < 4; ++rank) {
+        score[rank] = allocate(rank, columns);
+        index[rank] = allocate(rank, columns);
+        output[rank] = allocate(rank, columns);
+        history[rank] = allocate(rank, rounds * columns);
+        seed[rank] = allocate(rank, 4 * columns);
+        scores[rank] = Tensor(data(score[rank]), DType::FP32, {1, columns});
+        indices[rank] = Tensor(data(index[rank]), DType::I32, {1, columns});
+        outputs[rank] = Tensor(data(output[rank]), DType::I32, {columns});
+        host_seed[rank].resize(4 * columns);
+    }
+    auto sv = allocate(0, 4 * columns), si = allocate(0, 4 * columns);
+    auto map_storage = allocate(0, 4 * shard);
+    Tensor gathered_scores(data(sv), DType::FP32, {4, columns});
+    Tensor gathered_indices(data(si), DType::I32, {4, columns});
+    std::vector<std::int32_t> map(4 * shard);
+    for (int i = 0; i < 4 * shard; ++i) { map[i] = (i * 97 + 13) % (4 * shard); }
+    CUDA_CHECK(cudaMemcpy(data(map_storage), map.data(), map.size() * 4, cudaMemcpyHostToDevice));
+    const auto invoke = [&] {
+        for (int round = 0; round < rounds; ++round) {
+            for (int rank = 0; rank < 4; ++rank) {
+                CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+                CUDA_CHECK(cudaMemcpyAsync(scores[rank].data, data(seed[rank]) + (round % 2) * columns,
+                    bytes, cudaMemcpyDeviceToDevice, ec.dev[rank]->stream));
+                CUDA_CHECK(cudaMemcpyAsync(indices[rank].data, data(seed[rank]) + (2 + round % 2) * columns,
+                    bytes, cudaMemcpyDeviceToDevice, ec.dev[rank]->stream));
+            }
+            ops::allreduce_argmax(scores, indices, outputs, gathered_scores, gathered_indices,
+                shard, ec, events, mapped ? reinterpret_cast<const int*>(data(map_storage)) : nullptr);
+            for (int rank = 0; rank < 4; ++rank) {
+                CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+                CUDA_CHECK(cudaMemcpyAsync(data(history[rank]) + round * columns, outputs[rank].data,
+                    bytes, cudaMemcpyDeviceToDevice, ec.dev[rank]->stream));
+            }
+        }
+    };
+    auto definition = capture(ec, invoke);
+    DecodeGraphExecutable executable;
+    executable.instantiate(definition);
+    int failures = 0;
+    const auto check_guards = [&](const auto& allocation, int words) {
+        CUDA_CHECK(cudaSetDevice(allocation->device));
+        for (int offset : {0, guard + words}) {
+            std::array<std::uint32_t, guard> edge;
+            CUDA_CHECK(cudaMemcpy(edge.data(), static_cast<std::uint32_t*>(allocation->pointer) + offset,
+                                   sizeof(edge), cudaMemcpyDeviceToHost));
+            for (auto word : edge) { failures += word != sentinel; }
+        }
+    };
+    for (int probe = 0; probe < 3; ++probe) {
+        for (int rank = 0; rank < 4; ++rank) {
+            for (int mode = 0; mode < 2; ++mode) {
+                for (int t = 0; t < columns; ++t) {
+                    const int i = mode * columns + t;
+                    float v = float((t + mode + probe + rank * 3) % 11 - 5);
+                    if (t % 8 == 0) { v = mode ? -INFINITY : INFINITY; }
+                    if (t % 8 == 1) { v = rank % 2 ? -0.0F : 0.0F; }
+                    if (t % 8 >= 2 && t % 8 <= 5) {
+                        v = rank == (t + mode + probe) % 4 ? INFINITY : -INFINITY;
+                    }
+                    host_seed[rank][i] = std::bit_cast<std::uint32_t>(v);
+                    host_seed[rank][2 * columns + i] = (t * 11 + probe * 13 + mode * 17) % shard;
+                }
+            }
+            CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+            CUDA_CHECK(cudaMemcpy(data(seed[rank]), host_seed[rank].data(), 4 * bytes,
+                                   cudaMemcpyHostToDevice));
+        }
+        if (probe == 0) { invoke(); }
+        else {
+            CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+            executable.launch(ec.dev[0]->stream);
+        }
+        synchronize(ec);
+        std::vector<std::int32_t> expected(rounds * columns);
+        for (int round = 0; round < rounds; ++round) {
+            for (int t = 0; t < columns; ++t) {
+                const int i = (round % 2) * columns + t;
+                double best = -INFINITY;
+                int winner = 4 * shard;
+                for (int rank = 0; rank < 4; ++rank) {
+                    const double value = std::bit_cast<float>(host_seed[rank][i]);
+                    const int global = rank * shard + host_seed[rank][2 * columns + i];
+                    if (value > best || (value == best && global < winner)) {
+                        best = value;
+                        winner = global;
+                    }
+                }
+                expected[round * columns + t] = mapped ? map[winner] : winner;
+            }
+        }
+        for (int rank = 0; rank < 4; ++rank) {
+            CUDA_CHECK(cudaSetDevice(ec.dev[rank]->device));
+            std::vector<std::int32_t> actual(rounds * columns);
+            CUDA_CHECK(cudaMemcpy(actual.data(), data(history[rank]), actual.size() * 4,
+                                   cudaMemcpyDeviceToHost));
+            failures += actual != expected;
+            std::vector<std::uint32_t> actual_seed(4 * columns);
+            CUDA_CHECK(cudaMemcpy(actual_seed.data(), data(seed[rank]), 4 * bytes, cudaMemcpyDeviceToHost));
+            failures += actual_seed != host_seed[rank];
+            check_guards(score[rank], columns);
+            check_guards(index[rank], columns);
+            check_guards(output[rank], columns);
+            check_guards(history[rank], rounds * columns);
+            check_guards(seed[rank], 4 * columns);
+        }
+        check_guards(sv, 4 * columns);
+        check_guards(si, 4 * columns);
+        check_guards(map_storage, 4 * shard);
+    }
+    CUDA_CHECK(cudaSetDevice(ec.dev[0]->device));
+    std::vector<std::int32_t> actual_map(map.size());
+    CUDA_CHECK(cudaMemcpy(actual_map.data(), data(map_storage), map.size() * 4, cudaMemcpyDeviceToHost));
+    failures += actual_map != map;
+    std::cout << "TP4 exact argmax T=" << columns << " mapped=" << mapped
+              << " direct=" << events.direct_peer_access() << " failures=" << failures << '\n';
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -267,9 +570,19 @@ int main() {
     for (bool route : {false, true}) {
         if (route && !direct) { continue; }
         ops::PeerEvents events(ec, route);
-        for (int size : {511, 5120, 5120 * 48}) { failures += reduce_case(ec, events, size); }
+        for (int size : {511, 5120, 5120 * 5, 5120 * 8, 5120 * 48, 5120 * 2560}) {
+            failures += reduce_case(ec, events, size);
+        }
+        failures += norm_case(ec, events, false);
+        failures += norm_case(ec, events, true);
         failures += gather_cases(ec, events);
-        failures += broadcast_case(ec, events);
+        for (int columns : {1, 5, 8, 129, 1024, 1025, 5120}) {
+            failures += broadcast_case(ec, events, columns);
+        }
+        for (int columns : {1, 5, 8, 33, 129}) {
+            failures += argmax_case(ec, events, columns, false);
+            failures += argmax_case(ec, events, columns, true);
+        }
     }
     return failures ? 1 : 0;
 }

@@ -147,6 +147,38 @@ std::uint32_t LinearAttentionStatePool::layer_count() const noexcept {
     return static_cast<std::uint32_t>(conv.size());
 }
 
+std::size_t LinearAttentionStatePool::slot_bytes() const {
+    return layer_count() * (conv_slot(0, 0).bytes() + recurrent_slot(0, 0).bytes());
+}
+
+void LinearAttentionStatePool::export_slot(std::int32_t slot, std::span<std::byte> image,
+                                          cudaStream_t stream) {
+    if (image.size() != slot_bytes()) { throw std::invalid_argument("invalid GDN host image size"); }
+    std::size_t offset = 0;
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        for (const Tensor source : {conv_slot(layer, slot), recurrent_slot(layer, slot)}) {
+            CUDA_CHECK(cudaMemcpyAsync(image.data() + offset, source.data, source.bytes(),
+                                       cudaMemcpyDeviceToHost, stream));
+            offset += source.bytes();
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void LinearAttentionStatePool::import_slot(std::int32_t slot, std::span<const std::byte> image,
+                                          cudaStream_t stream) {
+    if (image.size() != slot_bytes()) { throw std::invalid_argument("invalid GDN host image size"); }
+    std::size_t offset = 0;
+    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+        for (const Tensor destination : {conv_slot(layer, slot), recurrent_slot(layer, slot)}) {
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, image.data() + offset, destination.bytes(),
+                                       cudaMemcpyHostToDevice, stream));
+            offset += destination.bytes();
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
 std::int32_t LinearAttentionStatePool::slot_count() const noexcept { return spec.slot_count; }
 
 std::int64_t LinearAttentionStatePool::conv_slot_stride_elements() const noexcept {

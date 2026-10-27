@@ -569,6 +569,11 @@ int main() {
     failures += inplace_case({"35b two-chunk raw-qk", 16, 32, 128, false}, 12228u);
     failures += distinct_state_case({"27b TP2 long prefill fused-qk-norm", 8, 24, 3072, true},
                                      15372u);
+    failures += distinct_state_case({"27b TP4 two chunks", 4, 12, 128, true}, 16128u);
+    failures += inplace_case({"27b TP4 chunk tail", 4, 12, 129, true}, 16129u);
+    failures += distinct_state_case({"27b TP4 wide prefill", 4, 12, 2560, true}, 18560u);
+    failures += distinct_state_case({"27b TP4 padded prefill tail", 4, 12, 520, true}, 16520u);
+    failures += inplace_case({"27b TP4 near-zero normalization", 4, 12, 129, true, true}, 17129u);
 
     // Snapshot is a separate public state transition. Nonzero source slots also prove that the
     // selected initial state, not slot zero, seeds the complete recurrence.

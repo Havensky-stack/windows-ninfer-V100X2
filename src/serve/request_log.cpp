@@ -122,6 +122,8 @@ const char* prefix_reuse_path_name(ninfer::PrefixReusePath path) {
         return "restore_turn_checkpoint";
     case ninfer::PrefixReusePath::RestoreResponseCheckpoint:
         return "restore_response_checkpoint";
+    case ninfer::PrefixReusePath::RestorePrefixCheckpoint:
+        return "restore_prefix_checkpoint";
     }
     return "unknown";
 }
@@ -462,6 +464,7 @@ std::string format_server_start_json(
                               {"media_preprocess_threads", options.media_preprocess_threads},
                               {"request_log_jsonl", options.request_log_jsonl},
                               {"default_output_tokens", options.default_max_tokens},
+                              {"max_output_tokens", options.max_output_tokens},
                               {"default_thinking", options.enable_thinking},
                               {"default_preserve_thinking", options.preserve_thinking}};
     record["artifact"] = Json{{"path", options.artifact_path},
@@ -496,16 +499,20 @@ std::string format_server_start_json(
           {"ram_kv_gpu_tokens", memory.ram_kv_gpu_tokens},
           {"ram_kv_archive_bytes", memory.ram_kv_archive_bytes},
           {"ram_kv_budget_bytes", options.ram_kv.budget_bytes},
+          {"prefix_cache_tokens", options.prefix_cache_tokens},
           {"volta_long_attention", options.volta_long_attention},
+          {"volta_fast_decode", options.volta_fast_decode},
           {"kv_capacity_page_groups", memory.kv_capacity_page_groups},
           {"kv_capacity_max_page_groups", memory.kv_capacity_max_page_groups},
           {"max_concurrency", options.max_concurrency},
           {"max_pending_requests", options.max_pending_requests},
           {"pending_timeout_ms", options.pending_timeout_ms},
           {"prefill_chunk", options.prefill_chunk},
+          {"prefill_decode_rounds", options.prefill_decode_rounds},
           {"log_stats_interval_ms", options.log_stats_interval_ms},
           {"kv_cache", kv_cache_name(options.kv_cache)},
           {"vision", options.enable_vision},
+          {"vision_device", options.vision_device == VisionDevice::Cpu ? "cpu" : "gpu"},
           {"vision_max_tokens", std::min(options.max_context, options.vision_max_tokens)},
           {"cuda_graph", options.use_cuda_graph},
           {"prefix_reuse", options.allow_prefix_reuse},
@@ -620,6 +627,8 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                         static_cast<double>(report.decode_rounds);
     }
     record["interval_seconds"] = report.interval_seconds;
+    record["speculative"] = Json{{"drafted_tokens", report.speculative_drafted_tokens},
+                                  {"accepted_tokens", report.speculative_accepted_tokens}};
     record["tokens"]           = Json{{"computed_prefill", report.computed_prefill_tokens},
                                       {"committed_decode", report.committed_decode_tokens}};
     record["throughput_tokens_per_second"] =

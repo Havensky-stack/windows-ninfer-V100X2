@@ -18,9 +18,15 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(4096);
     options.prefill_chunk             = 1024;
     options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens  = 3;
+    const char* drafts = std::getenv("NINFER_TEST_MTP_DRAFTS");
+    options.speculative.draft_tokens  = drafts ? std::stoul(drafts) : 3;
     options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
     options.enable_vision             = true;
+    options.vision_max_tokens         = 4096;
+    if (std::getenv("NINFER_TEST_CPU_VISION") != nullptr) {
+        options.vision_device = ninfer::VisionDevice::Cpu;
+    }
+    options.volta_long_attention = std::getenv("NINFER_TEST_LONG_ATTENTION") != nullptr;
     if (std::getenv("NINFER_TEST_TP2") != nullptr) {
         options.tp = 2;
         options.devices = {0, 1};
@@ -456,7 +462,8 @@ int exercise_vision(ninfer::Engine& engine) {
 int verify_loaded_product(const ninfer::Engine& engine) {
     const ninfer::LoadSummary load = engine.load_summary();
     if ((load.target != "qwen3_6_27b" && load.target != "qwen3_8_27b") ||
-        (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4") ||
+        (load.weights_id != "groupwise-int" && load.weights_id != "nvfp4" &&
+         load.weights_id != "quasar-nvfp4") ||
         load.host_to_device_bytes == 0 || load.artifact_bytes_read == 0) {
         std::cerr << "Engine construction has an invalid load summary: target=" << load.target
                   << " weights=" << load.weights_id << '\n';

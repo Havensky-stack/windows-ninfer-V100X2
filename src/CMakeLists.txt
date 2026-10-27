@@ -63,11 +63,17 @@ endif()
 
 # Shared mathematical Ops. The list is intentionally explicit: adding a
 # source is a build-boundary decision, not an accidental recursive-glob side effect.
+add_library(ninfer_host_ops STATIC ops/host/vision.cpp)
+ninfer_internal_includes(ninfer_host_ops)
+target_link_libraries(ninfer_host_ops PUBLIC ninfer_core PRIVATE BLAS::BLAS)
+
 add_library(ninfer_ops STATIC
   ops/linear/ggml_k/ggml_k.cu
   ops/common/allreduce.cu
   ops/launcher/allreduce.cu
   ops/launcher/add_bias.cu
+  ops/proposal_argmax/q4_sm70.cu
+  ops/proposal_argmax/proposal_argmax.cpp
   ops/launcher/argmax.cu
   ops/launcher/cast.cu
   ops/launcher/causal_conv1d.cu
@@ -311,6 +317,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_volta_qpn.cu
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
     ops/launcher/gqa_attention_volta_flash.cu
+    ops/launcher/gqa_attention_volta_splitd.cu
     ops/launcher/vision_attention_volta_flash.cu)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
   target_compile_options(ninfer_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
@@ -340,6 +347,7 @@ endif()
 ninfer_internal_includes(ninfer_ops)
 ninfer_cuda_archive(ninfer_ops)
 target_link_libraries(ninfer_ops PUBLIC ninfer_core)
+target_link_libraries(ninfer_ops PRIVATE ninfer_host_ops)
 target_link_libraries(ninfer_ops PRIVATE ${CMAKE_DL_LIBS})
 if(TARGET ninfer_nvfp4_tma)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_tma)

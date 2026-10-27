@@ -134,15 +134,36 @@ measurements of this target. The supported identities are
 `qwen3.8-27b/nvfp4`, `qwen3.8-27b/fp8`, `qwen3.8-27b/gguf-q4-k-m`, and
 `qwen3.6-35b-a3b/groupwise-int`.
 The explicitly requested QUASAR trial adds `qwen3.8-27b/quasar-nvfp4`, currently restricted to
-SM70 TP2 Text/None/MTP/DFlash and experimental PP2 Text/None/MTP. It registers the published QUASAR v3 container identity, preserves its
+SM70 TP2 Text/None/MTP/DFlash, TP2 image/video Vision with None/MTP, experimental TP4
+Text/None/MTP, and experimental PP2 Text/None/MTP. Vision excludes DFlash, PP2 and the fast-decode numerical profile. Vision admits the default-off
+long-attention profile on TP2 with complete INT8 group-64 KV. It registers the published QUASAR v3 container identity, preserves its
 256 NVFP4 parents and FP32 activation divisors, and keeps its W8 vocabulary/MTP and BF16 GDN
 controls and optional W8/BF16 DFlash2 package. The 27B draft window remains at most seven.
 This artifact's QAT/conversion quality is not established by inference smoke tests.
+Text/None/MTP with complete GPU KV additionally retains exact per-rank GDN and tail-hidden
+checkpoints in at most 2 GiB host RAM per Program, divided among configured lanes. Shorter or
+edited shared prefixes restore the longest matching saved frontier and recompute its remaining
+suffix; reported cached tokens exclude that recomputation. Historical branches additionally retain
+immutable exact host KV chunks and complete checkpoints under a default 384000-token unique
+page-rounded Main Text budget, with FIFO branch eviction and an independent 2 GiB archived state
+cap. Active lane state images retain their separate 2 GiB cap. Restored lineage can share immutable
+host chunks; every active request receives private writable GPU pages and GDN state. This admits
+historical branch and completed-sibling restoration, not arbitrary substring reuse or partial-state
+reuse for Vision/DFlash/RAM-KV. The token budget is not a process RSS limit.
 The explicitly requested remote extension targets four NVLink-connected V100-SXM2 16 GB cards,
-single-request TP4 Text/MTP on Qwen3.8-27B NVFP4 and native block-128 FP8. Native FP8 preserves
+single-request TP4 Text/MTP on Qwen3.8-27B official NVFP4, QUASAR NVFP4 and native block-128
+FP8. QUASAR TP4 admits the default-off long-attention and fast-decode profiles; its four-card
+qualification and measurements are recorded separately from official NVFP4/native FP8. Native FP8 preserves
 source E4M3 codes and BF16 block multipliers without requantization and requires TP4 on SM70.
 TP4 Vision/DFlash and other TP4 identities are not admitted. Operator checks on the local two
 cards do not substitute for four-card whole-model/state or end-to-end performance evidence.
+The explicitly requested WSL2 extension targets QUASAR SM70 TP2 Text/MTP4 on two V100-SXM2
+16 GB cards without direct P2P. Small aligned BF16 reductions may use startup-owned mapped
+host packets with system fences and device-local epochs; wider reductions and gathers retain
+verified CUDA UVA staging. This transport preserves the represented sum formula and introduces
+no model quantization change. Its whole-model measurements are separate from native Linux.
+The remote WSL deployment disables historical branches and prefix reuse at the user's request
+to avoid host cache growth. See `docs/wsl/README.md` for qualification and deployment settings.
 The V100X2 workload uses the GGUF-derived Qwen3.8-27B Q4_K_M artifact from the local LM Studio
 directory, 180000-token context capacity, INT8 group-64 KV, CUDA Graphs, and MTP with at most
 three drafts; accepting zero drafts is valid. Capacity must not be confused with prompt occupancy.
@@ -159,11 +180,91 @@ including TP2; the official NVFP4 v3 package preserves W8 projections and BF16 a
 The 27B draft window is at most seven. On this V100X2, the verified DFlash profile is 98304-token
 capacity with a 1024-token prefill chunk, not the 180000-capacity MTP acceptance profile.
 
-The optional `volta_long_attention` profile admits SM70 27B TP2/PP1 single-request
-Text/None/MTP with complete INT8 group-64 KV, without Vision or RAM-KV. It retains every
+The optional `volta_long_attention` profile admits SM70 27B TP2/TP4, PP1 experimental 1–8-request
+Text/None/MTP and TP2 Vision/None/MTP with complete INT8 group-64 KV, without RAM-KV. It retains every
 causally visible key but changes split partitioning, softmax association and PV accumulation;
 it is default-off and not bit-equivalent to ordinary attention. The 104-question local GPQA
 comparison is behavioral evidence, not a full 198-question evaluation or proof of losslessness.
+
+Vision optionally uses `VisionDevice::Cpu` / `--vision-device cpu` with `--vision`. Its tower
+weights decode once from original signed groupwise codes and exact FP16 scales into one FP32
+host copy, without requantization or GPU tower residency. This explicit CPU representation is
+not a GPU repacking path. Family-owned host scheduling keeps BF16 activation boundaries, 2-D
+RoPE, complete temporal-segment attention and the merger. Only final BF16 embeddings upload.
+CPU encoding runs on the submitting host thread after ingress-capacity reservation and before
+joining the GPU FIFO; it neither locks the GPU executor nor changes text/decode leaves. A caller's
+explicit submission deadline and cancellation cover CPU work; the default queue timeout starts after staging.
+Each request references immutable embeddings in a Program-local 128 MiB FIFO cache, keyed by media
+digest, modality and grid, never the frontend's shared media cache. The CPU/GPU
+arithmetic and long attention need not produce identical embeddings, logits or output. Real
+qualification for this release uses the QUASAR v3 TP2/MTP4 artifact; no new GPQA is claimed.
+Release 0.1.2 contains these Vision changes and an optional qualified Linux SM70 prebuilt;
+QUASAR TP4 qualification is recorded separately and ships in release 0.2.0.
+
+The optional `volta_fast_decode` profile is default-off and admits QUASAR SM70 TP2/TP4
+Text/None/MTP. It selects packed NVFP4 parents with FP32 scale-after-K-reduction and
+shape-specific packed MTP W8 reductions. The normal profile retains per-group FP16 scaling
+with the same exact weight layout, fusion and communication optimizations. Both paths keep
+original codes/scales/divisors and one resident copy. The fast profile can change logits and
+draft acceptance. Together with long attention the final 85K/MTP4 measurements are
+198.105/198.097 committed wall tok/s in the 2026-10-19 campaign; 200 was not achieved.
+After device recovery the user reopened QUASAR TP2 optimization. On 2026-10-22 the user
+removed the fixed speed goal and requested six decode trials, retaining MTP4: attention load
+overlap, MTP tail fusion, TP2 communication/norm, NVFP4 QPN scheduling, GDN value tiles,
+and verified history lookup. Neither 200 nor 250 tok/s is a completion condition or measured limit.
+No current-combination GPQA result is available.
+The earlier remote TP4 campaign retains MTP4 and that host's 220 W / 1200 MHz limits. After the
+216.934 tok/s result, the user requested a measured same-host 1Cat comparison and reopened
+optimization toward a 300 committed tok/s stretch target at 85000 occupied input tokens.
+Match the saved prompt IDs, output budget, sampling, draft window and request concurrency;
+record any unavoidable artifact, KV or arithmetic differences rather than claiming exact
+equivalence. Short-context rates and clock extrapolations do not establish the 85K objective.
+The retained 2026-10-23–24 TP4 optimization measures 283.118/283.367 committed wall tok/s
+(mean 283.242) with both experimental profiles, versus 191.997/192.210 (mean 192.104)
+with both flags off. Prefill averages 2334.73/2327.73 tok/s, respectively. The 1Cat-inspired
+large collective and TP4 Split-D prefill improve the preceding approximately 1743 tok/s
+prefill; Split-D changes floating-point association and the saved continuation first differs
+from the preceding 231 stage at output 505. Publication, norm scheduling, verify5 prefetch,
+proposal reduction, exact BF16→FP16 norm-image and single-launch split-10 GDN controls
+additionally improve decode. TP4 GDN projection/record/conv fusion then removes intermediate
+projection copies and launches, retaining the observable BF16 record boundary. These later
+steps preserve all 513 fixture IDs and MTP counters of the qualified 244.655
+stage, not universal output equality. The subsequent TP4 N64 prefill tile improves prefill
+by 3.46%/3.45% and passes the independent FP64 oracle at the real final 85K chunk;
+its saved continuations first differ from N32 at zero-based output 504/505. It changes
+long/fast acceptance, so its 0.81% decode-rate increase is not an isolated decode-kernel gain.
+Ordered long-attention split reduction and a BF16-rounded FP16 SwiGLU output image then
+improve N64's 260.133/182.133 by 1.87%/0.80%, preserving both fixtures' 513 IDs and every
+speculative counter. A GDN gated-norm FP16 image then adds 0.94%/0.67%, preserving
+these complete fixtures and the explicit FP32→BF16→FP16 rounding boundary. The output
+images are explicitly typed. Last-CTA GDN record/norm fusion adds 0.55%/0.30%, retaining
+the Dv2/W4 recurrence, BF16 readout/records and resettable per-Program/rank completion counters.
+A caller-owned FP16 W8 verifier input image then adds 0.65%/0.45%, retaining represented
+operands, Split4 reduction, BF16 output and one resident weight image. Both preserve every
+fixture ID/counter; independent recurrence/norm/W8 FP64 oracles, changed-input Graphs and
+normal/longfast/prefix state gates pass without relaxed criteria. Direct-peer TP4 argmax
+then adds 4.05%/2.78%; one origin kernel reads completed four-rank shards and publishes the
+exact global tie-broken/mapped winner. Direct-peer I32 broadcasts through 4 KiB add another
+0.56%/0.38%. Ready/completion edges protect source and output-consumer lifetimes. Exact CPU
+argmax/relocation oracles, changed-input Graphs, reuse/guard checks and all three model-state
+gates pass; all 513 fixture IDs and speculative counters remain unchanged. An MTP stem
+sum/norm trial shows no benefit and is withdrawn. A Q/K-norm/RoPE prototype is also withdrawn
+without whole-model qualification; neither direction is considered exhausted.
+The same-host 1Cat 1.5.1 MTP4 control measures
+98.249/102.509 (mean 100.379), with the same prompt IDs/output budget; FP16/E4M3-KV differs
+from NInfer BF16/INT8-G64. Its captured comparison diverges after 325 shared output IDs.
+Mean TTFT is 35.9378 s versus NInfer long/fast's 36.4077 s. These are not equal-quality
+results. 300 tok/s was not reached and this is not a measured hardware limit.
+After recovery, initcheck identified an eager-only residual/RMSNorm trial reading
+uninitialized scratch. That branch was removed. Current four-rank numerical oracles and
+normal, prefix and actual-85K long/fast Graph/eager, replay-logit/counter and committed-frontier
+gates pass; the residual/norm regression passes initcheck with zero errors. These checks
+do not establish model quality; no current-combination GPQA was run. TP4 work ships in release 0.2.0, separately from the earlier 0.1.2 Vision qualification. The subsequent 2026-10-24 host campaign explicitly
+authorizes 300 W on its four test cards, to remain enabled for the user's video. It measures
+322.178 committed wall tok/s at 85K/MTP4 with both experimental profiles. Its no-NVLink-traffic
+control forces the qualified no-P2P staging route and verifies zero link-counter deltas; it is
+not a direct PCIe P2P measurement.
+See `docs/tp4.md`.
 
 The explicit RAM-KV experiment is optional SM70 27B TP1/TP2/PP2 single-request Text/None/MTP.
 It stores original packed KV in a bounded RAM archive and uses KVMem-inspired Q/K cosine
@@ -191,6 +292,13 @@ above are outside the current product. This is a local, single-owner project. Re
 generated artifacts, and the local workflow are trusted.
 Requirements derived from a different workload, trust model, or deployment model are out of scope
 until that product contract is explicitly changed.
+
+The explicitly requested GUI/TUI model hot unload/load retains one immutable original `.ninfer`
+container in host RAM and destroys/reconstructs the GPU Engine through its public interface.
+Serving admits transitions only with zero request lifetimes, rejects inference while RAM-only or
+transitioning, and preserves the startup configuration and cumulative execution counters.
+KV/GDN/prefix/processed-media caches do not survive; this is not request pause/resume. RAM survives
+reload for subsequent cycles and is released on server shutdown; failed reload remains retryable.
 
 The 27B and 35B-A3B execution packages are peer compile-time Variants of one identity-free Qwen3.6
 family runtime. The family owns the shared `SequencePlan<Variant>`, `RequestPlan<Variant>`, and

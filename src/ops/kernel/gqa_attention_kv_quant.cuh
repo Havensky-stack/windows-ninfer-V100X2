@@ -76,9 +76,9 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8_from(const std::int8_t* code
 
 // Same contract as gqa_kv_dequant_i8x8_from, but packs fp16 instead of bf16: Volta's
 // mma.sync.m8n8k4 accepts fp16 operands only, so the tensor-core decode path needs its staged
-// K/V in fp16, while the SIMT path wants bf16 to match its accumulators. Still one 64-bit load.
-__device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16_from(const std::int8_t* codes8, __half s) {
-    const int2 raw = load_vec<int2>(codes8);
+// K/V in fp16, while the SIMT path wants bf16 to match its accumulators. The register
+// form lets callers issue independent packed K/V loads before consuming either one.
+__device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16(int2 raw, __half s) {
     const unsigned words[2] = {static_cast<unsigned>(raw.x) ^ 0x80808080U,
                                static_cast<unsigned>(raw.y) ^ 0x80808080U};
     const unsigned bias_bits = 0x64806480U;
@@ -96,6 +96,10 @@ __device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16_from(const std::int8_t* 
         packed[i] = *reinterpret_cast<const unsigned*>(&product);
     }
     return make_int4(packed[0], packed[1], packed[2], packed[3]);
+}
+
+__device__ __forceinline__ int4 gqa_kv_dequant_i8x8_f16_from(const std::int8_t* codes8, __half s) {
+    return gqa_kv_dequant_i8x8_f16(load_vec<int2>(codes8), s);
 }
 
 } // namespace ninfer::ops

@@ -140,6 +140,10 @@ int test_cli_contract() {
                                        "--volta-long-attention"}).volta_long_attention &&
                            !parsed.volta_long_attention,
                        "benchmark Volta long attention must be explicit and disabled by default");
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer",
+                                       "--volta-fast-decode"}).volta_fast_decode &&
+                           !parsed.volta_fast_decode,
+                       "benchmark fast numeric profile must be explicit and disabled by default");
     failures += expect(ram.ram_kv.gpu_tokens == 98304 && parsed.ram_kv.gpu_tokens == 0,
                        "RAM KV benchmark window is explicit and off by default");
     failures += expect(tp2.tp == 2 && tp2.device == 1 && tp2.devices == std::vector<int>({1, 0}),
@@ -322,6 +326,7 @@ qb::BenchEnvironment sample_environment() {
     env.mtp_draft_tokens                  = 5;
     env.proposal_head                     = ninfer::ProposalHead::Optimized;
     env.volta_long_attention              = true;
+    env.volta_fast_decode                 = true;
     env.use_cuda_graph                    = true;
     env.decode_graph_primed               = true;
     env.decode_graph_prime_output_tokens  = 13;
@@ -372,6 +377,8 @@ int test_report_contract() {
                        "CUDA Graph allowance");
     failures += expect(report.at("memory").at("kv_payload_bytes") == 123456ULL, "KV payload");
     failures += expect(report.at("config").at("proposal_head") == "optimized", "proposal head");
+    failures += expect(report.at("config").at("volta_fast_decode") == true,
+                       "experimental numerical profile in JSON");
     failures += expect(report.at("config").at("volta_long_attention") == true,
                        "JSON records the attention implementation profile");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
@@ -472,7 +479,7 @@ int test_human_and_csv_reports() {
     failures += expect(csv.find(",2,1,1,\"1,0\",") != std::string::npos,
                        "CSV device list remains one quoted field");
     for (const std::string_view field :
-         {"proposal_head", "volta_long_attention", "kv_payload_bytes", "load_host_to_device_bytes",
+         {"proposal_head", "volta_long_attention", "volta_fast_decode", "kv_payload_bytes", "load_host_to_device_bytes",
           "request_transient_capacity_bytes", "cuda_graph_allowance_bytes", "workspace_peak_bytes",
           "workspace_allocator_peak_bytes", "spec_acceptance_rate", "decode_output_tok_s_mean",
           "decode_engine_tok_s_mean", "total_seconds_mean"}) {

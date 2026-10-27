@@ -103,4 +103,29 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream);
 
+/**
+ * Optional closed gated-normalization epilogue for replay recording. It consumes the public
+ * BF16 readout and applies gated_rmsnorm with BF16 weight [128] and same-shaped BF16 z.
+ * out is the BF16-rounded FP16 image. completion_counts is device I32 [12], initialized to
+ * zero once before first use. Calls sharing these counters must be stream-ordered, including
+ * Graph replays; every completed call restores all counters to zero. It is private synchronization
+ * storage, never model state, and may not overlap any input, readout, record or normalized output.
+ * The admitted fused geometry is Hq=4, Hv=12, B=1, T=2..8. Readout/record/state semantics are
+ * unchanged. Its norm oracle evaluates FP64 from the represented BF16 readout, weight and z.
+ */
+struct GdnReplayGatedNorm {
+    Tensor weight;
+    Tensor z;
+    float eps;
+    Tensor out;
+    Tensor completion_counts;
+};
+
+void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
+                                   const Tensor& g, const Tensor& beta, float scale,
+                                   const Tensor& ssm_states, const Tensor& valid_columns,
+                                   const Tensor& initial_state_slots, Tensor& key_record,
+                                   Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                   const GdnReplayGatedNorm& norm, cudaStream_t stream);
+
 } // namespace ninfer::ops

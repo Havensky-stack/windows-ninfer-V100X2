@@ -5,6 +5,7 @@
 #include "ops/input_projection_test_common.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan.h"
+#include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 
 #include <iostream>
@@ -16,6 +17,12 @@ namespace qw = ninfer::test::quantized_weight;
 
 #ifdef NINFER_VOLTA_BUILD
 namespace {
+bool fp32_scale = false;
+
+Weight profile(Weight weight) {
+    weight.volta_fp32_scale = fp32_scale;
+    return weight;
+}
 
 constexpr ReductionCriterion kA16{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
 
@@ -39,6 +46,7 @@ int exercise(bool attention, int tp) {
     device_weight.copy_from_host(packed.data(), packed.size());
     auto weight = native.device_weight(device_weight.p);
     weight.layout = QuantLayout::VoltaQpnPrepacked;
+    weight.volta_fp32_scale = fp32_scale;
     cudaStream_t stream;
     cuda_check(cudaStreamCreate(&stream), "projection test stream");
     int failures = 0;
@@ -146,7 +154,7 @@ int exercise_down_projection() {
         Tensor input(device_input.p, DType::BF16, {8704, tokens});
         GuardedBf16Tensor result(5120, tokens);
         auto output = result.tensor();
-        const auto view = weight.view();
+        const auto view = profile(weight.view());
         const auto capacity = ops::linear_workspace_capacity_bytes(
             QType::NVFP4, 5120, 8704, ops::LinearPolicy::A16Only, tokens, tokens);
         DeviceArena workspace(capacity);
@@ -192,7 +200,7 @@ int exercise_swiglu() {
         GuardedBf16Tensor result(n, tokens);
         auto output = result.tensor();
         DeviceBuffer gate(sizeof(float) * n * tokens), activation(sizeof(std::uint16_t) * k * tokens);
-        const auto view = weight.view();
+        const auto view = profile(weight.view());
         auto invoke = [&] {
             ops::detail::nvfp4_linear_swiglu_qpn_split_launch(
                 input, view, output, static_cast<float*>(gate.p), activation.p, stream);
@@ -231,10 +239,118 @@ int exercise_swiglu() {
     return failures;
 }
 
+int exercise_conv_record() {
+    constexpr int Hidden = 5120, Channels = 5120, QRows = 1024, VRows = 3072;
+    int failures = 0;
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreate(&stream), "record stream");
+    for (float divisor : {0.125F, 1801.382080078125F}) {
+        qw::PatternedWeightOptions options;
+        options.decorrelate_coordinates = true;
+        options.weight_scale_divisor = divisor;
+        options.input_scale_divisor = 3.5F;
+        DevicePackedWeight weight(qw::make_patterned_weight(QType::NVFP4, 8192, Hidden,
+                                                               1871U, options), true);
+        std::vector<float> conv_host(Channels * 4), state_host(Channels * 3 * 2);
+        fill_uniform(conv_host, 1873U, -0.25F, 0.25F);
+        fill_uniform(state_host, 1877U, -1.0F, 1.0F);
+        round_to_bf16(conv_host);
+        round_to_bf16(state_host);
+        auto conv_device = to_device_bf16(conv_host), state_device = to_device_bf16(state_host);
+        auto slots_device = to_device(std::vector<int>{1});
+        Tensor conv(conv_device.p, DType::BF16, {Channels, 4});
+        Tensor state(state_device.p, DType::BF16, {Channels, 3, 2});
+        Tensor slots(slots_device.p, DType::I32, {1});
+        for (int tokens : {1, 2, 4, 5, 7, 8}) {
+            const auto host = make_bf16_activation(Hidden, tokens, 1879U + tokens);
+            auto input_device = to_device_bf16(host);
+            auto valid_device = to_device(std::vector<int>{tokens == 1 ? 1 : tokens - 1});
+            Tensor x(input_device.p, DType::BF16, {Hidden, tokens});
+            Tensor valid(valid_device.p, DType::I32, {1});
+            GuardedBf16Tensor record(Channels, tokens), query(QRows, tokens), key(QRows, tokens),
+                value(VRows, tokens), z(VRows, tokens), projected(Channels, tokens),
+                reference_q(QRows, tokens), reference_k(QRows, tokens),
+                reference_v(VRows, tokens), reference_z(VRows, tokens);
+            auto r = record.tensor(), q = query.tensor(), k = key.tensor(), v = value.tensor(),
+                zv = z.tensor(), p = projected.tensor(), rq = reference_q.tensor(),
+                rk = reference_k.tensor(), rv = reference_v.tensor(), rz = reference_z.tensor();
+            Tensor projected_3d(p.data, DType::BF16, {Channels, tokens, 1});
+            const auto capacity = ops::detail::nvfp4_gdn_input_sm70_workspace_bytes(8192, tokens);
+            DeviceArena arena(std::max<std::size_t>(capacity, 1));
+            auto invoke = [&] {
+                ops::detail::nvfp4_gdn_input_sm70_record_launch(x, profile(weight.view()), conv, state,
+                    valid, slots, r, q, k, v, zv, arena, stream);
+            };
+            auto compare_composition = [&] {
+                ops::detail::nvfp4_gdn_input_sm70_launch(x, profile(weight.view()), p, rz, &arena, stream);
+                ops::detail::gdn_projected_conv_record_launch(projected_3d, conv, state, valid,
+                                                                slots, rq, rk, rv, stream);
+                cuda_synchronize(stream);
+                if (record.bits() != projected.bits() || query.bits() != reference_q.bits() ||
+                    key.bits() != reference_k.bits() || value.bits() != reference_v.bits() ||
+                    z.bits() != reference_z.bits()) {
+                    std::cerr << "GDN column record changed represented composition\n";
+                    ++failures;
+                }
+            };
+            invoke();
+            compare_composition();
+            std::vector<double> actual_record, ideal_record, actual_conv, ideal_conv;
+            const auto record_values = record.values(), qv = query.values(), kv = key.values(),
+                vv = value.values();
+            for (int row : sampled_rows(Channels, 29)) {
+                double s0 = state_host[Channels * 3 + row];
+                double s1 = state_host[Channels * 4 + row];
+                double s2 = state_host[Channels * 5 + row];
+                for (int token = 0; token < tokens; ++token) {
+                    const double ideal = qw::dot_fp64(weight.host, row,
+                        host.data() + static_cast<std::size_t>(token) * Hidden, Hidden);
+                    actual_record.push_back(record_values[token * Channels + row]);
+                    ideal_record.push_back(ideal);
+                    const int valid_tokens = tokens == 1 ? 1 : tokens - 1;
+                    const double c = conv_host[row] * s0 + conv_host[Channels + row] * s1 +
+                        conv_host[2 * Channels + row] * s2 + conv_host[3 * Channels + row] * ideal;
+                    ideal_conv.push_back(token < valid_tokens ? c / (1.0 + std::exp(-c)) : 0.0);
+                    actual_conv.push_back(row < QRows ? qv[token * QRows + row]
+                        : row < 2 * QRows ? kv[token * QRows + row - QRows]
+                        : vv[token * VRows + row - 2 * QRows]);
+                    s0 = s1; s1 = s2; s2 = ideal;
+                }
+            }
+            const auto label = "NVFP4 GDN column record T=" + std::to_string(tokens);
+            failures += compare(label + " projection FP64", actual_record, ideal_record, kA16);
+            failures += compare(label + " conv FP64", actual_conv, ideal_conv, kA16);
+            failures += check(label + " z", z, weight.host, Channels, VRows, host, tokens);
+            cudaGraph_t graph;
+            cudaGraphExec_t executable;
+            cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture record");
+            invoke();
+            cuda_check(cudaStreamEndCapture(stream, &graph), "finish record capture");
+            cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0), "instantiate record");
+            auto changed = make_bf16_activation(Hidden, tokens, 1889U + tokens);
+            const auto changed_bits = bf16_bits(changed);
+            input_device.copy_from_host(changed_bits.data(), changed_bits.size() * 2);
+            cuda_check(cudaGraphLaunch(executable, stream), "replay changed record");
+            compare_composition();
+            cuda_check(cudaGraphExecDestroy(executable), "destroy record executable");
+            cuda_check(cudaGraphDestroy(graph), "destroy record graph");
+            for (auto* output : {&record, &query, &key, &value, &z}) {
+                failures += output->verify_guards(label) + output->verify_fully_written(label);
+            }
+            if (from_device_bf16(state_device.p, state_host.size()) !=
+                std::vector<double>(state_host.begin(), state_host.end())) { ++failures; }
+            std::cout << label << " divisor=" << divisor << '\n';
+        }
+        failures += weight.verify_preserved("record weight");
+    }
+    cuda_check(cudaStreamDestroy(stream), "destroy record stream");
+    return failures;
+}
+
 } // namespace
 #endif
 
-int main() {
+int main(int argc, char** argv) {
 #ifndef NINFER_VOLTA_BUILD
     return 77;
 #else
@@ -242,8 +358,16 @@ int main() {
     cudaDeviceProp props{};
     cuda_check(cudaGetDeviceProperties(&props, 0), "query projection device");
     if (props.major != 7 || props.minor != 0) { return 77; }
-    const int failures = exercise(true, 1) + exercise(false, 1) +
-        exercise(true, 2) + exercise(false, 2) + exercise_down_projection() + exercise_swiglu();
+    if (argc == 2 && std::string_view(argv[1]) == "--record") {
+        return exercise_conv_record() ? 1 : 0;
+    }
+    int failures = 0;
+    for (bool selected : {false, true}) {
+        fp32_scale = selected;
+        std::cout << "NVFP4 FP32 epilogue=" << selected << '\n';
+        failures += exercise(true, 1) + exercise(false, 1) + exercise(true, 2) + exercise(false, 2)
+            + exercise_down_projection() + exercise_swiglu() + exercise_conv_record();
+    }
     std::cout << (failures ? "FAIL" : "OK") << " NVFP4 SM70 input projections\n";
     return failures ? 1 : 0;
 #endif

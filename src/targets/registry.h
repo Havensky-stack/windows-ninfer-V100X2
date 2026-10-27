@@ -88,7 +88,8 @@ struct ConstructedTarget {
 };
 
 [[nodiscard]] ConstructedTarget construct_target(const EngineOptions& options,
-                                                 ExecutionContext& execution);
+                                                 ExecutionContext& execution,
+                                                 std::shared_ptr<const std::vector<std::byte>> image = {});
 
 } // namespace targets
 } // namespace ninfer

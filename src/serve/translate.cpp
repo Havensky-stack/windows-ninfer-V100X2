@@ -127,7 +127,26 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         return result;
     }
 
-    switch (requested) {
+    auto template_effort = requested;
+    if (request.map_responses_reasoning_effort) {
+        const auto& efforts = capabilities.reasoning_effort;
+        if (capabilities.enable_thinking && !efforts.low && !efforts.medium && !efforts.xhigh) {
+            // Toggle-only templates support thinking, without a graded token budget.
+            return result;
+        }
+        switch (requested) {
+        case RequestedReasoningEffort::Minimal:
+            template_effort = RequestedReasoningEffort::Low;
+            break;
+        case RequestedReasoningEffort::High:
+        case RequestedReasoningEffort::Max:
+            template_effort = RequestedReasoningEffort::XHigh;
+            break;
+        default:
+            break;
+        }
+    }
+    switch (template_effort) {
     case RequestedReasoningEffort::Low:
         result.reasoning_effort = ninfer::ReasoningEffort::Low;
         break;

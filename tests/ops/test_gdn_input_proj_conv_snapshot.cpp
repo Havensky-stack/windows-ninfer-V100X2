@@ -1026,7 +1026,7 @@ int run_fp8() {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
@@ -1083,4 +1083,7 @@ int main(int argc, char** argv) {
     failures += run_fp8();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
+} catch (const std::exception& error) {
+    std::cerr << "gdn_input_proj_conv_snapshot: " << error.what() << '\n';
+    return 1;
 }

@@ -213,6 +213,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                          .output_rows    = TextConfig::output_rows,
                                          .batch_capacity = plan.max_concurrency,
                                          .draft_window   = plan.draft_window,
+                                         .gdn_record_norm_heads =
+                                             plan.features.mtp() && TextConfig::gdn_value_heads / tp == 12
+                                                 ? 12 : 0,
                                          .enable_mtp     = plan.features.mtp(),
                                          .enable_dflash  = plan.features.dflash()});
     out.prefill_hidden = add_tensor(
@@ -325,6 +328,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                  std::int32_t last, qwen3_6::TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width, ops::GqaExecutionEnvelope envelope) {
+        auto norm_scope = layout.scope();
+        if (plan.tp > 1 && first <= 8) {
+            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, 8));
+            (void)workspace_recipe::post_mixer_hidden<TextConfig>(layout, std::min(last, 8));
+        }
         attention_stage(layout, first, last, phase, batch_size, min_width, max_width, envelope);
         gdn_stage(layout, first, last, phase, path, batch_size, min_width, max_width);
         post_mixer_stage(layout, first, last, phase);
@@ -415,6 +423,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::I32, 1, logit_columns);
         matrix(layout, DType::FP32, plan.tp, logit_columns);
         matrix(layout, DType::I32, plan.tp, logit_columns);
+        // Head projection may materialize a private A16 input image for small T.
+        // Reserve its maximum two-byte activation image; the Op owns selection.
+        if (logit_columns >= 3 && logit_columns <= 8) {
+            auto image = layout.scope();
+            matrix(layout, DType::FP16, TextConfig::hidden, logit_columns);
+        }
     };
 
     // The MTP round's own tp2 additions. Its three all-reduces share ONE [hidden, T] staging
@@ -437,6 +451,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         matrix(layout, DType::I32, 1, logit_columns);
         matrix(layout, DType::FP32, plan.tp, logit_columns);
         matrix(layout, DType::I32, plan.tp, logit_columns);
+        // Full-vocabulary proposal fallback can use the same private input image
+        // as target verification; reserve it independently of head selection.
+        if (logit_columns >= 3 && logit_columns <= 8) {
+            auto image = layout.scope();
+            matrix(layout, DType::FP16, TextConfig::hidden, logit_columns);
+        }
     };
 
     WorkspacePlan out;
@@ -627,7 +647,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         }
     }
 
-    if (plan.features.vision) {
+    if (plan.features.vision && plan.features.vision_device == VisionDevice::Gpu) {
         constexpr std::uint32_t kFrontendSegmentLimit = 768 / 2;
         const std::uint32_t merged = plan.vision_max_tokens;
         out.vision_encode          = schedule::VisionContext::workspace_capacity_bytes(
@@ -654,12 +674,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
 // `RopeMode::Yarn`. The single caller passes it straight into the sequence plan, so the ceiling is
 // resolved exactly once per Engine construction.
 std::uint32_t validate_target_options(DeviceContext& device, const EngineOptions& options) {
+    if (options.vision_device != VisionDevice::Gpu && options.vision_device != VisionDevice::Cpu) {
+        throw std::invalid_argument("unknown vision_device");
+    }
+    if (!options.enable_vision && options.vision_device != VisionDevice::Gpu) {
+        throw std::invalid_argument("CPU Vision requires enable_vision");
+    }
     if (options.volta_long_attention &&
-        (TextConfig::query_heads != 24 || device.sm() != 70 || options.tp != 2 || options.pp != 1 ||
-         options.max_concurrency != 1 || options.enable_vision ||
+        (TextConfig::query_heads != 24 || device.sm() != 70 || (options.tp != 2 && options.tp != 4) || options.pp != 1 ||
          options.kv_cache != KvCacheStorage::Int8Group64 || options.ram_kv.gpu_tokens != 0 ||
          options.speculative.backend == SpeculativeBackend::DFlash)) {
-        throw std::invalid_argument("Volta long attention requires SM70 27B TP2 single-request Text/None/MTP with complete INT8 KV");
+        throw std::invalid_argument("Volta long attention requires SM70 27B TP2/TP4 Text/None/MTP (Vision on TP2 only) with complete INT8 KV");
     }
     if (options.ram_kv.gpu_tokens != 0) {
         if constexpr (TextConfig::query_heads != 24) {
@@ -800,6 +825,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->pp                  = inputs.pp;
     impl->pipeline_chunks     = inputs.pipeline_chunks;
     impl->ram_kv              = inputs.ram_kv;
+    impl->prefix_cache_tokens = inputs.prefix_cache_tokens;
     impl->volta_long_attention = inputs.volta_long_attention;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
@@ -862,10 +888,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
                     // TP2 needs the ordinary two-device module/executable margin as well:
-                    // WDDM SM70 mapped-host collectives use kernel nodes instead of copy nodes
-                    // and measured 26 MiB at C=1, 4096 capacity, MTP3 (old bound: 24 MiB).
-                    // Add 12 MiB for the greedy topology; model/state/workspace remain shared.
-                    const std::uint64_t small_context = impl->tp == 2 ? 20ULL : 12ULL;
+                    // WDDM SM70 MTP3 measured 26 MiB at C=1/4096. The updated
+                    // NVFP4 optimized MTP4 route on Windows TCC/prefill 512 needs
+                    // 34 MiB, exceeding the former 32 MiB reservation. Reserve
+                    // 40 MiB including the 12 MiB greedy topology; actual startup
+                    // consumption is still checked against this per-device bound.
+                    // Model/state/workspace remain shared.
+                    const std::uint64_t small_context = impl->tp == 2 ? 28ULL : 12ULL;
                     return ((final_visible <= 4096 ? small_context : 82ULL) + 12ULL) * kMiB;
                 },
                 "MTP graph allowance");
@@ -894,8 +923,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         if (impl->tp == 4) {
             // Four-rank event/copy topology also contributes to rank 0's driver residency.
             // At C=1, 4096 capacity, SM70 MTP3 consumed 26 MiB versus the TP2 24 MiB bound.
+            // QUASAR MTP4 at C=2 consumed up to 150 MiB on a non-root rank: the two
+            // exact-b graph families exceed the former 96 MiB reservation. Reserve
+            // 96 MiB per short-context batch class (192 MiB at C=2), retaining the
+            // measured per-device check after preparation.
+            const std::size_t multiplier = impl->speculative_backend == SpeculativeBackend::Mtp ? 4 : 2;
             impl->graph_allowance_bytes = checked_mul(
-                impl->graph_allowance_bytes, 2, "TP4 per-device graph allowance");
+                impl->graph_allowance_bytes, multiplier, "TP4 per-device graph allowance");
         }
     }
 
@@ -938,6 +972,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .pp             = options.pp,
         .pipeline_chunks = options.pp == 2 ? options.pipeline_chunks : 1U,
         .ram_kv         = options.ram_kv,
+        .prefix_cache_tokens = options.prefix_cache_tokens,
         .volta_long_attention = options.volta_long_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

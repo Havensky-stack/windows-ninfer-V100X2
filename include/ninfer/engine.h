@@ -8,6 +8,18 @@
 
 namespace ninfer {
 
+// Original packed .ninfer container in host RAM; owns no CUDA resources or request state.
+class ModelMemory {
+public:
+    ModelMemory() = default;
+    [[nodiscard]] std::uint64_t bytes() const noexcept;
+    [[nodiscard]] explicit operator bool() const noexcept { return bytes() != 0; }
+private:
+    struct Impl;
+    std::shared_ptr<const Impl> impl_;
+    friend class Engine;
+};
+
 class PreparedPrompt {
 public:
     PreparedPrompt() noexcept;
@@ -65,6 +77,7 @@ private:
 class Engine {
 public:
     explicit Engine(EngineOptions options);
+    Engine(EngineOptions options, const ModelMemory& model);
     ~Engine();
 
     Engine(Engine&&) noexcept;
@@ -85,17 +98,21 @@ public:
     [[nodiscard]] PromptCapabilities prompt_capabilities() const;
     [[nodiscard]] ModelSamplingDefaults sampling_defaults() const;
 
-    // Establishes queue membership synchronously. Destroying an unconsumed handle cancels its
+    // Completes optional CPU media encoding and establishes queue membership synchronously.
+    // Submission control bounds that host work and the subsequent admission deadline.
+    // Destroying an unconsumed handle cancels its
     // request; wait() owns result consumption and may run independently from GPU execution.
     [[nodiscard]] GenerationHandle
     submit(PreparedPrompt prompt, RequestOptions options,
-           std::chrono::steady_clock::time_point pending_deadline = {});
+           const PreparationControl& control = {});
 
     GenerationResult generate(PreparedPrompt prompt, RequestOptions options,
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
 
     [[nodiscard]] const EngineOptions& options() const;
+    // Captures original codes/scales, not live KV/GDN/prefix state. Does not unload this Engine.
+    [[nodiscard]] ModelMemory retain_model_in_memory(const LoadProgress& progress = {}) const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] MemorySummary memory_summary() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;

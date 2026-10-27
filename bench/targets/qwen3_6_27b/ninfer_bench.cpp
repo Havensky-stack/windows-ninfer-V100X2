@@ -177,6 +177,7 @@ int main(int argc, char** argv) {
         engine_options.speculative.proposal_head = options.proposal_head;
         engine_options.use_cuda_graph            = options.use_cuda_graph;
         engine_options.volta_long_attention      = options.volta_long_attention;
+        engine_options.volta_fast_decode      = options.volta_fast_decode;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
@@ -190,6 +191,7 @@ int main(int argc, char** argv) {
         env.proposal_head            = options.proposal_head;
         env.use_cuda_graph           = options.use_cuda_graph;
         env.volta_long_attention     = options.volta_long_attention;
+        env.volta_fast_decode     = options.volta_fast_decode;
         env.repetitions              = options.repetitions;
         env.warmup                   = options.warmup;
         env.corpus_path              = options.corpus_path;

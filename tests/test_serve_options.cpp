@@ -27,6 +27,18 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    const auto capped = parse({"ninfer-serve", "model.ninfer", "--max-output-tokens", "131072",
+                               "--default-max-tokens", "131072", "--no-thinking"});
+    failures += check(capped.max_output_tokens == 131072 &&
+                          capped.default_max_tokens == 131072 && !capped.enable_thinking,
+                      "128K output ceiling or non-thinking default did not parse");
+    const auto small_cap = parse({"ninfer-serve", "model.ninfer", "--max-output-tokens", "32"});
+    failures += check(small_cap.default_max_tokens == 32, "default budget exceeds output cap");
+    bool bad_budget = false;
+    try { (void)parse({"ninfer-serve", "model.ninfer", "--max-output-tokens", "32",
+                       "--default-max-tokens", "64"}); }
+    catch (const std::invalid_argument&) { bad_budget = true; }
+    failures += check(bad_budget, "explicit default above output cap was accepted");
     const auto pp2 = parse({"ninfer-serve", "model.ninfer", "--pp", "2", "--devices", "1,0",
                             "--pipeline-chunks", "4"});
     failures += check(pp2.tp == 1 && pp2.pp == 2 && pp2.pipeline_chunks == 4 &&
@@ -36,12 +48,30 @@ int main() {
                       "TP4 server lost the four-rank device order");
 
     const ServeOptions defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(defaults.prefill_decode_rounds == 1,
+                      "default prefill/decode alternation changed");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--prefill-decode-rounds", "4"})
+                          .prefill_decode_rounds == 4,
+                      "configured decode burst was lost");
+    for (const char* invalid : {"0", "65"}) {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--prefill-decode-rounds", invalid});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "out-of-range decode burst was accepted");
+    }
     failures += check(parse({"ninfer-serve", "model.ninfer", "--volta-long-attention"}).volta_long_attention &&
                           !defaults.volta_long_attention,
                       "server Volta long attention must be explicit and disabled by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--volta-fast-decode"}).volta_fast_decode &&
+                          !defaults.volta_fast_decode,
+                      "experimental fast decode must be explicit and disabled by default");
     failures += check(defaults.allow_prefix_reuse, "prefix reuse is not enabled by default");
     failures +=
         check(!defaults.preserve_thinking, "thinking history is unexpectedly preserved by default");
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--vision", "--vision-device", "cpu"}).vision_device == ninfer::VisionDevice::Cpu,
+                      "CPU Vision device did not parse");
+    failures += check(defaults.vision_device == ninfer::VisionDevice::Gpu, "Vision device default is not GPU");
     failures += check(!defaults.enable_vision, "Vision is not disabled by default");
     failures += check(defaults.vision_max_tokens == ninfer::kMaximumVisionTokenBudget,
                       "Vision token budget default changed");
@@ -211,6 +241,8 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
+    failures += check(serve_usage_text("ninfer-serve").find("--prefill-decode-rounds") !=
+                          std::string::npos, "serve help omits decode burst control");
     failures +=
         check(serve_usage_text("ninfer-serve").find("--preserve-thinking") != std::string::npos,
               "serve help omits --preserve-thinking");

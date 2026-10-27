@@ -108,14 +108,17 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
                                    const Tensor& ssm_states, const Tensor& valid_columns,
                                    const Tensor& initial_state_slots, Tensor& key_record,
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
+                                   cudaStream_t stream, const GdnReplayGatedNorm* norm = nullptr) {
+    // Independent value columns retain the same per-column warp reduction.
+    // The narrow record tile reduces live state and exposes twice as many CTAs.
+    constexpr int Dv = 2, Warps = 4;
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), static_cast<unsigned>(q.ne[3]),
-                    static_cast<unsigned>(kStateDim / kBlockDv));
-    const dim3 block(kWarpSize, kNumWarps, 1);
+                    static_cast<unsigned>(kStateDim / (Dv * Warps)));
+    const dim3 block(kWarpSize, Warps, 1);
     const std::int64_t state_slot_stride =
         static_cast<std::int64_t>(kStateDim) * kStateDim * ssm_states.ne[2];
-    const RecordAccess<Masked> access{
+    const RecordAccess<Masked, Dv, Warps> access{
         static_cast<const __nv_bfloat16*>(q.data),
         static_cast<const __nv_bfloat16*>(k.data),
         static_cast<const __nv_bfloat16*>(v.data),
@@ -133,7 +136,15 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    recurrent_record_kernel<Masked><<<grid, block, 0, stream>>>(access);
+    if (norm != nullptr) {
+        recurrent_record_norm_kernel<Masked><<<grid, block, 0, stream>>>(
+            access, static_cast<const __nv_bfloat162*>(norm->weight.data),
+            static_cast<const __nv_bfloat162*>(norm->z.data),
+            static_cast<__half2*>(norm->out.data), norm->eps,
+            static_cast<unsigned*>(norm->completion_counts.data));
+    } else {
+        recurrent_record_kernel<Masked, Dv, Warps><<<grid, block, 0, stream>>>(access);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -256,6 +267,23 @@ void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, 
         launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
                                             initial_state_slots, key_record, value_record,
                                             gate_record, out, stream);
+    }
+}
+
+void launch_recurrent_record_norm(const Tensor& q, const Tensor& k, const Tensor& v,
+                                  const Tensor& g, const Tensor& beta, float scale,
+                                  const Tensor& ssm_states, const Tensor& valid_columns,
+                                  const Tensor& initial_state_slots, Tensor& key_record,
+                                  Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                  const GdnReplayGatedNorm& norm, cudaStream_t stream) {
+    if (valid_columns.data == nullptr) {
+        launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
+                                             initial_state_slots, key_record, value_record,
+                                             gate_record, out, stream, &norm);
+    } else {
+        launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
+                                            initial_state_slots, key_record, value_record,
+                                            gate_record, out, stream, &norm);
     }
 }
 

@@ -40,7 +40,10 @@ std::size_t attn_input_volta_tp4_workspace_bytes(QType type, std::int32_t tokens
                        type != QType::FP8_E4M3FN_BLOCK128_BF16S)) {
         throw std::invalid_argument("SM70 TP4 attention: invalid profile");
     }
-    if (tokens < kWideTokens) { return 0; }
+    if (tokens < kWideTokens) {
+        return type == QType::NVFP4
+            ? nvfp4_volta_qpn_precast_workspace_bytes(kRows, 5120, tokens) : 0;
+    }
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::BF16, {kRows, tokens}, 256);
     const auto bytes = type == QType::NVFP4
@@ -81,8 +84,13 @@ void attn_input_volta_tp4_launch(const Tensor& x, const Weight& weight, Tensor& 
             static_cast<__nv_bfloat16*>(gate.data) + begin * kQueryRows,
             static_cast<__nv_bfloat16*>(value.data) + begin * kKvRows};
         if (weight.qtype == QType::NVFP4) {
-            launch_nvfp4_volta_qpn_with_output(input, weight, output, kRows,
-                                               1.0F / weight.weight_scale_divisor, stream);
+            if (workspace && nvfp4_volta_qpn_precast_supported(kRows, 5120, width)) {
+                launch_nvfp4_volta_qpn_with_precast_output(
+                    input, weight, output, kRows, *workspace, stream);
+            } else {
+                launch_nvfp4_volta_qpn_with_output(input, weight, output, kRows,
+                                                   1.0F / weight.weight_scale_divisor, stream);
+            }
         } else if (weight.qtype == QType::FP8_E4M3FN_BLOCK128_BF16S) {
             launch_fp8_volta_qpn_with_output<HeadLocalOutput, true>(input, weight, output, kRows, stream);
         } else {

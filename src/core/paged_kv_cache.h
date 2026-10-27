@@ -187,6 +187,16 @@ public:
     void unbind_row() noexcept;
     [[nodiscard]] Tensor block_table() const;
 
+    [[nodiscard]] std::size_t snapshot_bytes(std::uint32_t pages) const;
+    void export_pages(std::uint32_t first, std::uint32_t count, std::span<std::byte> image,
+                      cudaStream_t stream) const;
+    void import_pages(std::uint32_t first, std::uint32_t count, std::span<const std::byte> image,
+                      cudaStream_t stream);
+
+    // Restore the first count pages of an image containing image_pages logical pages.
+    void import_page_prefix(std::uint32_t first, std::uint32_t count, std::uint32_t image_pages,
+                            std::span<const std::byte> image, cudaStream_t stream);
+
     void release() noexcept;
     // Ranking is storage-policy input supplied by the model family, not interpreted by core.
     void prefer_pages(std::span<const std::int32_t> ranked_pages);

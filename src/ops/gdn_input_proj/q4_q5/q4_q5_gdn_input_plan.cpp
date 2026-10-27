@@ -168,9 +168,14 @@ Q4Q5GdnInputPlan q4_q5_gdn_input_resolve_plan(const Q4Q5GdnInputProblem& problem
             }
 #endif
             return plan;
+#ifdef NINFER_VOLTA_BUILD
         case Q4Q5GdnInputScheduleId::VoltaMmaFused:
             plan.workspace_bytes = gdn_volta_mma_workspace_bytes(problem);
             return plan;
+#else
+        case Q4Q5GdnInputScheduleId::VoltaMmaFused:
+            throw std::logic_error("Q4/Q5 GDN input: VoltaMmaFused is Volta-only");
+#endif
         case Q4Q5GdnInputScheduleId::CutlassSm70TensorCore:
 #ifdef NINFER_VOLTA_BUILD
             if (gdn_uses_volta_mma(problem)) {

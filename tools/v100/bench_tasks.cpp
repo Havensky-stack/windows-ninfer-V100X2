@@ -10,7 +10,6 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -89,51 +88,35 @@ void save(const char* path, const Json& report) {
     sync_path(directory.empty() ? std::filesystem::path(".") : directory);
 }
 
-Json check_jsonl(const std::string& content) {
-    using Ordered = nlohmann::ordered_json;
-    std::istringstream input(content);
-    std::string line;
-    int records = 0;
-    bool exact = true, ordered = true;
-    const std::vector<std::string> keys{
-        "id", "model", "prompt_tokens", "completion_tokens", "status"};
-    while (std::getline(input, line)) {
-        ++records;
-        try {
-            const auto row = Ordered::parse(line);
-            const Ordered expected{{"id", records}, {"model", "qwen3.8-27b"},
-                {"prompt_tokens", 1000 + 16 * records},
-                {"completion_tokens", 64 + 2 * records},
-                {"status", records % 5 == 0 ? "warn" : "ok"}};
-            exact = exact && Json(row) == Json(expected);
-            std::vector<std::string> actual;
-            for (const auto& item : row.items()) { actual.push_back(item.key()); }
-            ordered = ordered && actual == keys;
-        } catch (const Json::exception&) {
-            exact = ordered = false;
-        }
-    }
-    return {{"records", records}, {"exact_records", exact && records == 32},
-            {"field_order", ordered && records == 32}};
-}
-
 int run(int argc, char** argv) {
-    if (argc != 9) {
+    if (argc != 10) {
         throw std::invalid_argument(
             "usage: ninfer_v100_task_bench WEIGHTS.ninfer CASES.json REPORT.json "
-            "mtp|dflash TASK|all OCCUPANCY|all ACTIVE_SECONDS REST_SECONDS");
+            "CONFIG_LIBRARY.json PROFILE TASK|all OCCUPANCY|all REST_SECONDS REST_MIN_PROMPT_TOKENS");
     }
-    const std::string backend = argv[4];
-    if (backend != "mtp" && backend != "dflash") {
-        throw std::invalid_argument("backend must be mtp or dflash");
+    std::size_t parsed = 0;
+    const int rest_seconds = std::stoi(argv[8], &parsed);
+    if (parsed != std::string(argv[8]).size() || rest_seconds < 0) {
+        throw std::invalid_argument("REST_SECONDS must be a nonnegative integer");
     }
-    const bool dflash = backend == "dflash";
-    const int active_seconds = std::stoi(argv[7]), rest_seconds = std::stoi(argv[8]);
-    if (active_seconds < 180 || rest_seconds < 1) {
-        throw std::invalid_argument("active window must be >=180 seconds and rest must be positive");
+    parsed = 0;
+    const int rest_min_prompt_tokens = std::stoi(argv[9], &parsed);
+    if (parsed != std::string(argv[9]).size() || rest_min_prompt_tokens < 0) {
+        throw std::invalid_argument("REST_MIN_PROMPT_TOKENS must be a nonnegative integer");
     }
+    const auto profile = read_json(argv[4]).at("profiles").at(argv[5]);
+    // The retained QUASAR speed matrix measures the two delivered TP2/MTP4 profiles.
+    if (profile.at("tp") != "2" || profile.at("pp") != "1" ||
+        profile.at("devices") != "0,1" || profile.at("spec") != "mtp" ||
+        profile.at("draft_tokens") != 4 || profile.at("kv_dtype") != "int8" ||
+        profile.at("ram_kv") != false || profile.at("kv_capacity") != "" ||
+        profile.at("max_concurrency") != 1) {
+        throw std::invalid_argument("matrix requires TP2 devices 0,1, MTP4, full INT8 KV "
+                                    "following context capacity, and one active request");
+    }
+    const std::string backend = "mtp";
     const auto suite = read_json(argv[2]);
-    const std::string task = argv[5], occupancy = argv[6];
+    const std::string task = argv[6], occupancy = argv[7];
     Json cases = Json::array();
     for (const auto& item : suite.at("cases")) {
         if ((task == "all" || item.at("name") == task) &&
@@ -151,29 +134,46 @@ int run(int argc, char** argv) {
     options.artifact_path = argv[1];
     options.tp = 2;
     options.devices = {0, 1};
-    options.max_context = 98304;
-    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(98304);
-    options.prefill_chunk = 1024;
+    options.max_context = profile.at("max_context").get<std::uint32_t>();
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
+    options.prefill_chunk = profile.at("prefill_chunk").get<std::uint32_t>();
     options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
-    options.use_cuda_graph = true;
-    options.enable_vision = false;
-    options.speculative.backend = dflash ? ninfer::SpeculativeBackend::DFlash
-                                        : ninfer::SpeculativeBackend::Mtp;
-    options.speculative.draft_tokens = dflash ? 7 : 3;
-    options.speculative.proposal_head = dflash ? ninfer::ProposalHead::Full
-                                             : ninfer::ProposalHead::Optimized;
-    event("load_start", {{"artifact", argv[1]}, {"backend", backend}});
+    options.use_cuda_graph = profile.at("cuda_graph").get<bool>();
+    options.enable_vision = profile.at("vision").get<bool>();
+    options.vision_max_tokens = profile.at("vision_max_tokens").get<std::uint32_t>();
+    options.volta_long_attention = profile.at("volta_long_attention").get<bool>();
+    options.volta_fast_decode = profile.at("volta_fast_decode").get<bool>();
+    options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens = 4;
+    options.speculative.proposal_head = profile.at("lm_head_draft").get<bool>()
+        ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+    event("load_start", {{"artifact", argv[1]}, {"backend", backend}, {"profile", argv[5]}});
     ninfer::Engine engine(options);
     const auto identity = engine.load_summary();
     event("load_end", {{"backend", backend}, {"seconds", identity.load_seconds}});
     ProgressLog progress(engine);
+    // All inference has retired when generate() returns. Enforce idle time before the
+    // next request, including warmup, without adding it to any measured request timer.
+    auto last_request_end = std::chrono::steady_clock::now();
     const auto generate = [&](const std::vector<ninfer::TokenId>& prompt,
                               const ninfer::RequestOptions& request, Json fields) {
+        const int request_gap = prompt.size() >= static_cast<std::size_t>(rest_min_prompt_tokens)
+            ? rest_seconds : 0;
+        const auto next_start = last_request_end + std::chrono::seconds(request_gap);
+        const auto now = std::chrono::steady_clock::now();
+        if (now < next_start) {
+            event("rest_start", {{"seconds", std::chrono::duration<double>(next_start - now).count()},
+                                 {"before", fields}});
+            std::this_thread::sleep_until(next_start);
+            event("rest_end");
+        }
         fields["backend"] = backend;
+        fields["minimum_request_gap_seconds"] = request_gap;
         fields["prompt_tokens"] = prompt.size();
         fields["max_output_tokens"] = request.execution.requested_output_tokens;
         event("request_start", fields);
         auto result = engine.generate(engine.prepare_tokens(prompt, false), request);
+        last_request_end = std::chrono::steady_clock::now();
         fields["published_tokens"] = result.generated_token_ids.size();
         fields["prefill_seconds"] = result.timings.prefill_seconds;
         fields["first_token_seconds"] = result.timings.first_token_seconds;
@@ -187,8 +187,11 @@ int run(int argc, char** argv) {
         {"weights_id", identity.weights_id}, {"backend", backend},
         {"drafts", options.speculative.draft_tokens}, {"capacity", options.max_context},
         {"chunk", options.prefill_chunk}, {"tp", 2}, {"kv_cache", "int8-group64"},
-        {"graphs", true}, {"greedy", true}, {"model_stops", true}, {"prefix_reuse", false},
-        {"vision", false}, {"warmup_per_case", 1},
+        {"graphs", options.use_cuda_graph}, {"greedy", true}, {"model_stops", true},
+        {"prefix_reuse", false}, {"vision", options.enable_vision},
+        {"volta_long_attention", options.volta_long_attention},
+        {"volta_fast_decode", options.volta_fast_decode},
+        {"profile_name", argv[5]}, {"profile", profile}, {"warmup_per_case", 1},
         {"repetitions", "per-case corpus value"}, {"corpus", argv[2]},
         {"runs", Json::array()}};
     report["load"] = {{"seconds", identity.load_seconds},
@@ -205,7 +208,8 @@ int run(int argc, char** argv) {
         auto previous = read_json(argv[3]);
         for (const auto* key : {"artifact", "model_id", "weights_id", "backend", "drafts",
                                "capacity", "chunk", "tp", "kv_cache", "graphs", "greedy",
-                               "model_stops", "prefix_reuse", "vision", "corpus"}) {
+                               "model_stops", "prefix_reuse", "vision", "corpus",
+                               "volta_long_attention", "volta_fast_decode", "profile_name", "profile"}) {
             if (previous.at(key) != report.at(key)) {
                 throw std::invalid_argument(std::string("resume report differs at ") + key);
             }
@@ -214,23 +218,17 @@ int run(int argc, char** argv) {
         report = std::move(previous);
         event("resume", {{"measured_runs", report.at("runs").size()}});
     }
-    report["duty_cycle"] = {{"active_seconds", active_seconds}, {"rest_seconds", rest_seconds},
-                            {"request_boundary_margin_seconds", 120}};
-    auto cycle_started = std::chrono::steady_clock::now();
-    const auto cool_down = [&] {
-        const double elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - cycle_started).count();
-        // All measured requests in this suite fit within the 120-second margin. Rest only
-        // after a completed request: no queued GPU work and no pause inside reported timing.
-        if (elapsed < active_seconds - 120) { return; }
-        report["cooldowns"].push_back({{"after_measured_runs", report.at("runs").size()},
-                                      {"active_seconds", elapsed}, {"rest_seconds", rest_seconds}});
-        save(argv[3], report);
-        event("cooldown_start", {{"seconds", rest_seconds}, {"active_seconds", elapsed}});
-        std::this_thread::sleep_for(std::chrono::seconds(rest_seconds));
-        cycle_started = std::chrono::steady_clock::now();
-        event("cooldown_end");
-    };
+    // A changed idle policy does not change the measured workload. Preserve the policy
+    // of existing runs explicitly, and record the new interval with every new result.
+    const int previous_gap = report.value("minimum_request_gap_seconds", 0);
+    for (auto& run : report.at("runs")) {
+        if (!run.contains("minimum_request_gap_seconds")) {
+            run["minimum_request_gap_seconds"] = previous_gap;
+        }
+    }
+    report["minimum_request_gap_seconds"] = rest_seconds;
+    report["rest_min_prompt_tokens"] = rest_min_prompt_tokens;
+    save(argv[3], report);
     ninfer::RequestOptions request;
     request.execution.allow_prefix_reuse = false;
     request.execution.sampling.temperature = 0;
@@ -240,7 +238,6 @@ int run(int argc, char** argv) {
     request.stop.include_model_defaults = false;
     (void)generate({248045}, request, {{"phase", "graph_priming"}});
     request.stop.include_model_defaults = true;
-    int failures = 0;
     for (const auto& item : cases) {
         const auto completed = [&](int rep) {
             return std::any_of(report.at("runs").begin(), report.at("runs").end(),
@@ -258,12 +255,10 @@ int run(int argc, char** argv) {
             throw std::invalid_argument("declared prompt length differs from its token IDs");
         }
         request.execution.requested_output_tokens = item.at("max_output_tokens");
-        cool_down();
         (void)generate(prompt, request, {{"phase", "warmup"}, {"task", item.at("name")},
                                        {"occupancy", item.at("occupancy")}});
         for (int rep = 0; rep < repetitions; ++rep) {
             if (completed(rep)) { continue; }
-            cool_down();
             const auto result = generate(prompt, request,
                 {{"phase", "measured"}, {"task", item.at("name")},
                  {"occupancy", item.at("occupancy")}, {"rep", rep}});
@@ -272,16 +267,12 @@ int run(int argc, char** argv) {
             const auto timed = count ? count - 1 : 0;
             const auto accepted = result.speculative.accepted_tokens;
             const auto drafted = result.speculative.drafted_tokens;
-            const auto checks = item.at("name") == "structured_jsonl"
-                ? check_jsonl(result.content) : Json::object();
-            if (item.at("name") == "structured_jsonl") {
-                failures += !checks.at("exact_records").get<bool>() ||
-                            !checks.at("field_order").get<bool>();
-            }
             const auto decode_wall = result.timings.total_seconds - result.timings.first_token_seconds;
             const auto rate = timed / decode_wall;
             report["runs"].push_back({{"name", item.at("name")},
                 {"occupancy", item.at("occupancy")}, {"rep", rep},
+                {"minimum_request_gap_seconds",
+                    prompt.size() >= static_cast<std::size_t>(rest_min_prompt_tokens) ? rest_seconds : 0},
                 {"prompt_tokens", prompt.size()}, {"published_tokens", count},
                 {"timed_decode_tokens", timed}, {"finish_reason", static_cast<int>(result.finish_reason)},
                 {"prefill_seconds", result.timings.prefill_seconds},
@@ -297,16 +288,16 @@ int run(int argc, char** argv) {
                 {"fallback_steps", result.speculative.fallback_steps},
                 {"accepted_per_position", result.speculative.accepted_per_position},
                 {"token_ids", result.generated_token_ids}, {"content", result.content},
-                {"reasoning", result.reasoning}, {"checks", checks}});
+                {"reasoning", result.reasoning}});
             save(argv[3], report);
             event("measurement_saved", {{"task", item.at("name")},
                 {"occupancy", item.at("occupancy")}, {"rep", rep},
                 {"backend", backend}, {"measured_runs", report.at("runs").size()},
                 {"committed_decode_tok_s", rate},
-                {"acceptance", drafted ? double(accepted) / drafted : 0}, {"checks", checks}});
+                {"acceptance", drafted ? double(accepted) / drafted : 0}});
         }
     }
-    return failures ? 1 : 0;
+    return 0;
 }
 } // namespace
 

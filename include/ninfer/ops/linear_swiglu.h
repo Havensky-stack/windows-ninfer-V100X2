@@ -149,7 +149,14 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, W
 // W8G32_F16S is NOT registered here: its linear_swiglu profile ([12288,2048]) belongs only to the
 // MTP head, which stays single-device (never sharded by the qwen3_6_27b ShardPlan).
 //
-// Every requirement of linear_swiglu() applies per rank (BF16 dtype, contiguity, 16-byte
+// SM70 TP4 NVFP4 VoltaQpnPrepacked A16 at T1..8 additionally accepts a replicated
+// FP16 input, including the BF16-rounded FP16 image produced by the published collective
+// RMSNorm. It uses the same FP16 activation operands as the BF16-input path, skipping
+// the standalone cast. This profile also accepts an FP16 output image: the epilogue first
+// rounds its SwiGLU result to BF16, then converts that represented value to FP16. This is
+// exactly the image the following A16 down projection would otherwise materialize.
+// All other split profiles require BF16 input and output.
+// Every other requirement of linear_swiglu() applies per rank (contiguity, 16-byte
 // alignment, x/out non-aliasing). The caller obligations of src/ops/common/split_launch.h apply
 // unchanged: rank r's work is issued on ec.dev[r]->stream with that rank's device current, and
 // activations staged with the plain cudaMemcpy/cudaMemset/<<<...>>> forms must be retired (they

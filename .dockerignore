@@ -1,4 +1,6 @@
 .git
+.env
+.env.*
 .cache
 .claude
 .codex
@@ -31,3 +33,6 @@ models
 *.qus
 *.safetensors
 *.sqlite
+
+# Generated release packages and Docker exports
+dist/

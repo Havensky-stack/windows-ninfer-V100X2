@@ -426,12 +426,18 @@ private:
     [[nodiscard]] const Tensor& rank_linear_state_slots(int rank) const;
     void synchronize_all() const;
     void attn_mix_tp2(const std::array<const FullLayerW*, kMaximumExecutionDevices>& w, std::array<Tensor, kMaximumExecutionDevices>& x,
-                      int index, Phase phase, const std::array<Tensor, kMaximumExecutionDevices>& staging);
+                      int index, Phase phase, const std::array<Tensor, kMaximumExecutionDevices>& staging,
+                      const ops::ReplicatedRmsNorm* norm = nullptr,
+                       const std::array<Tensor, kMaximumExecutionDevices>* normalized_input = nullptr);
     void gdn_mix_tp2(const std::array<const GdnLayerW*, kMaximumExecutionDevices>& w, std::array<Tensor, kMaximumExecutionDevices>& x, int index,
-                     Phase phase, const std::array<Tensor, kMaximumExecutionDevices>& staging);
+                     Phase phase, const std::array<Tensor, kMaximumExecutionDevices>& staging,
+                      const ops::ReplicatedRmsNorm* norm = nullptr,
+                       const std::array<Tensor, kMaximumExecutionDevices>* normalized_input = nullptr);
     void mlp_tail_tp2(const std::array<const Tensor*, kMaximumExecutionDevices>& norm,
                       const std::array<const MlpW*, kMaximumExecutionDevices>& mlp, std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
-                      const std::array<Tensor, kMaximumExecutionDevices>& staging);
+                      const std::array<Tensor, kMaximumExecutionDevices>& staging,
+                      const std::array<Tensor, kMaximumExecutionDevices>* normalized = nullptr,
+                       const ops::ReplicatedRmsNorm* next_input_norm = nullptr);
     void run_layers_tp2(std::array<Tensor, kMaximumExecutionDevices>& x, Phase phase,
                         const std::array<Tensor, kMaximumExecutionDevices>& staging,
                         DFlashFeatureSink* dflash_sink = nullptr);
@@ -442,7 +448,7 @@ private:
     void head_argmax_tp(const std::array<Tensor, kMaximumExecutionDevices>& hidden,
                         const std::array<Weight, kMaximumExecutionDevices>& heads,
                         std::int32_t valid_rows,
-                        const std::array<Tensor, kMaximumExecutionDevices>& tokens);
+                        const std::array<Tensor, kMaximumExecutionDevices>& tokens, bool proposal = false);
     void ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cache_positions,
                                    const Tensor& rope_positions, const Tensor& kv_table_rows,
                                    const Tensor& linear_state_slots,

@@ -142,10 +142,16 @@ void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
     case W8GdnInputScheduleId::MmaR64C128:
         w8_gdn_input_mma_r64_c128_launch(x, weight, qkv, z, stream);
         return;
+#ifdef NINFER_VOLTA_BUILD
     case W8GdnInputScheduleId::SimtRowViewSplit:
         w8_gdn_input_simt_row_view_split_launch(x, weight, qkv, z, stream);
         return;
+#else
+    case W8GdnInputScheduleId::SimtRowViewSplit:
+        throw std::logic_error("W8 GDN input: SimtRowViewSplit is Volta-only");
+#endif
     case W8GdnInputScheduleId::CutlassSm70:
+#ifdef NINFER_VOLTA_BUILD
         // The public convenience overload documents that it needs no transient
         // workspace, so it cannot stage a dequantized parent. Degrade to the
         // in-place route rather than break that contract. Every caller that
@@ -157,6 +163,9 @@ void w8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, T
         }
         w8_gdn_input_cutlass_sm70_launch(x, weight, qkv, z, *workspace, stream);
         return;
+#else
+        throw std::logic_error("W8 GDN input: CutlassSm70 is Volta-only");
+#endif
     }
     throw std::logic_error("W8 GDN input: unknown schedule");
 }

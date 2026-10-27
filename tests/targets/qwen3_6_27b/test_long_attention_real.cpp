@@ -116,6 +116,7 @@ int exercise(int argc, char** argv) {
     options.prefill_chunk = mode == "control" ? 1024 : 2560;
     options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
     options.volta_long_attention = mode != "reference" && mode != "control" && !default_profile;
+    options.volta_fast_decode = !default_profile && mode != "reference" && mode != "control";
     options.use_cuda_graph = !eager;
     if (state) {
         options.speculative.backend = ninfer::SpeculativeBackend::Mtp;

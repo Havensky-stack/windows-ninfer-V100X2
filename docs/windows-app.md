@@ -8,7 +8,7 @@ HTTP 调用既有 `ninfer-serve.exe`；没有第二套推理实现，也不改�
 - 64 位 Windows 11，系统自带 .NET Framework 4.8；设备 0、1 为至少 16GB 的 V100。
 - 驱动由用户安装。检查 CUDA 12.x 最低 Windows 驱动门槛 528.33，本机实测 GRID 553.62。
   达到最低版本不等于其他驱动/硬件组合已通过本项目验证。
-- ZIP 的 `bin/` 包含引擎及 FFmpeg/curl/zlib/VC++ DLL；CUDART 静态链接进引擎。
+- ZIP 的 `bin/` 包含引擎及 FFmpeg/curl/zlib/OpenBLAS/VC++ DLL；CUDART 静态链接进引擎。
   普通用户无需安装编译器、Python、CUDA Toolkit 或系统 VC++ 安装程序。
 - v0.1.2 默认普通解码、思考开启、INT8 KV、256 分块、128K 上下文、2048 输出上限。
 - 可选实验 MTP（1–3 草稿、优化草稿头开关）、DFlash（1–7 草稿）；DFlash 选择时建议
@@ -56,16 +56,26 @@ if ($process.ExitCode -ne 0) { throw 'Launcher smoke failed; inspect the log.' }
 `--render-ui <PNG路径>` 仅绘制启动器自己的控件以检查布局，不启动推理或截取用户桌面。
 2026-10-14，v0.1.2 的真实 DFlash7 + thinking 集成检查通过，使用双卡 TCC、4K 容量、
 512 输出上限，包含思考及最终回答；不是新的速度或模型质量验收。
+2026-10-27，0.1.4 发布构建再次通过该真实 DFlash7 + thinking 集成检查，包含启动、
+思考/回答解析和退出时停止子服务；仍不代表 DFlash 已通过严格数值/行为门。
 
 ## 发行打包
 
 ```powershell
-.\tools\windows\package.ps1
+.\tools\windows\package.ps1 -BuildDirectory build-windows-upstream -Version 0.1.4
 .\tools\windows\package-ffmpeg-source.ps1
+
+# 两个归档完成后生成本次发布的完整校验文件。
+$archives = @('.\build-release\NInfer-Windows-V100X2-0.1.4.zip', '.\build-release\FFmpeg-8.1.2-source.zip')
+$archives | ForEach-Object {
+    $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$hash  $([IO.Path]::GetFileName($_))"
+} | Set-Content -LiteralPath .\build-release\SHA256SUMS.txt -Encoding ascii
 ```
 
 输出到忽略提交的 `build-release/`。包含主 ZIP、FFmpeg 完整源代码归档和实际使用的
-vcpkg port/补丁，以及主 ZIP 的 SHA-256。发布时把两个 ZIP 与 `SHA256SUMS.txt` 一起上传。
+vcpkg port/补丁，以及两个 ZIP 的 SHA-256。依赖许可从所选构建的 CMakeCache 读取；
+发布时把两个 ZIP 与 `SHA256SUMS.txt` 一起上传。
 需要时可给源代码打包脚本显式传 `-SourceArchive` 和 `-PortDirectory`。
 
 第三方许可在应用 `licenses/`，项目许可/来源说明在根目录。FFmpeg 动态链接，并提供

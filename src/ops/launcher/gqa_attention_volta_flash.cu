@@ -26,6 +26,7 @@
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 #include "ops/launcher/gqa_attention.h"
+#include "ops/launcher/gqa_attention_volta_splitd.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -466,6 +467,7 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
     const std::int32_t width         = q.ne[2];
     const std::int32_t n_kv_total    = static_cast<std::int32_t>(envelope.max_visible_keys);
     const std::int32_t logical_pages = cache.block_tables.ne[0];
+    if constexpr (kQHeads == 6) { q_block_tokens = width; }
 
     auto* block_tables = static_cast<const std::int32_t*>(cache.block_tables.data);
     auto* rows         = static_cast<const std::int32_t*>(table_rows.data);
@@ -526,6 +528,23 @@ void volta_flash_launch_impl(const Tensor& q, const Tensor& k, const Tensor& v,
         constexpr int kConvertThreads = 256;
         const int convert_blocks =
             static_cast<int>((q_count + kConvertThreads - 1) / kConvertThreads);
+
+        if constexpr (kQHeads == 6) {
+            gqa_attention_volta_splitd_launch(
+                static_cast<const __nv_bfloat16*>(q.data) +
+                    static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                static_cast<const half*>(k_gathered.data),
+                static_cast<const half*>(v_gathered.data), position_ptr + begin,
+                static_cast<half*>(q_f32.data), static_cast<float*>(out_f32.data),
+                tokens, n_kv_total, kQHeads, kKVHeads, scale, stream);
+            volta_flash_convert_out_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
+                static_cast<const float*>(out_f32.data),
+                static_cast<__nv_bfloat16*>(out.data) +
+                    static_cast<std::int64_t>(begin) * kQHeads * kHeadDim,
+                q_count);
+            CUDA_CHECK(cudaGetLastError());
+            continue;
+        }
 
         volta_flash_convert_q_kernel<<<convert_blocks, kConvertThreads, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data) +

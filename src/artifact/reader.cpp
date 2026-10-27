@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -19,6 +20,7 @@
 #include <utility>
 
 #ifdef _WIN32
+#include <malloc.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -197,6 +199,12 @@ struct TransparentStringHash {
 // Windows mapping and overlapped reads adapted from ww485000/ninfer-windows-v100.
 class MappedFile {
 public:
+    explicit MappedFile(std::shared_ptr<const std::vector<std::byte>> image)
+        : image_(std::move(image)) {
+        if (!image_) { throw ArtifactError("missing in-memory artifact"); }
+        data_ = image_->data();
+        size_ = image_->size();
+    }
     explicit MappedFile(const std::filesystem::path& path) {
 #ifdef _WIN32
         file_ = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -279,11 +287,11 @@ public:
 
     ~MappedFile() {
 #ifdef _WIN32
-        if (data_ != nullptr) { ::UnmapViewOfFile(data_); }
+        if (data_ != nullptr && !image_) { ::UnmapViewOfFile(data_); }
         if (mapping_ != nullptr) { ::CloseHandle(mapping_); }
         if (file_ != INVALID_HANDLE_VALUE) { ::CloseHandle(file_); }
 #else
-        if (data_ != nullptr) { ::munmap(const_cast<std::byte*>(data_), size_); }
+        if (data_ != nullptr && !image_) { ::munmap(const_cast<std::byte*>(data_), size_); }
         if (fd_ >= 0) { ::close(fd_); }
 #endif
     }
@@ -300,6 +308,12 @@ public:
         if (absolute_offset % alignment != 0 || destination.size() % alignment != 0 ||
             reinterpret_cast<std::uintptr_t>(destination.data()) % alignment != 0) {
             throw ArtifactError("direct artifact read is not 4096-byte aligned");
+        }
+        if (image_) {
+            if (absolute_offset >= size_) { return 0; }
+            const auto bytes = std::min(destination.size(), size_ - static_cast<std::size_t>(absolute_offset));
+            std::memcpy(destination.data(), data_ + absolute_offset, bytes);
+            return bytes;
         }
 #ifdef _WIN32
         if (destination.size() > std::numeric_limits<DWORD>::max()) {
@@ -346,6 +360,7 @@ public:
     }
 
 private:
+    std::shared_ptr<const std::vector<std::byte>> image_;
 #ifdef _WIN32
     HANDLE file_    = INVALID_HANDLE_VALUE;
     HANDLE mapping_ = nullptr;
@@ -1264,7 +1279,9 @@ std::uint64_t object_bytes(const ObjectDescriptor& object) noexcept {
 }
 
 struct Reader::Impl {
-    explicit Impl(const std::filesystem::path& path) : file(path) {
+    explicit Impl(const std::filesystem::path& path) : file(path) { parse(); }
+    explicit Impl(std::shared_ptr<const std::vector<std::byte>> image) : file(std::move(image)) { parse(); }
+    void parse() {
         if (file.size() < kPrefixBytes) {
             throw ArtifactError("artifact is shorter than the NInfer prefix");
         }
@@ -1377,6 +1394,34 @@ struct Reader::Impl {
 };
 
 Reader::Reader(const std::filesystem::path& path) : impl_(std::make_unique<Impl>(path)) {}
+Reader::Reader(std::shared_ptr<const std::vector<std::byte>> image)
+    : impl_(std::make_unique<Impl>(std::move(image))) {}
+
+std::shared_ptr<const std::vector<std::byte>> Reader::retain_in_memory(
+    const std::function<void(std::uint64_t, std::uint64_t)>& progress) const {
+    auto image = std::make_shared<std::vector<std::byte>>(file_bytes());
+    constexpr std::size_t chunk = 8 * 1024 * 1024;
+    void* buffer = nullptr;
+#ifdef _WIN32
+    buffer = ::_aligned_malloc(chunk, direct_io_alignment);
+    if (buffer == nullptr) { throw std::bad_alloc(); }
+    const std::unique_ptr<void, decltype(&::_aligned_free)> staging(buffer, &::_aligned_free);
+#else
+    if (::posix_memalign(&buffer, direct_io_alignment, chunk) != 0) { throw std::bad_alloc(); }
+    const std::unique_ptr<void, decltype(&std::free)> staging(buffer, &std::free);
+#endif
+    if (progress) { progress(0, file_bytes()); }
+    for (std::size_t offset = 0; offset < image->size();) {
+        const auto remaining = std::min(chunk, image->size() - offset);
+        const auto aligned = (remaining + direct_io_alignment - 1) / direct_io_alignment * direct_io_alignment;
+        const auto read = read_direct(offset, {static_cast<std::byte*>(buffer), aligned});
+        if (read < remaining) { throw ArtifactError("short read while retaining artifact in RAM"); }
+        std::memcpy(image->data() + offset, buffer, remaining);
+        offset += remaining;
+        if (progress) { progress(offset, file_bytes()); }
+    }
+    return image;
+}
 
 Reader::~Reader()                            = default;
 Reader::Reader(Reader&&) noexcept            = default;

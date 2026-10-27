@@ -1,6 +1,6 @@
 # NInfer for Windows · Dual V100
 
-[中文首页](README.md) · [Download Windows v0.1.3 preview](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.3-windows-preview)
+[中文首页](README.md) · [Download Windows v0.1.4 preview](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.4-windows-preview)
 
 **Local Qwen inference on Windows with dual Tesla V100 GPUs, a portable Chinese launcher,
 and compatible APIs.**
@@ -22,12 +22,12 @@ MSVC 14.44 build, exact Coder390 v3 artifact/template admission, focused regress
 and a portable Chinese launcher with hardware checks, resumable model download, SHA-256
 verification, service lifecycle controls and a simple single-turn chat interface.
 
-Current source and the v0.1.3 release use mapped-host transfers for small WDDM TP2
+Current source and the v0.1.4 release use mapped-host transfers for small WDDM TP2
 reductions. In the earlier WDDM count-to-300 comparison, committed ordinary decode rose from 16.49
 to 28.08 tok/s; experimental MTP3 rose from 57.07 to 94.68 tok/s. Answers were byte-identical
 before and after. The input occupied only 19 tokens, and MTP accepted all drafts; this is not
 a long-context or general-chat claim. See [Windows performance](docs/windows-performance.md).
-The v0.1.3 ZIP includes this optimization and configurable speculative modes; the old 0.1.0 does not.
+The v0.1.4 ZIP includes this optimization and configurable speculative modes; the old 0.1.0 does not.
 
 The historical v0.1.2 baseline with the same driver and per-mode workload measured **36.19 / 122.69 / 189.50 committed
 decode tok/s** for ordinary decode / MTP3 / DFlash7, versus **28.08 / 94.68 / 153.70** on
@@ -39,7 +39,7 @@ WDDM concurrency reached 180.23 total tok/s for ordinary decode and 207.88 for M
 requests with 4096 capacity each, including prefill/scheduling. DFlash multi-request startup
 is not working; see the [full measurements and limitations](docs/windows-performance.md).
 
-The source integrates upstream commits `861633e8` and `756d1363`: exact W8 vocabulary-head
+The v0.1.3 source integrated upstream commits `861633e8` and `756d1363`: exact W8 vocabulary-head
 prepacking, NVFP4 projections and INT8 attention optimizations, while preserving the Windows
 platform and WDDM transport adaptations. PP2, experimental long attention and approximate
 Q/K mean-vector RAM-KV remain opt-in CLI features, outside the launcher. PP2 and experimental
@@ -50,12 +50,25 @@ versus **189.50** previously (−0.16%, one request each). Output bytes and acce
 match; no meaningful speedup was established. The original 1/64 strict DFlash discrepancy
 remains at the same position, while the ordinary control is 0/64.
 
+Current source synchronizes upstream `e9509170` (2026-10-24), including historical prefix
+branches, model RAM offload/reload, persistent-HTTP first-token fixes, CPU Vision and new
+Volta operators. Windows adds bundled single-threaded LP64 OpenBLAS and uses one-dimensional
+DFlash gather copies so pre-instantiated Graphs can update arena addresses. These changes ship
+in the v0.1.4 Windows preview. Selected native checks passed 52 cases, with two prerequisite
+skips; real historical-prefix, RAM residency, portable-app and HTTP checks passed. DFlash7
+counting measured 185.32 committed tok/s, with no same-day old-version baseline or demonstrated
+speed/quality gain. The 1/64 strict speculative failure, MTP custom-stop coverage failure and
+unfiltered GDN failures remain documented. New CLI/API options do not expand the Chinese launcher's
+parameter set. See [Windows qualification](docs/windows-toolchain.md) and
+[local measurements](docs/windows-performance.md); Linux/QUASAR and TP4 results are not
+measurements of this two-card Coder390 machine.
+
 Download and extract the complete Windows ZIP, then run `NInfer.exe`. Runtime dependencies
 are bundled: no Python, CUDA Toolkit or Visual Studio installation is needed. Install a suitable
 NVIDIA driver first. The optional model download is 23.8GB and is not included in the ZIP.
 This preview requires NVIDIA devices 0 and 1 to be V100s with at least 16GB each.
 
-The v0.1.3 launcher defaults to ordinary decode, thinking enabled, INT8 KV, 128K capacity,
+The v0.1.4 launcher defaults to ordinary decode, thinking enabled, INT8 KV, 128K capacity,
 2048 output tokens and 256-token prefill chunks. It exposes MTP/DFlash, draft count, MTP proposal
 head, thinking, context/output limits, KV format, prefill chunk, port, concurrency, CUDA Graph
 and prefix reuse. DFlash selection suggests 96K with seven drafts and enforces one active request.
@@ -92,7 +105,7 @@ both directions still report `IOH_TOPOLOGY_NOT_SUPPORTED` here, and NVLink is in
 rule, including CUDA components and raw diagnostic results. Maintained scripts are committed
 under `tools/windows/`; published measurement summaries are in `docs/windows-performance.md`.
 The old local mode-switch scripts have moved to the tracked tools directory.
-The v0.1.3 ZIP bundles the same scripts in `tools/`, with TCC/WDDM buttons in the launcher.
+The v0.1.4 ZIP bundles the same scripts in `tools/`, with TCC/WDDM buttons in the launcher.
 Stop the model first, approve UAC, then reboot manually; no automatic driver-mode change occurs.
 
 ## Sources and attribution

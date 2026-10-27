@@ -1,4 +1,4 @@
-// Opt-in TP2 prefix-state gate on real Qwen3.8 Q4_K_M/NVFP4 artifacts.
+// Opt-in prefix-state gate on real Qwen3.8 Q4_K_M/NVFP4 artifacts.
 // Defaults to optimized MTP3; NINFER_V100X2_SPEC=dflash selects full-head DFlash7.
 // Exact token/state replay is the behavioral oracle; the independent numerical
 // Op oracles live in the GGML_K, GDN, and attention tests. Prefix vs cold prefill
@@ -52,6 +52,9 @@ ninfer::EngineOptions engine_options(const char* artifact, bool graphs) {
     options.prefill_chunk = 256;
     options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
     options.use_cuda_graph = graphs;
+    // Exercise active-lane checkpoints without historical branches overriding
+    // the resident append/reset paths asserted below. History has its own gate.
+    options.prefix_cache_tokens = 0;
     options.speculative = v100x2_test::profile(ninfer::ProposalHead::Optimized);
     return options;
 }
@@ -99,11 +102,20 @@ Observation run(ninfer::Engine& engine, std::string name, ninfer::PreparedPrompt
                 bool reuse, ninfer::PrefixReusePath path, std::uint32_t count = kOutput,
                 ninfer::TokenId stop = -1, std::uint32_t returned = 0) {
     const auto prompt_tokens = prompt.debug_token_ids().size();
-    const auto before = engine.runtime_stats().computed_prefill_tokens;
+    const auto before = engine.runtime_stats();
     auto options = request_options(reuse, count);
     if (stop >= 0) { options.stop.token_ids.push_back(stop); }
     auto result = engine.generate(std::move(prompt), options);
-    const auto computed = engine.runtime_stats().computed_prefill_tokens - before;
+    // The debug read takes the execution lock, so the final round's aggregate
+    // publication is complete before comparing request and live counters.
+    auto logits = engine.debug_last_round_logits_bf16();
+    const auto after = engine.runtime_stats();
+    const auto computed = after.computed_prefill_tokens - before.computed_prefill_tokens;
+    require(after.speculative_drafted_tokens - before.speculative_drafted_tokens ==
+                result.speculative.drafted_tokens &&
+            after.speculative_accepted_tokens - before.speculative_accepted_tokens ==
+                result.speculative.accepted_tokens,
+            name + ": live speculative counters disagree with the completed request");
     require(result.generated_token_ids.size() == (returned ? returned : count),
             name + ": unexpected output count");
     require(result.prefix_reuse_path == path, name + ": unexpected prefix path=" +
@@ -129,7 +141,7 @@ Observation run(ninfer::Engine& engine, std::string name, ninfer::PreparedPrompt
               << result.reused_prompt_tokens << " computed=" << computed << " accepted="
               << result.speculative.accepted_tokens << "/" << result.speculative.drafted_tokens
               << " ttft_s=" << result.timings.first_token_seconds << std::endl;
-    return {std::move(name), std::move(result), engine.debug_last_round_logits_bf16()};
+    return {std::move(name), std::move(result), std::move(logits)};
 }
 
 void same_output(const Observation& a, const Observation& b) {
@@ -191,13 +203,17 @@ void compare_cold_rounding(ninfer::Engine& engine, const Tokens& prompt,
         }
     }
     const float deficit = best_logit - logit_value(oracle.logits[*first_a]);
+    const float cold_deficit = best_logit - logit_value(oracle.logits[*first_b]);
     std::cout << cached.name << "_cold teacher_force_argmax=" << best
-              << " cached_emitted_logit_deficit=" << deficit << std::endl;
-    require(oracle.result.generated_token_ids.front() == best && best == *first_b,
-            "the fresh shared-history oracle does not reproduce the cold choice");
+              << " cached_emitted_logit_deficit=" << deficit
+              << " cold_emitted_logit_deficit=" << cold_deficit << std::endl;
+    require(oracle.result.generated_token_ids.front() == best,
+            "the fresh shared-history oracle did not emit its target argmax");
     // Bound already used by test_engine_mtp_tp2_real.cpp, not fitted to this fixture.
     constexpr float kNearTieBound = 0.5F;
-    require(deficit <= kNearTieBound,
+    // Teacher-forcing this history changes its final prefill grouping relative
+    // to BOTH decode paths. It need not reproduce either particular tied choice.
+    require(deficit <= kNearTieBound && cold_deficit <= kNearTieBound,
             cached.name + ": cold divergence exceeds the TP2 near-tie logit bound");
 }
 
@@ -230,7 +246,7 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
         return observations.back();
     };
     // Avoid invalidating references to previous observations while constructing continuations.
-    observations.reserve(24);
+    observations.reserve(64);
     const auto& first = remember(run(engine, "cold", engine.prepare(input), false, Path::FullReset));
     const auto& replay = remember(run(engine, "response_replay", engine.prepare(input), true,
                                       Path::RestoreResponseCheckpoint));
@@ -240,6 +256,14 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
     const auto& repeat = remember(run(engine, "response_replay_again", engine.prepare(input), true,
                                       Path::RestoreResponseCheckpoint));
     same_replay(replay, repeat);
+
+    const auto& single = remember(run(engine, "exact_terminal_one", engine.prepare(input), true,
+                                      Path::RestoreResponseCheckpoint, 1));
+    require(single.result.generated_token_ids.front() == replay.result.generated_token_ids.front(),
+            "terminal exact-hit selection differs");
+    const auto& after_single = remember(run(engine, "exact_after_terminal_one", engine.prepare(input),
+                                            true, Path::AppendAtFrontier));
+    same_replay(replay, after_single);
 
     ninfer::PromptInput followup;
     followup.options.enable_thinking = false;
@@ -273,7 +297,7 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
                                     Path::FullReset));
     const auto& miss_cold = remember(run(engine, "changed_prefix_cold", engine.prepare_tokens(changed),
                                          false, Path::FullReset));
-    same_replay(miss, miss_cold);
+    compare_cold_rounding(engine, changed, miss, miss_cold);
 
     // A retained engine with reuse explicitly disabled is the cold-state comparator. Reset must
     // discard both ranks' old KV, GDN, and draft state, even after a rejected proposal.
@@ -349,6 +373,71 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
                                             Path::AppendAtFrontier, 1));
     same_replay(sample_cold, sample_reuse);
 
+    if (v100x2_test::profile(ninfer::ProposalHead::Optimized).backend !=
+        ninfer::SpeculativeBackend::DFlash) {
+        // Raw token fixtures avoid template boundaries as an alternative explanation
+        // for the hit. The shorter request and edited suffix both restore host images.
+        Tokens source = tokens;
+        source.front() = source.front() == 198 ? 16 : 198;
+        const auto& without_capture = remember(run(engine, "prefix_source_no_capture",
+            engine.prepare_tokens(source), false, Path::FullReset));
+        const auto& with_capture = remember(run(engine, "prefix_source", engine.prepare_tokens(source),
+                                               true, Path::FullReset));
+        std::cout << "prefix_capture_timing prompt=" << source.size()
+                  << " without_s=" << without_capture.result.timings.prefill_seconds
+                  << " with_s=" << with_capture.result.timings.prefill_seconds << std::endl;
+        Tokens shortened(source.begin(), source.begin() + 1536);
+        const auto& shorter = remember(run(engine, "shorter_prefix", engine.prepare_tokens(shortened),
+                                            true, Path::RestorePrefixCheckpoint));
+        require(shorter.result.reused_prompt_tokens == shortened.size(),
+                "shorter request did not restore the exact saved prefill boundary");
+        const auto& shorter_again = remember(run(engine, "shorter_prefix_again",
+            engine.prepare_tokens(shortened), true, Path::RestorePrefixCheckpoint));
+        same_replay(shorter, shorter_again);
+
+        const auto& one = remember(run(engine, "ram_exact_terminal_one",
+            engine.prepare_tokens(shortened), true, Path::RestorePrefixCheckpoint, 1));
+        require(one.result.generated_token_ids.front() == shorter.result.generated_token_ids.front(),
+                "RAM terminal exact-hit selection differs");
+        const auto& after_one = remember(run(engine, "ram_exact_after_terminal_one",
+            engine.prepare_tokens(shortened), true, Path::AppendAtFrontier));
+        same_replay(shorter, after_one);
+        remember(run(engine, "ram_exact_terminal_before_suffix", engine.prepare_tokens(shortened),
+                     true, Path::RestorePrefixCheckpoint, 1));
+        Tokens terminal_suffix = shortened;
+        terminal_suffix.insert(terminal_suffix.end(), next_turn.begin(), next_turn.end());
+        const auto& suffix = remember(run(engine, "ram_terminal_suffix",
+            engine.prepare_tokens(terminal_suffix), true, Path::AppendAtFrontier));
+        const auto& suffix_cold = remember(run(engine, "ram_terminal_suffix_cold",
+            engine.prepare_tokens(terminal_suffix), false, Path::FullReset));
+        compare_cold_rounding(engine, terminal_suffix, suffix, suffix_cold);
+
+        // Independent state-transition control: recompute the same prefix with the
+        // same prefill partition, then compare all target logits and MTP acceptance.
+        const Tokens unrelated{source.front() == 198 ? 16 : 198, 198, 16};
+        remember(run(engine, "prefix_evict", engine.prepare_tokens(unrelated), true,
+                     Path::FullReset, 1));
+        const auto& shorter_direct = remember(run(engine, "shorter_direct",
+            engine.prepare_tokens(shortened), true, Path::FullReset));
+        same_replay(shorter, shorter_direct);
+
+        remember(run(engine, "prefix_evict_again", engine.prepare_tokens(unrelated), true,
+                     Path::FullReset, 1));
+        remember(run(engine, "edited_source", engine.prepare_tokens(source), true, Path::FullReset));
+        Tokens edited(source.begin(), source.begin() + 1100);
+        edited.insert(edited.end(), next_turn.begin(), next_turn.end());
+        const auto& edit = remember(run(engine, "edited_prefix", engine.prepare_tokens(edited),
+                                         true, Path::RestorePrefixCheckpoint));
+        require(edit.result.reused_prompt_tokens > 256 && edit.result.reused_prompt_tokens <= 1100,
+                "edited prefix did not reuse a useful checkpoint inside the common history");
+        const auto& edit_again = remember(run(engine, "edited_prefix_again",
+            engine.prepare_tokens(edited), true, Path::RestorePrefixCheckpoint));
+        same_replay(edit, edit_again);
+        const auto& edit_cold = remember(run(engine, "edited_cold", engine.prepare_tokens(edited),
+                                             false, Path::FullReset));
+        compare_cold_rounding(engine, edited, edit, edit_cold);
+    }
+
     std::uint64_t accepted = 0;
     std::uint64_t drafted = 0;
     for (const auto& observation : observations) {
@@ -388,6 +477,53 @@ std::vector<Observation> exercise(const char* artifact, bool graphs) {
     return observations;
 }
 
+void exercise_parallel_exact_hits(const char* artifact) {
+    if (v100x2_test::pp() != 1 ||
+        v100x2_test::profile(ninfer::ProposalHead::Optimized).backend !=
+            ninfer::SpeculativeBackend::Mtp) { return; }
+    auto options = engine_options(artifact, true);
+    options.max_concurrency = 2;
+    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(2 * kCapacity);
+    ninfer::Engine engine(options);
+    engine.debug_enable_peer_egress_check(true);
+    Tokens a = engine.prepare(coding_prompt()).debug_token_ids();
+    a.resize(300);
+    Tokens b = a;
+    b.front() = b.front() == 198 ? 16 : 198;
+    auto ra = request_options(true, 32);
+    auto rb = ra;
+    rb.execution.sampling.temperature = 0.7F;
+    rb.execution.sampling.seed = 42;
+    rb.execution.sampling.presence_penalty = 0.4F;
+    std::array<ninfer::GenerationResult, 2> previous;
+    for (int rep = -1; rep < 2; ++rep) {
+        const auto before = engine.runtime_stats();
+        auto ha = engine.submit(engine.prepare_tokens(a), ra);
+        auto hb = engine.submit(engine.prepare_tokens(b), rb);
+        std::array<ninfer::GenerationResult, 2> results{ha.wait(), hb.wait()};
+        if (rep >= 0) {
+            require(engine.runtime_stats().computed_prefill_tokens == before.computed_prefill_tokens,
+                    "parallel exact-hit requests recomputed prefill");
+            for (std::size_t row = 0; row < 2; ++row) {
+                require(results[row].reused_prompt_tokens == 300,
+                        "parallel request did not restore its full checkpoint");
+                if (rep > 0) {
+                    const auto& x = previous[row].speculative;
+                    const auto& y = results[row].speculative;
+                    require(previous[row].generated_token_ids == results[row].generated_token_ids &&
+                        x.rounds == y.rounds && x.drafted_tokens == y.drafted_tokens &&
+                        x.accepted_tokens == y.accepted_tokens &&
+                        x.accepted_per_position == y.accepted_per_position,
+                        "parallel exact-hit lane continuation changed");
+                }
+            }
+        }
+        previous = std::move(results);
+    }
+    v100x2_test::check_peer_egress(engine, ninfer::SpeculativeBackend::Mtp);
+    std::cout << "B=2 mixed-sampling exact-hit lane continuations PASS\n";
+}
+
 } // namespace
 
 int main() {
@@ -411,6 +547,7 @@ int main() {
             require(captured[i].result.reused_prompt_tokens == eager[i].result.reused_prompt_tokens,
                     "graph/eager restored different prefix frontiers");
         }
+        exercise_parallel_exact_hits(artifact);
         std::cout << "V100X2 prefix reuse: graph/eager outputs, logits, acceptance and frontiers PASS\n";
         return 0;
     } catch (const std::exception& error) {

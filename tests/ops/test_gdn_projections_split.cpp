@@ -1227,7 +1227,7 @@ int verify_split_rejections(const ExecutionContext& ec) {
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     int failures = verify_registry();
     if (failures != 0) {
         std::cout << "FAIL gdn_projections split (registry)\n";
@@ -1253,6 +1253,14 @@ int main(int argc, char** argv) {
                               : "unavailable (verified CUDA UVA D2D staging)")
               << '\n';
 
+    if (argc == 2 && std::string_view(argv[1]) == "--gating") {
+        failures += run_gating_case(ec, 51u);
+        for (int tokens : {1, 5, 8, 9, 48}) {
+            failures += run_gating_fused_case(ec, 53u, tokens);
+        }
+        std::cout << (failures ? "FAIL" : "OK") << " GDN gating split\n";
+        return failures ? 1 : 0;
+    }
     failures += verify_split_rejections(ec);
     std::vector<ops::LinearPolicy> nvfp4_policies{ops::LinearPolicy::A16Only};
     std::vector<ops::LinearPolicy> fp8_policies{ops::LinearPolicy::A16Only};
@@ -1272,4 +1280,7 @@ int main(int argc, char** argv) {
 
     std::cout << (failures ? "FAIL" : "OK") << " gdn_projections split\n";
     return failures ? 1 : 0;
+} catch (const std::exception& error) {
+    std::cerr << "gdn_projections split: " << error.what() << '\n';
+    return 1;
 }

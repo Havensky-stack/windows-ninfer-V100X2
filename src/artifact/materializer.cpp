@@ -218,19 +218,19 @@ std::uint64_t MaterializedArtifact::device_bytes(ObjectHandle handle, int device
     return objects_[handle.index].device_bytes[static_cast<std::size_t>(device)];
 }
 
-std::span<const std::byte> MaterializedArtifact::resource_bytes(ObjectHandle handle) const {
+std::span<const std::byte> MaterializedArtifact::host_bytes(ObjectHandle handle) const {
     if (handle.index >= objects_.size() || objects_[handle.index].resource.empty()) {
-        throw ArtifactError("object handle does not name a materialized resource");
+        throw ArtifactError("object handle does not name a materialized host object");
     }
     return objects_[handle.index].resource;
 }
 
-std::vector<std::byte> MaterializedArtifact::take_resource_bytes(ObjectHandle handle) {
+std::vector<std::byte> MaterializedArtifact::take_host_bytes(ObjectHandle handle) {
     if (handle.index >= objects_.size() || objects_[handle.index].resource.empty()) {
-        throw ArtifactError("object handle does not name a materialized resource");
+        throw ArtifactError("object handle does not name a materialized host object");
     }
     auto& resource = objects_[handle.index].resource;
-    stats_.retained_resource_bytes -= resource.size();
+    stats_.retained_host_bytes -= resource.size();
     return std::move(resource);
 }
 
@@ -298,13 +298,16 @@ MaterializedArtifact materialize(const Reader& reader, const MaterializationPlan
         std::count_if(plan.device_objects.begin(), plan.device_objects.end(),
                       [](const DeviceMaterialization& placement) { return placement.device == 0; }));
     out.stats_.tensor_count += plan.virtual_objects.size();
-    out.stats_.resource_count = plan.host_objects.size();
+    out.stats_.resource_count = 0;
 
     for (const HostMaterialization& placement : plan.host_objects) {
+        if (std::holds_alternative<ResourceDescriptor>(reader.objects().at(placement.object.index))) {
+            ++out.stats_.resource_count;
+        } else { ++out.stats_.tensor_count; }
         auto& resource            = out.objects_.at(placement.object.index).resource;
         const PayloadSpan payload = reader.payload(reader.objects().at(placement.object.index));
         resource.assign(payload.data.begin(), payload.data.end());
-        out.stats_.retained_resource_bytes += resource.size();
+        out.stats_.retained_host_bytes += resource.size();
         out.stats_.file_bytes =
             checked_add(out.stats_.file_bytes, resource.size(), "artifact read bytes overflow u64");
     }

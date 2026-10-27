@@ -24,7 +24,9 @@ for the selected tool.
 | Measure stop-aware TP2 task output on saved workloads | [`v100/bench_tasks.cpp`](v100/bench_tasks.cpp), see [`bench/README.md`](../bench/README.md#stop-aware-v100-task-probes) |
 | Record read-only V100/reset telemetry | [`v100/health_log.py`](v100/health_log.py) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
+| Measure fully cached HTTP first-text latency, fresh/reused connections | [`v100/bench_http_ttft.py`](v100/bench_http_ttft.py) |
 | Start/configure a local HTTP server with PyQt | [`v100/ninfer_gui.py`](v100/ninfer_gui.py) and [`../docs/gui.md`](../docs/gui.md) |
+| Start/configure a local HTTP server in a terminal or SSH session | [`v100/ninfer_tui.py`](v100/ninfer_tui.py) and [`../docs/tui.md`](../docs/tui.md) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 
 ## Artifact workflow

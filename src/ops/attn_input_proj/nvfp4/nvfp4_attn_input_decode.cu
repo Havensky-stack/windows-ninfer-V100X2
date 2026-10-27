@@ -16,7 +16,7 @@ struct Nvfp4AttentionInputOutput {
     __nv_bfloat16* gate;
     __nv_bfloat16* value;
 
-    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t,
+    __device__ __forceinline__ void store(std::int32_t parent_row, std::int32_t token,
                                           float result) const {
         using Sections                     = Nvfp4AttnInputSections<Geometry>;
         constexpr std::int32_t kQueryRows  = Sections::kQueryRows;
@@ -28,13 +28,16 @@ struct Nvfp4AttentionInputOutput {
 
         const __nv_bfloat16 result_bf16 = __float2bfloat16_rn(result);
         if (parent_row < kKeyBegin) {
-            query[parent_row] = result_bf16;
+            query[static_cast<std::int64_t>(token) * kQueryRows + parent_row] = result_bf16;
         } else if (parent_row < kGateBegin) {
-            key[parent_row - kKeyBegin] = result_bf16;
+            key[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kKeyBegin] =
+                result_bf16;
         } else if (parent_row < kValueBegin) {
-            gate[parent_row - kGateBegin] = result_bf16;
+            gate[static_cast<std::int64_t>(token) * kGateRows + parent_row - kGateBegin] =
+                result_bf16;
         } else {
-            value[parent_row - kValueBegin] = result_bf16;
+            value[static_cast<std::int64_t>(token) * kKeyRows + parent_row - kValueBegin] =
+                result_bf16;
         }
     }
 };

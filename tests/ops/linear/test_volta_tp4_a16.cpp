@@ -17,14 +17,24 @@ int main() {
     if (!cuda_available()) { return 77; }
     try {
         constexpr std::array narrow{
-            Invocation{1}, Invocation{4}, Invocation{33}, Invocation{128},
+            Invocation{1}, Invocation{4}, Invocation{5}, Invocation{6}, Invocation{7}, Invocation{8},
+            Invocation{33}, Invocation{128},
         };
         constexpr std::array wide{Invocation{2560}};
         constexpr std::array shapes{
-            std::array{3584, 5120}, std::array{4096, 5120}, std::array{8704, 5120},
+            std::array{3584, 5120}, std::array{4096, 5120},
+            std::array{8704, 5120},
             std::array{5120, 1536}, std::array{5120, 4352},
         };
         int failures = 0;
+        constexpr std::array verifier{Invocation{1}, Invocation{4}, Invocation{5}, Invocation{6},
+                                      Invocation{7}, Invocation{8}};
+        for (const auto shape : shapes) {
+            failures += run_shape("TP4_NVFP4_FAST_A16", ActivationCompute::A16,
+                                  make_nvfp4_weight,
+                                  {shape[0], shape[1], 863U, Comparison::Sampled,
+                                   true, verifier, true, true});
+        }
         failures += run_shape("TP4_Q4_DRAFT_A16", ActivationCompute::A16,
                               make_q4g64_f16s_weight,
                               {32768, 5120, 859U, Comparison::Sampled, true, narrow});

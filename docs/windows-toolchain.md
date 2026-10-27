@@ -12,7 +12,7 @@
 
 ## 已验证组合
 
-2026-10-14，本机 Windows 11、两张 V100-SXM2 16GB、两卡 PCIe 3.0 x16：
+2026-10-14 初始验证，2026-10-27 同步补充；本机 Windows 11、两张 V100-SXM2 16GB、两卡 PCIe 3.0 x16：
 
 | 组件 | 选择 |
 |---|---|
@@ -24,6 +24,7 @@
 | CMake / 生成器 | VS 自带 CMake 4.1.1-msvc1 / Ninja 1.12.1 |
 | CUDA 编译目标 | 原生 `sm_70` 机器码，探针不依赖新 PTX 在旧驱动上即时编译 |
 | 依赖管理 | VS 自带 vcpkg；固定 FFmpeg 8.1.2、curl 8.21.0、zlib 1.3.2 |
+| CPU 视觉 BLAS | OpenBLAS 0.3.33，LP64/32-bit integer、动态链接，关闭其多线程 feature |
 
 CUDA 12.8.1 的主机编译器检查接受 MSVC 19.44；无需
 `--allow-unsupported-compiler` 或修改 CUDA 头文件。使用 Ninja，避免单卡参考项目
@@ -58,6 +59,11 @@ GRID 553.62 满足 CUDA 12.x 小版本兼容的最低 Windows 驱动门槛，但
 # 启用测试时明确指定已有的 Python 3.11，不修改该 Python 环境。
 .\tools\windows\build.ps1 -Tests -PythonExecutable 'C:\path\to\python311\python.exe'
 .\tools\windows\test.ps1
+
+# 同步上游后的扩展检查；串行 GPU 测试、逐项保存结果，并安排冷却。
+.\tools\windows\test.ps1 -Upstream
+# 已配置的隔离构建也可选择，例如本次集成目录；中断后只补跑未通过项。
+.\tools\windows\test.ps1 -Upstream -BuildDirectory build-windows-upstream -SkipBuild -Resume
 ```
 
 依赖通过仓库 `vcpkg.json` 和 `x64-windows-ninfer` triplet 固定，使用动态 CRT、动态库、
@@ -194,7 +200,7 @@ $env:NINFER_V100X2_PROPOSAL_HEAD = 'optimized'
 .\build-windows\tests\ninfer_qwen3_8_27b_v100x2_real_test.exe
 ```
 
-## 上游 Volta 更新的 Windows 集成验证
+## 0.1.3 上游 Volta 更新的 Windows 集成验证
 
 本次集成上游 `861633e8` / `756d1363`，保留 WDDM mapped-host 通信、Coder390 前端、
 4K MTP Graph 的 32 MiB 预算、模式切换工具及中文启动器。新 API 中的 `device_count`
@@ -233,3 +239,69 @@ $env:NINFER_V100X2_SPEC = 'dflash'
 $env:NINFER_V100X2_PROPOSAL_HEAD = 'full'
 ./build-windows/tests/ninfer_qwen3_8_27b_v100x2_real_test.exe
 ```
+
+## 0.1.4 上游同步与 Windows 发布验证
+
+源码同步至上游 `e9509170`（2026-10-24），在独立目录 `build-windows-upstream` 构建。
+双 V100 仍为 GRID 553.62 / TCC；系统 CUDA 12.4、驱动、时钟和桌面启动参数未改。
+新增 CPU Vision 使用包内单线程 LP64 OpenBLAS，随便携包提供 DLL 和许可。
+2026-10-27 的验证构建发布为 [0.1.4 Windows 预览版](https://github.com/Havensky-stack/windows-ninfer-V100X2/releases/tag/v0.1.4-windows-preview)，
+本地包在 `build-release/NInfer-Windows-V100X2-0.1.4`，不替换旧版回退目录。
+
+合并保留 Windows 文件映射/偏移读取、WDDM mapped-host 通信和模式切换工具，适配
+内存 artifact 与模型卸载/重载、上游 packet 通信及新测试接口。MSVC 的 aligned
+allocation、数学常量和非 constexpr `sqrt` 差异均已处理。DFlash rank-0 gather 的
+二维复制改为固定列数的一维复制节点，允许同一启动期实例化的 Graph 更新 arena
+地址，不在服务期 capture/instantiate，也不增加设备 staging 或改变数值。
+双卡回归逐字节检查地址往返更新后的输出、未选中目标和输入不变性。
+上游 head-local 批量 FP64 参考曾把请求序号当成页表行号；已按公开的 table-row 映射
+选取历史缓存，BF16/INT8 短输入检查因此通过，生产 kernel 和容差均未改变。
+
+所选 Windows 资格集 54 项：52 通过、2 因 QUASAR artifact/四卡前提缺失而跳过；
+另有 Coder390 独立模板检查通过。平台/协议/状态与 NVFP4/SM70 算子检查包括 CPU Vision FP64、W8 预排、
+NVFP4 投影/融合、proposal argmax、Allreduce 默认 DMA 及显式 host-packet。
+Python 共 43 项：19 通过、24 因 PyQt/POSIX 前提缺失而跳过；中文启动器参数、下载、
+校验和取消/恢复测试通过。清空开发工具链 PATH 后发布服务端 `--help` 通过。
+
+资格脚本及完整注意力 oracle 分组见 [tests/README.md](../tests/README.md#native-windows-upstream-qualification)。
+注意力七组均通过：实际 85K 占用、180K 容量、1/4/5/6 查询，以及预填充、页表/
+Graph 边界和 BF16/INT8 短输入。串行完整组合曾超时；分组与四线程参考保留所有用例、
+每个头内的 FP64 累加顺序和原数值判据。修正页表映射后的边界组用时约 235 秒。
+`-Resume` 只检查已有状态；实现、参考公式或输入改变时，须先使受影响报告失效。
+上游普通 TP4 测试仍需四卡；本机四分片
+几何检查仅覆盖单卡上的算子/独立 FP64，不验证四卡通信或整模型性能。
+完整 GDN 全格式测试还包含 SM100a/SM120a A8 前提、W8 route-boundary 断言失败及
+Q4/Q5 shard 空 workspace 拒绝；本机 Coder390 的 NVFP4 专用检查通过，不把全格式
+失败或跳过记录为通过。QUASAR、native FP8 TP4 和外部参考语料未下载，未作对应整模型认证。
+
+本次短请求数据和当日旧版启动失败的边界见 [Windows 性能报告](windows-performance.md)。
+此前 MTP/DFlash 严格行为门失败仍有效，不能由算子通过或短数数一致推定模型质量无损。
+
+本轮真实 Coder390、4K 容量、DFlash7/full 复测：Graph/eager 与贪心/采样切换通过；
+严格 teacher-forced 仍是 1/64（probe 1、位置 31，2532 vs 561，logit 差 0.125），
+普通对照 0/64。独立前缀检查通过 Graph/eager 输出、logits、接受状态和前沿的一致性，
+覆盖追加、完整命中、编辑后重算、部分终止续写及思考内容处理；不构成严格 DFlash 认证。
+MTP3/优化草稿头的本轮复核相同：Graph/eager 与采样切换通过，严格门仍在同一位置
+出现同一 0.125 差异（1/64），普通对照 0/64。两个后端的严格失败均未放宽判据。
+MTP 前缀检查还在 custom-stop 用例返回失败：Coder390 该处接受 0/3 drafts，未进入
+该用例要求的已接受草稿停止路径。此前若干追加/冷重算检查已执行，但完整 MTP 前缀门
+不能计为通过；保留原断言，不以 DFlash 的通过代替它。
+
+历史分支真实模型五组通过：Graph 下正常恢复、FIFO 预算淘汰、四请求分支复用、
+禁用历史缓存，以及 eager 正常恢复。使用 Coder390、TP2、MTP4/优化草稿头、INT8 KV、
+32768 容量、1024 分块；合成合法 token 序列实际占用 8192，追加分支为 8196。
+比较恢复/驻留路径的严格 token 输出和缓存计数，不把它当作语义质量、85K 性能或并发吞吐测量。
+
+原 MTP4/4K/512 分块的 Graph 实测为每卡 34 MiB，旧计划仅预留 32 MiB，因而在
+RAM 重载测试首次加载时被预算检查拒绝。TP2 小上下文 MTP 预留已改为每卡 40 MiB，
+保留启动期“实测不得超出计划”检查，未降低草稿数或关闭 Graph；长上下文和 DFlash
+的预留不变。
+修正后原 TP2/MTP4 Graph RAM 重载用例通过：忙碌拒绝、卸载幂等、删除临时文件链接后
+RAM-only 加载、输出一致、旧 KV 清空及累计统计均通过。原始模型文件未改动。
+
+最终 CLI/API 及依赖已同步到桌面脚本使用的 `build-windows/apps`，保持现有启动参数。
+旧 `build-release/NInfer-Windows-V100X2-0.1.3` 留作程序回退，0.1.4 使用独立发布目录。
+当前桌面入口已移到 `快速启动脚本/model-router/runNInfer-DFlash.cmd`，文件名保留了
+DFlash，但实际是 MTP3/full、并发上限 2、上下文与共享 KV 110000、256 分块、思考开启、
+默认输出 98304。本轮未更改这些用户参数；同配置约 18.7 秒就绪，61 输入/34 输出的
+短 API 请求通过。实际 KV 分页容量为 110016，这不是满上下文或两路吞吐测量。

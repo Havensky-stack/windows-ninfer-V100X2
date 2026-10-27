@@ -37,6 +37,7 @@ struct ServeOptions {
     std::uint32_t max_pending_requests     = 16;
     std::uint32_t pending_timeout_ms       = 30000;
     std::uint32_t prefill_chunk            = 1024;
+    std::uint32_t prefill_decode_rounds    = 1;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
     std::size_t max_request_bytes          = kDefaultMaxRequestBytes;
     std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
@@ -54,8 +55,11 @@ struct ServeOptions {
     std::vector<int> devices;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     RamKvOptions ram_kv;
+    std::uint32_t prefix_cache_tokens = 384000;
     bool volta_long_attention = false;
+    bool volta_fast_decode = false;
     SpeculativeOptions speculative;
+    VisionDevice vision_device = VisionDevice::Gpu;
     bool enable_vision      = false;
     std::uint32_t vision_max_tokens = kMaximumVisionTokenBudget;
     bool use_cuda_graph     = true;
@@ -64,6 +68,7 @@ struct ServeOptions {
         true; // default thinking mode for the generation prompt (--no-thinking opts out)
     bool preserve_thinking = false;
     int default_max_tokens = kDefaultMaxTokens;
+    int max_output_tokens = 0; // optional server-wide output ceiling
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // Process-level explicit overrides layered between registered model/mode defaults and request
     // fields. An omitted seed is replaced per request with a fresh random seed.

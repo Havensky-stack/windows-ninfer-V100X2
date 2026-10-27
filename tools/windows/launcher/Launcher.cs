@@ -302,7 +302,9 @@ namespace NInferWindows {
         internal Launcher(bool preview = false) {
             Directory.CreateDirectory(Runtime.StateDir);
             runtime = new Runtime(AppDomain.CurrentDomain.BaseDirectory, AddLog);
-            Text = "NInfer · Windows 双 V100 · 0.1.3 预览版";
+            var appVersion = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version;
+            Text = "NInfer · Windows 双 V100 · " +
+                (appVersion.Major == 0 && appVersion.Minor == 0 ? "源码构建" : appVersion.ToString(3) + " 预览版");
             Font = new Font("Microsoft YaHei UI", 10); Size = new Size(1100, 960); MinimumSize = new Size(1060, 900);
             StartPosition = FormStartPosition.CenterScreen;
             var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 10 };

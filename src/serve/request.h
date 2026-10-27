@@ -46,11 +46,23 @@ private:
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
     int default_max_tokens = 65536;
+    int max_output_tokens = 0; // zero leaves the context limit as the only ceiling
 };
+
+inline void validate_output_token_limit(int tokens, const RequestLimits& limits,
+                                        std::string_view param) {
+    if (limits.max_output_tokens > 0 && tokens > limits.max_output_tokens) {
+        throw ApiException(ApiError{400, "invalid_request_error",
+            "Requested output exceeds the server limit of " +
+                std::to_string(limits.max_output_tokens) + " tokens",
+            std::string(param), "max_output_tokens_exceeded"});
+    }
+}
 
 struct CompletionUsage {
     int prompt_tokens     = 0;
     int completion_tokens = 0;
+    int cached_tokens     = 0; // actual reused prefix; included in prompt_tokens
 };
 
 enum class ContentKind {
@@ -177,6 +189,8 @@ struct GenerationRequest {
     bool include_usage  = false;
     std::optional<bool> enable_thinking; // non-standard extension; falls back to server default
     std::optional<RequestedReasoningEffort> reasoning_effort;
+    // Responses effort levels describe intent; translate them to the loaded Qwen template.
+    bool map_responses_reasoning_effort = false;
     std::string reasoning_effort_param = "reasoning_effort";
     std::optional<bool> preserve_thinking;
     bool preserve_thinking_semantic_change = false;

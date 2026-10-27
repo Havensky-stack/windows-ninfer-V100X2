@@ -327,9 +327,31 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
+        std::string node_detail;
+        if (result.errorNode != nullptr) {
+            cudaGraphNodeType type{};
+            if (cudaGraphNodeGetType(result.errorNode, &type) == cudaSuccess) {
+                node_detail = ", node type " + std::to_string(static_cast<int>(type));
+                if (type == cudaGraphNodeTypeKernel) {
+                    cudaKernelNodeParams parameters{};
+                    if (cudaGraphKernelNodeGetParams(result.errorNode, &parameters) == cudaSuccess) {
+                        node_detail += ", grid " + std::to_string(parameters.gridDim.x) + "x" +
+                            std::to_string(parameters.gridDim.y) + "x" + std::to_string(parameters.gridDim.z) +
+                            ", shared bytes " + std::to_string(parameters.sharedMemBytes);
+                    }
+                } else if (type == cudaGraphNodeTypeMemcpy) {
+                    cudaMemcpy3DParms parameters{};
+                    if (cudaGraphMemcpyNodeGetParams(result.errorNode, &parameters) == cudaSuccess) {
+                        node_detail += ", copy kind " + std::to_string(static_cast<int>(parameters.kind)) +
+                            ", extent " + std::to_string(parameters.extent.width) + "x" +
+                            std::to_string(parameters.extent.height) + "x" + std::to_string(parameters.extent.depth);
+                    }
+                }
+            }
+        }
         throw std::runtime_error(
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+            " (update result " + std::to_string(static_cast<int>(result.result)) + node_detail + ")");
     }
 }
 

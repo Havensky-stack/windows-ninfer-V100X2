@@ -21,6 +21,10 @@ SM70 NVFP4 input checks use independent host QPN encoding and FP64 logical proje
 at TP1/TP2 shapes, including QPN/wide-CUTLASS boundaries and graph replay. Run
 `ctest -R '^ninfer_nvfp4_(input_sm70|gdn_.*)_test$'` for projection, snapshot-state, masked
 record and public TP2 split checks.
+`ninfer_gdn_tp4_decode_test` additionally covers prepacked TP4 normal/fast projection at
+T=1/2/4/5/6/8 and masked record/convolution at T>=2. Its FP64 oracle applies the record
+interface's observable BF16 projection boundary; exact composed-route, read-only state,
+record/history and masked-zero checks supplement that oracle. It requires four CUDA devices.
 
 - `artifact/` — Python container, registered layout, quantization, and resource behavior;
 - `ops/` — one identifiable qualification suite per semantic Op or closely related overload group,
@@ -79,6 +83,33 @@ owns deterministic payload generation, device `Weight` views, row views, and ind
 weight decoding.
 
 ## Build and run
+
+Model hot unload/load: `test_launcher_model.py` checks asynchronous control, authenticated HTTP,
+progress, busy errors and recovery without CUDA. The artifact reader fixture verifies exact packed
+bytes and aligned reads after deleting the source file. For a real QUASAR TP2/MTP4 CUDA Graph
+lifecycle (busy admission, 503 while in RAM, disk-independent reload, deterministic output,
+discarded KV/prefix cache and cumulative stats), run:
+
+```bash
+NINFER_RESIDENCY_MODEL=/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build-v100-tp4 -R '^ninfer_model_residency_real_test$' --output-on-failure
+.venv/bin/python -m unittest tests.test_launcher_model tests.test_gui_cache tests.test_ninfer_tui
+```
+
+The real-model test uses a temporary symlink, removes only that link, and never modifies the model
+artifact. Without the explicit environment variable it is skipped. It requires two free V100 GPUs
+and enough host RAM to retain the complete container.
+
+The standard-library TUI launcher checks cover admission, saved preferences, metrics and owned
+child lifetime, including an actual curses session in a pseudo-terminal with a fixture server.
+The GUI checks use Qt when installed (otherwise only the log consumer checks run). Neither
+suite builds CUDA tests or loads a model:
+
+```bash
+python3 -m unittest discover -s tests -p test_ninfer_tui.py
+QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p test_gui_cache.py
+python3 -m unittest discover -s tests -p test_launcher_resources.py
+```
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
@@ -246,7 +277,8 @@ uses another numerical/execution path's generated tokens as a golden.
 
 The V100X2-named gates accept registered Qwen3.8 Q4_K_M/NVFP4 at TP2 (default), or
 Qwen3.8 NVFP4/native block-FP8 on four SM70 cards with `NINFER_TEST_TP=4`.
-`NINFER_V100X2_SPEC=mtp` (default) selects MTP3; `dflash` selects DFlash7 and requires an
+`NINFER_V100X2_SPEC=mtp` (default) selects MTP3; `NINFER_TEST_MTP_DRAFTS=4` selects MTP4.
+`dflash` selects DFlash7 and requires an
 artifact with the optional drafter. `NINFER_V100X2_PROPOSAL_HEAD=optimized` is MTP-only.
 `NINFER_TEST_PP=2` selects the experimental SM70 Qwen3.8 NVFP4/QUASAR TP1/PP2
 single-request gates. Its real gate retains graph/eager, sampling and all 64
@@ -260,14 +292,16 @@ additionally measures ordinary decode's re-prefill discrepancy: each prompt's sp
 worst emitted-logit deficit must not exceed its ordinary control, within the established
 0.5-logit BF16 grouping bound. This is not a bit-identical-trajectory or quality-score claim.
 The prefix gate checks checkpoint, append, partial-stop and exact-frontier replay, including
-an exact stop-vs-budget truncation control. Cold re-prefill can change BF16 grouping; its
+an exact stop-vs-budget truncation control. It also checks exact-hit single-output termination,
+subsequent replay/suffix restoration and B=2 mixed-sampling MTP checkpoint isolation.
+Cold re-prefill can change BF16 grouping; its
 first differing choice is checked separately against fresh target logits. DFlash does not
 use the MTP-only peer-egress diagnostic and is unavailable at TP4.
 
 ```bash
-NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/qwen3_8_27b_nvfp4.ninfer \
-NINFER_V100X2_SPEC=dflash \
-  ctest --test-dir build-v100 -R 'v100x2_(real|prefix_real)' --output-on-failure
+NINFER_V100X2_ARTIFACT=/Models/ninfer-V100X2/quasar-v3/qwen3_8_27b_nvfp4.ninfer \
+NINFER_TEST_MTP_DRAFTS=4 \
+  ctest --test-dir build-v100-tp4 -R 'v100x2_(real|prefix_real)' --output-on-failure
 ```
 
 The capability-evaluation coordinator has its own environment and unittest entry point:
@@ -311,7 +345,15 @@ The shared messages are in
 
 ### Experimental TP2 Vision status
 
-The TP2 Vision path is opt-in and not fully qualified on the local two V100-SXM2 16 GB cards.
+The TP2 Vision path is opt-in. On 2026-10-19, QUASAR v3 with default numerical profiles,
+INT8 group-64 KV, 4096 capacity, 1024 chunks, Graphs and optimized-head MTP4 passes
+`ninfer_qwen3_6_27b_prefix_real_test`, including image lifetime, same/changed/appended media,
+stop/resume, exact-frontier reuse and the visual-prefix bridge. Select the artifact with
+`NINFER_QWEN3_6_27B_NVFP4_WEIGHTS`, TP2 with `NINFER_TEST_TP2=1`, and four drafts with
+`NINFER_TEST_MTP_DRAFTS=4`. Real image/video CLI and Vision ON/OFF HTTP checks also pass.
+These are integration checks, not a scored visual-quality evaluation.
+
+The earlier official-NVFP4 qualification is a separate unresolved result:
 With the official Qwen3.8-27B NVFP4 artifact, INT8 group-64 KV, 4096 capacity, 1024 prefill chunks
 and optimized-head MTP3, `ninfer_qwen3_6_27b_vision_tp2_real_test` repeatedly fails its visual-prefix
 bridge greedy-output comparison at the first output token. Earlier cross-chunk image lifetime,
@@ -319,9 +361,9 @@ same/changed/appended-media reuse and stop/resume checks complete before this fa
 
 The differing candidates are not an exact BF16 tie, but this does not by itself establish a state
 bug or a model-quality regression. The cause remains unresolved; no numerical criterion has been
-relaxed and the failing test is retained. The recommended experimental Vision server uses
-`--no-prefix-reuse` to avoid this cache path, not as evidence that the complete Vision route has
-passed qualification.
+relaxed and the failing test is retained. The supplied Vision presets start with `--no-prefix-reuse`. The older official result does not
+negate the QUASAR integration result above, and the QUASAR result does not qualify the official
+artifact or prove all chunkings and numerical profiles equivalent.
 
 ## What belongs here
 
@@ -337,3 +379,73 @@ A permanent test should protect one current risk, such as:
 Performance-only assertions belong in benchmarks and profiler review. Source scans,
 implementation-shape assertions, trivial getters/configuration, retired command surfaces, and
 broad additions without a concrete regression risk do not belong in the permanent suite.
+
+## CPU Vision and visual long attention (0.1.2)
+
+`ninfer_host_vision_test` runs without a GPU. It checks exact signed-code/FP16-scale decoding for
+all real tower/merger matrix shapes, FP64 linear and full segmented attention oracles, independent
+LayerNorm/GELU/RoPE/position interpolation, and BF16 representation. The CPU path retains original
+mathematical weights and BF16 Op outputs; pairwise GPU equality is not its numerical oracle.
+
+`ninfer_quasar_load_plan_test` checks that CPU Vision places every tower object on host and none
+on either GPU, while GPU Vision remains primary-rank-only. `ninfer_qwen3_6_27b_prefix_real_test`
+accepts `NINFER_TEST_CPU_VISION=1` and `NINFER_TEST_LONG_ATTENTION=1` alongside the existing TP2
+and MTP4 settings to exercise real cross-chunk media, continuation, edited media and MTP state.
+`ninfer_vision_long_real_test` accepts `--cpu`, `--image`, `--eager`, `--prompt-tokens N` and
+`--output-tokens N`; set the exact `NINFER_QUASAR_ARTIFACT` path. Its default is 85,000 occupied
+text tokens with GPU Vision enabled, long attention and MTP4; it prints JSON wall timing,
+acceptance, memory and committed IDs. These checks are not GPQA or proof of checkpoint quality.
+
+## Native Windows upstream qualification
+
+After `tools/windows/build.ps1 -Tests -PythonExecutable <Python-3.11>`, run
+`tools/windows/test.ps1 -Upstream`. This builds and executes the Windows-relevant artifact,
+protocol, cache/state, host Vision and changed SM70 Op gates, including their independent
+numerical oracles. Select an isolated configured build with `-BuildDirectory`; `-SkipBuild`
+reuses its binaries. Results are saved per case under that build's `windows-qualification/`.
+Use `-Resume` to retain completed results after an interruption. It checks saved status only;
+invalidate affected reports when changing the implementation, oracle or inputs of a check.
+Failed and prerequisite-skipped cases rerun. Tests are serial, bounded to 150 seconds
+per case (450 for attention FP64/geometry oracles), with three-minute idle periods and
+enough reserved time for the next case before the ten-minute active ceiling. A timeout is a
+failed check, never a pass.
+
+The complete TP2 attention fixture can exceed one active period while evaluating its CPU
+FP64 references. The Windows script runs its identical cases as seven `--section` groups:
+`prefill`, `decode1`, `decode4`, `decode5`, `decode6`, `boundaries`, and `short`. Each group
+retains the same oracle, cache checks and numerical criteria; all seven are required. The
+unfiltered executable remains available for environments without the active-period limit.
+Its CPU reference uses at most four workers over disjoint attention heads, each with private
+score/probability storage. Every head retains the complete scalar FP64 key/dimension reduction
+order. GPU execution and numerical criteria are unchanged; other fixture callers remain serial.
+
+The GDN portion selects the existing `ninfer_nvfp4_gdn_*` cases for the Windows Coder390
+profile. The unfiltered snapshot/record fixtures include FP8 A8 execution requiring
+SM100a/SM120a; they are not V100 A8 qualification. The broader split-projection fixture also
+exposes an existing Q4/Q5 column-shard empty-workspace rejection before numerical execution.
+These full-format exploratory failures remain separate from the NVFP4 results; they are not
+converted into passes or evidence that the legacy profiles work on Windows.
+
+Real-artifact checks remain explicit. `ninfer_prefix_history_real_test` takes
+`ARTIFACT CORPUS graphs|eager normal|budget|concurrent|disabled standard|quasar-fast`;
+the corpus contains at least 9000 valid token IDs. `standard` runs the same historical-state,
+FIFO and fan-out assertions with both experimental numerical profiles off, permitting the
+registered Coder390 NVFP4 artifact. `quasar-fast` retains the upstream QUASAR experiment.
+This state replay check is not a model-quality evaluation.
+
+`ninfer_model_residency_real_test` uses `NINFER_RESIDENCY_MODEL` and creates a temporary hard
+link beside that artifact so source-removal/RAM-only reload checks work without Windows
+symlink privileges or another model-sized file. The test therefore needs write access to the
+artifact directory. It removes only its temporary link; the source artifact remains unchanged.
+
+For the Python launcher/config/cache checks, use the selected Python 3.11 with process-local
+`PYTHONUTF8=1`. Qt lifecycle tests require PyQt; the Docker TUI handoff and TUI pseudo-terminal
+suite require POSIX. Their absence is a prerequisite/platform skip, not native Windows
+qualification. TP4/NVLink, other model artifacts, and vLLM-reference tests likewise require
+their declared hardware/data; local TP2 checks do not substitute for them.
+
+The explicit `ninfer_attention_tp4_geometry_test` instead runs the four independent six-query/
+one-KV-head slices sequentially on device 0, comparing them with unsplit attention and the same
+independent FP64 oracle. This covers the Split-D prefill Op without four physical cards. The
+ordinary TP4 suite still requires four devices. Geometry-only results do not qualify TP4
+execution, transport, whole-model state, or throughput.

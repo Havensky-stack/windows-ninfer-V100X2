@@ -184,14 +184,33 @@ int test_reasoning_effort() {
     failures += check(!none_semantics.enable_thinking && !none_semantics.reasoning_effort,
                       "Responses none effort did not disable thinking");
 
-    Json high                            = base;
-    high["reasoning"]                    = Json{{"effort", "high"}};
-    const GenerationRequest high_request = parse_responses_request(high, limits()).generation;
-    failures += check(api_code([&] {
-                          (void)resolve_prompt_semantics(high_request, ServeOptions{},
-                                                         effort_capabilities());
-                      }) == "reasoning_effort_not_supported",
-                      "Responses high effort bypassed template capability validation");
+    for (const auto& [wire, expected] :
+         std::array<std::pair<const char*, ninfer::ReasoningEffort>, 6>{
+             {{"minimal", ninfer::ReasoningEffort::Low},
+              {"low", ninfer::ReasoningEffort::Low},
+              {"medium", ninfer::ReasoningEffort::Medium},
+              {"high", ninfer::ReasoningEffort::XHigh},
+              {"xhigh", ninfer::ReasoningEffort::XHigh},
+              {"max", ninfer::ReasoningEffort::XHigh}}}) {
+        Json body = base;
+        body["reasoning"] = Json{{"effort", wire}};
+        const auto request = parse_responses_request(body, limits()).generation;
+        const auto graded = resolve_prompt_semantics(request, ServeOptions{}, effort_capabilities());
+        failures += check(graded.enable_thinking && graded.reasoning_effort == expected,
+                          std::string("incorrect Responses graded mapping: ") + wire);
+        const auto toggle = resolve_prompt_semantics(
+            request, ServeOptions{}, ninfer::PromptCapabilities{.enable_thinking = true});
+        failures += check(toggle.enable_thinking && !toggle.reasoning_effort,
+                          std::string("toggle-only template rejected Responses effort: ") + wire);
+        failures += check(api_code([&] {
+            (void)resolve_prompt_semantics(request, ServeOptions{}, ninfer::PromptCapabilities{});
+        }) == "reasoning_effort_not_supported", "unsupported template accepted thinking");
+        auto conflict = request;
+        conflict.enable_thinking = false;
+        failures += check(api_code([&] {
+            (void)resolve_prompt_semantics(conflict, ServeOptions{}, effort_capabilities());
+        }) == "conflicting_template_option", "Responses effort ignored explicit thinking conflict");
+    }
 
     Json invalid         = base;
     invalid["reasoning"] = Json{{"effort", "ultra"}};
@@ -513,10 +532,41 @@ int test_input_tokens_schema() {
     return failures;
 }
 
+int test_output_token_cap() {
+    RequestLimits cap;
+    cap.default_max_tokens = 64;
+    cap.max_output_tokens = 64;
+    Json body = {{"model", "m"}, {"input", "hello"}};
+    int failures = 0;
+    for (int tokens : {32, 64}) {
+        body["max_output_tokens"] = tokens;
+        const auto out = parse_responses_request(body, cap);
+        failures += check(out.generation.max_tokens == tokens, "output cap rejected a supported budget");
+    }
+    body["max_output_tokens"] = 65;
+    bool rejected = false;
+    try { (void)parse_responses_request(body, cap); }
+    catch (const ApiException& error) {
+        rejected = error.error().status == 400 &&
+                   error.error().code == "max_output_tokens_exceeded" &&
+                   error.error().param == "max_output_tokens";
+    }
+    failures += check(rejected, "output cap did not reject an oversized request");
+    body.erase("max_output_tokens");
+    auto out = parse_responses_request(body, cap);
+    failures += check(out.generation.max_tokens == 64, "output cap changed the default budget");
+    cap.max_output_tokens = 0;
+    body["max_output_tokens"] = 65;
+    out = parse_responses_request(body, cap);
+    failures += check(out.generation.max_tokens == 65, "disabled output cap still limits requests");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_output_token_cap();
     failures += test_basic_request();
     failures += test_instruction_message_order();
     failures += test_preserve_thinking_options_and_inheritance();

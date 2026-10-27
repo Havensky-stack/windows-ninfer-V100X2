@@ -1,35 +1,52 @@
 # syntax=docker/dockerfile:1
 
-FROM nvidia/cuda:13.1.2-devel-ubuntu24.04 AS build
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update     && apt-get install --yes --no-install-recommends         cmake         libavcodec-dev         libavformat-dev         libavutil-dev         libcurl4-openssl-dev         libswscale-dev         ninja-build         pkg-config     && rm -rf /var/lib/apt/lists/*
+ARG CUDA_ARCH=70
+ARG BUILD_JOBS=2
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+        build-essential ca-certificates cmake git ninja-build pkg-config \
+        libavcodec-dev libavformat-dev libavutil-dev libcurl4-openssl-dev libswscale-dev libopenblas-serial-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 COPY . .
+RUN cmake -S . -B /build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH} \
+        -DNINFER_BUILD_APPS=ON -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=OFF \
+    && cmake --build /build --parallel ${BUILD_JOBS} --target ninfer ninfer-serve
 
-RUN cmake -S . -B /build -G Ninja         -DCMAKE_BUILD_TYPE=Release         -DNINFER_BUILD_APPS=ON         -DBUILD_TESTING=OFF         -DNINFER_BUILD_BENCHMARKS=OFF     && cmake --build /build --parallel 4 --target ninfer ninfer-serve
-
-FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update     && apt-get install --yes --no-install-recommends         ca-certificates         libavcodec60         libavformat60         libavutil58         libcurl4t64         libswscale7     && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+        ca-certificates curl python3 python3-venv tini ncurses-term \
+        libavcodec60 libavformat60 libavutil58 libcurl4t64 libswscale7 libopenblas0-serial \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir huggingface-hub==1.0.1
 
-# The CUDA runtime image ships forward-compatibility libraries in
-# /usr/local/cuda*/compat (a newer libcuda.so than the host driver). Forward
-# compatibility is supported only on datacenter GPUs; on any GeForce card the
-# loader picks these up and every CUDA call fails at startup with
-#   cudaErrorCompatNotSupportedOnDevice: forward compatibility was attempted
-#   on non supported HW
-# Removing them lets the container use the host driver through ordinary CUDA
-# minor-version compatibility, which is what an RTX 3090/3060 needs.
-RUN rm -rf /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat /usr/local/cuda/compat
+# Use the driver's libcuda supplied by the NVIDIA Container Toolkit.
+RUN rm -rf /usr/local/cuda-12.8/compat /usr/local/cuda/compat
 
 COPY --from=build /build/apps/ninfer /usr/local/bin/ninfer
 COPY --from=build /build/apps/ninfer-serve /usr/local/bin/ninfer-serve
+WORKDIR /opt/ninfer
+COPY tools/v100/ninfer_tui.py tools/v100/gui_cache.py tools/v100/launcher_sampling.py tools/v100/launcher_model.py ./tools/v100/
+COPY docker/entrypoint.py ./docker/entrypoint.py
+COPY LICENSE NOTICE ./
 
-WORKDIR /workspace
+ENV PATH="/opt/venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    LANG=C.UTF-8 \
+    TERM=xterm-256color \
+    NINFER_MODEL_DIR=/Models/ninfer-V100X2 \
+    HF_HOME=/Models/ninfer-V100X2/.huggingface \
+    XDG_CONFIG_HOME=/data/config
+
+VOLUME ["/Models/ninfer-V100X2", "/data"]
 EXPOSE 8080
 STOPSIGNAL SIGTERM
-
-CMD [ninfer-serve, --help]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/venv/bin/python3", "/opt/ninfer/docker/entrypoint.py"]
+CMD []
