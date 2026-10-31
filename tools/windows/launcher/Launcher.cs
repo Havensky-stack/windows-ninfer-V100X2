@@ -442,6 +442,7 @@ namespace NInferWindows {
 
         void CheckChannel() {
             var ch = channel.SelectedIndex == 0 ? "P2P" : "STAGING";
+            var sb = new StringBuilder();
             try {
                 int rc = cuInit(0);
                 if (rc != 0) { status.Text = ch + " 通道验证失败：cuInit 返回 " + rc + "（CUDA 驱动不可用？）"; return; }
@@ -451,22 +452,39 @@ namespace NInferWindows {
                 int can = 0; cuDeviceCanAccessPeer(ref can, d0, d1);
                 bool hwP2P = can == 1;
                 string nInferP2P = ch == "STAGING" ? "0" : "1";
-                string actual;
+                string actual, passTxt;
                 if (ch == "STAGING") {
-                    actual = "STAGING（UVA-D2D）：NINFER_P2P=0 经代理 DLL 强制走映射主机内存通道，与物理 P2P 无关";
+                    actual = "STAGING（UVA-D2D，NINFER_P2P=0 经代理 DLL 强制，与物理 P2P 无关）";
+                    passTxt = "是（软件映射通道）";
+                } else if (hwP2P) {
+                    actual = "P2P（NINFER_P2P=1 且硬件 peer access 可用）";
+                    passTxt = "是";
                 } else {
-                    actual = hwP2P
-                        ? "P2P（NINFER_P2P=1 且硬件 peer access 可用）"
-                        : "STAGING（NINFER_P2P=1 但硬件 peer access=0，将回退 UVA-D2D）";
+                    actual = "STAGING（NINFER_P2P=1 但硬件 peer access=0，回退 UVA-D2D）";
+                    passTxt = "否（物理 P2P 不可用，实际回退 STAGING）";
                 }
-                status.Text = "选择 " + ch + "（NINFER_P2P=" + nInferP2P + "）→ 实际将走：" + actual
-                    + "；物理 P2P 能力=" + (hwP2P ? "可用" : "不可用") + "，CUDA 设备=" + count
-                    + "。serve 运行时以日志 [NInferChannel] 为准。";
-                AddLog("跨卡通道验证：选择 " + ch + "（NINFER_P2P=" + nInferP2P + "），物理 P2P=" + (hwP2P ? "可用" : "不可用") + "，实际将走 " + actual + "，CUDA 设备=" + count);
+                sb.Append("所选通道 ").Append(ch).Append("（NINFER_P2P=").Append(nInferP2P).Append("）：走通=").Append(passTxt);
+                sb.Append("；实际通道=").Append(actual);
+                sb.Append("；物理 P2P 能力=").Append(hwP2P ? "可用" : "不可用").Append("；CUDA 设备=").Append(count);
+                string serveActual = ReadServeChannel();
+                if (serveActual != null) sb.Append("；serve 运行日志实际通道：").Append(serveActual);
+                else sb.Append("；serve 尚未运行，启动后以日志 [NInferChannel] 为准");
+                AddLog("跨卡通道验证：" + sb);
+                status.Text = sb.ToString();
             } catch (Exception ex) {
                 status.Text = "跨卡通道验证失败：" + ex.Message;
                 AddLog("跨卡通道验证异常：" + ex);
             }
+        }
+
+        string ReadServeChannel() {
+            if (logs == null || !IsHandleCreated) return null;
+            string t;
+            try { t = logs.Text; } catch { return null; }
+            int idx = t.LastIndexOf("[NInferChannel]", StringComparison.Ordinal);
+            if (idx < 0) return null;
+            int eol = t.IndexOf('\n', idx);
+            return (eol > idx ? t.Substring(idx, eol - idx) : t.Substring(idx)).Trim();
         }
 
         void SwitchMode(string name) {
