@@ -449,14 +449,20 @@ namespace NInferWindows {
                 if (count < 2) { status.Text = ch + "：仅检测到 " + count + " 块显卡，无法进行跨卡通道验证"; AddLog("跨卡通道验证：CUDA 设备数 " + count); return; }
                 IntPtr d0, d1; cuDeviceGet(out d0, 0); cuDeviceGet(out d1, 1);
                 int can = 0; cuDeviceCanAccessPeer(ref can, d0, d1);
-                if (ch == "P2P") {
-                    status.Text = can == 1
-                        ? "P2P 通道连通：卡0↔卡1 peer access 可用（检测到 " + count + " 卡）"
-                        : "P2P 通道未连通：卡0↔卡1 peer access=0（NINFER_P2P=1 时实际将回退到 staging）";
+                bool hwP2P = can == 1;
+                string nInferP2P = ch == "STAGING" ? "0" : "1";
+                string actual;
+                if (ch == "STAGING") {
+                    actual = "STAGING（UVA-D2D）：NINFER_P2P=0 经代理 DLL 强制走映射主机内存通道，与物理 P2P 无关";
                 } else {
-                    status.Text = "STAGING（UVA-D2D）通道可用：软件映射路径，" + count + " 卡可通信；物理 P2P=" + (can == 1 ? "可用" : "不可用");
+                    actual = hwP2P
+                        ? "P2P（NINFER_P2P=1 且硬件 peer access 可用）"
+                        : "STAGING（NINFER_P2P=1 但硬件 peer access=0，将回退 UVA-D2D）";
                 }
-                AddLog("跨卡通道验证：选择 " + ch + "，卡0↔卡1 peer access=" + can + "，CUDA 设备=" + count);
+                status.Text = "选择 " + ch + "（NINFER_P2P=" + nInferP2P + "）→ 实际将走：" + actual
+                    + "；物理 P2P 能力=" + (hwP2P ? "可用" : "不可用") + "，CUDA 设备=" + count
+                    + "。serve 运行时以日志 [NInferChannel] 为准。";
+                AddLog("跨卡通道验证：选择 " + ch + "（NINFER_P2P=" + nInferP2P + "），物理 P2P=" + (hwP2P ? "可用" : "不可用") + "，实际将走 " + actual + "，CUDA 设备=" + count);
             } catch (Exception ex) {
                 status.Text = "跨卡通道验证失败：" + ex.Message;
                 AddLog("跨卡通道验证异常：" + ex);
