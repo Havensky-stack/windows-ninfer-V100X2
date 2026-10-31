@@ -9,6 +9,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -282,6 +283,7 @@ namespace NInferWindows {
         readonly ComboBox backend = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 155 };
         readonly ComboBox kv = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 82 };
         readonly ComboBox channel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
+        readonly Button channelCheck = new Button { Text = "验证连通", Width = 96, Height = 30 };
         readonly CheckBox thinking = new CheckBox { Text = "开启思考", Checked = true, AutoSize = true };
         readonly CheckBox graph = new CheckBox { Text = "CUDA Graph", Checked = true, AutoSize = true };
         readonly CheckBox prefix = new CheckBox { Text = "前缀复用", Checked = true, AutoSize = true };
@@ -333,6 +335,7 @@ namespace NInferWindows {
             backend.Items.AddRange(new object[] { "普通解码（默认）", "MTP（实验）", "DFlash（实验）" }); backend.SelectedIndex = 0;
             kv.Items.AddRange(new object[] { "INT8", "BF16" }); kv.SelectedIndex = 0;
             channel.Items.AddRange(new object[] { "P2P 直连（默认）", "STAGING（UVA-D2D）" }); channel.SelectedIndex = 0;
+            channelCheck.Click += (sender, args) => CheckChannel();
             optionsPanel.RowCount = 4;
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
@@ -341,7 +344,7 @@ namespace NInferWindows {
             optionsPanel.Controls.Add(OptionRow("解码", backend, "草稿数", drafts, thinking, mtpHead));
             optionsPanel.Controls.Add(OptionRow("上下文容量", context, "输出上限", outputTokens, "预填充分块", prefill, "端口（0=自动）", port));
             optionsPanel.Controls.Add(OptionRow("KV 格式", kv, "并发", concurrency, graph, prefix));
-            optionsPanel.Controls.Add(OptionRow("跨卡通道", channel));
+            optionsPanel.Controls.Add(OptionRow("跨卡通道", channel, channelCheck));
             layout.Controls.Add(Section("模型启动选项（停止服务后修改；输出上限包含思考与回答）", optionsPanel));
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill };
             actions.Controls.Add(start); actions.Controls.Add(stop); actions.Controls.Add(download); actions.Controls.Add(tcc); actions.Controls.Add(wddm); layout.Controls.Add(actions);
@@ -428,6 +431,38 @@ namespace NInferWindows {
                 channel.SelectedIndex = o.Channel == "staging" ? 1 : 0;
             } catch (Exception error) { AddLog("无法恢复保存的设置，请重新选择：" + error.Message); }
         }
+        [DllImport("nvcuda.dll")]
+        static extern int cuInit(uint flags);
+        [DllImport("nvcuda.dll")]
+        static extern int cuDeviceGetCount(ref int count);
+        [DllImport("nvcuda.dll")]
+        static extern int cuDeviceGet(out IntPtr device, int ordinal);
+        [DllImport("nvcuda.dll")]
+        static extern int cuDeviceCanAccessPeer(ref int canAccessPeer, IntPtr dev1, IntPtr dev2);
+
+        void CheckChannel() {
+            var ch = channel.SelectedIndex == 0 ? "P2P" : "STAGING";
+            try {
+                int rc = cuInit(0);
+                if (rc != 0) { status.Text = ch + " 通道验证失败：cuInit 返回 " + rc + "（CUDA 驱动不可用？）"; return; }
+                int count = 0; cuDeviceGetCount(ref count);
+                if (count < 2) { status.Text = ch + "：仅检测到 " + count + " 块显卡，无法进行跨卡通道验证"; AddLog("跨卡通道验证：CUDA 设备数 " + count); return; }
+                IntPtr d0, d1; cuDeviceGet(out d0, 0); cuDeviceGet(out d1, 1);
+                int can = 0; cuDeviceCanAccessPeer(ref can, d0, d1);
+                if (ch == "P2P") {
+                    status.Text = can == 1
+                        ? "P2P 通道连通：卡0↔卡1 peer access 可用（检测到 " + count + " 卡）"
+                        : "P2P 通道未连通：卡0↔卡1 peer access=0（NINFER_P2P=1 时实际将回退到 staging）";
+                } else {
+                    status.Text = "STAGING（UVA-D2D）通道可用：软件映射路径，" + count + " 卡可通信；物理 P2P=" + (can == 1 ? "可用" : "不可用");
+                }
+                AddLog("跨卡通道验证：选择 " + ch + "，卡0↔卡1 peer access=" + can + "，CUDA 设备=" + count);
+            } catch (Exception ex) {
+                status.Text = "跨卡通道验证失败：" + ex.Message;
+                AddLog("跨卡通道验证异常：" + ex);
+            }
+        }
+
         void SwitchMode(string name) {
             try {
                 string path = Path.Combine(runtime.Root, "tools", name);
