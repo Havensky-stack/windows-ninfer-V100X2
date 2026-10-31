@@ -18,6 +18,7 @@ using System.Windows.Forms;
 namespace NInferWindows {
     internal sealed class LaunchOptions {
         public string Backend = "none";
+        public string Channel = "p2p";
         public int Drafts = 3;
         public int Context = 131072;
         public int OutputTokens = 2048;
@@ -40,6 +41,7 @@ namespace NInferWindows {
             if (Backend == "dflash" && Concurrency != 1) throw new Exception("DFlash 多并发尚有已知错误，请使用单请求。");
             if (Backend != "none" && (Drafts < 1 || Drafts > (Backend == "mtp" ? 3 : 7))) throw new Exception("MTP 草稿数为 1–3；DFlash 为 1–7。");
             if (Kv != "int8" && Kv != "bf16") throw new Exception("KV 格式须为 int8 或 bf16。");
+            if (Channel != "p2p" && Channel != "staging") throw new Exception("跨卡通道须为 P2P 或 STAGING。");
         }
 
         internal string[] Arguments(string model, int port) {
@@ -209,10 +211,13 @@ namespace NInferWindows {
             var args = options.Arguments(model, port);
             activeOptions = options;
             Log("启动命令：ninfer-serve.exe " + string.Join(" ", args.Select(Quote)));
+            Log("跨卡通道：" + (options.Channel == "staging" ? "STAGING（UVA-D2D）" : "P2P（直连）") +
+                "（NINFER_P2P=" + (options.Channel == "staging" ? "0" : "1") + "）");
             server = new Process { StartInfo = new ProcessStartInfo(Path.Combine(Root, "bin", "ninfer-serve.exe"), string.Join(" ", args.Select(Quote))) {
                 WorkingDirectory = Path.Combine(Root, "bin"), UseShellExecute = false, CreateNoWindow = true,
                 RedirectStandardOutput = true, RedirectStandardError = true, StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
             }};
+            server.StartInfo.EnvironmentVariables["NINFER_P2P"] = options.Channel == "staging" ? "0" : "1";
             server.OutputDataReceived += (s, e) => { if (e.Data != null) Log(e.Data); };
             server.ErrorDataReceived += (s, e) => { if (e.Data != null) Log(e.Data); };
             try {
@@ -276,6 +281,7 @@ namespace NInferWindows {
         readonly NumericUpDown drafts = Number(1, 3, 3, 50, 1);
         readonly ComboBox backend = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 155 };
         readonly ComboBox kv = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 82 };
+        readonly ComboBox channel = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
         readonly CheckBox thinking = new CheckBox { Text = "开启思考", Checked = true, AutoSize = true };
         readonly CheckBox graph = new CheckBox { Text = "CUDA Graph", Checked = true, AutoSize = true };
         readonly CheckBox prefix = new CheckBox { Text = "前缀复用", Checked = true, AutoSize = true };
@@ -311,7 +317,7 @@ namespace NInferWindows {
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
-            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 174));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 218));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
@@ -326,12 +332,16 @@ namespace NInferWindows {
             modelRow.Controls.Add(model); modelRow.Controls.Add(browse); layout.Controls.Add(modelRow);
             backend.Items.AddRange(new object[] { "普通解码（默认）", "MTP（实验）", "DFlash（实验）" }); backend.SelectedIndex = 0;
             kv.Items.AddRange(new object[] { "INT8", "BF16" }); kv.SelectedIndex = 0;
+            channel.Items.AddRange(new object[] { "P2P 直连（默认）", "STAGING（UVA-D2D）" }); channel.SelectedIndex = 0;
+            optionsPanel.RowCount = 4;
+            optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.Controls.Add(OptionRow("解码", backend, "草稿数", drafts, thinking, mtpHead));
             optionsPanel.Controls.Add(OptionRow("上下文容量", context, "输出上限", outputTokens, "预填充分块", prefill, "端口（0=自动）", port));
             optionsPanel.Controls.Add(OptionRow("KV 格式", kv, "并发", concurrency, graph, prefix));
+            optionsPanel.Controls.Add(OptionRow("跨卡通道", channel));
             layout.Controls.Add(Section("模型启动选项（停止服务后修改；输出上限包含思考与回答）", optionsPanel));
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill };
             actions.Controls.Add(start); actions.Controls.Add(stop); actions.Controls.Add(download); actions.Controls.Add(tcc); actions.Controls.Add(wddm); layout.Controls.Add(actions);
@@ -399,6 +409,7 @@ namespace NInferWindows {
             return new LaunchOptions { Backend = new[] { "none", "mtp", "dflash" }[backend.SelectedIndex], Drafts = (int)drafts.Value,
                 Context = (int)context.Value, OutputTokens = (int)outputTokens.Value, PrefillChunk = (int)prefill.Value, Port = (int)port.Value,
                 Concurrency = (int)concurrency.Value, Kv = kv.SelectedIndex == 0 ? "int8" : "bf16", Thinking = thinking.Checked,
+                Channel = channel.SelectedIndex == 0 ? "p2p" : "staging",
                 Graph = graph.Checked, PrefixReuse = prefix.Checked, OptimizedMtpHead = mtpHead.Checked };
         }
         void SaveSettings() {
@@ -414,6 +425,7 @@ namespace NInferWindows {
                 drafts.Value = o.Drafts; context.Value = o.Context; outputTokens.Value = o.OutputTokens; prefill.Value = o.PrefillChunk;
                 port.Value = o.Port; concurrency.Value = o.Concurrency; kv.SelectedIndex = o.Kv == "int8" ? 0 : 1;
                 thinking.Checked = o.Thinking; graph.Checked = o.Graph; prefix.Checked = o.PrefixReuse; mtpHead.Checked = o.OptimizedMtpHead;
+                channel.SelectedIndex = o.Channel == "staging" ? 1 : 0;
             } catch (Exception error) { AddLog("无法恢复保存的设置，请重新选择：" + error.Message); }
         }
         void SwitchMode(string name) {
@@ -463,9 +475,9 @@ namespace NInferWindows {
                     }
                     return 0;
                 }
-                if (args.Length == 4 && args[0] == "--smoke") {
+                if (args.Length >= 4 && args[0] == "--smoke") {
                     using (var runtime = new Runtime(AppDomain.CurrentDomain.BaseDirectory, line => File.AppendAllText(args[2], line + "\n"))) {
-                        var options = new LaunchOptions { Backend = args[3], Context = 4096, OutputTokens = 512, Drafts = args[3] == "dflash" ? 7 : 3 };
+                        var options = new LaunchOptions { Backend = args[3], Context = 4096, OutputTokens = 512, Drafts = args[3] == "dflash" ? 7 : 3, Channel = args.Length >= 5 ? (args[4] == "staging" ? "staging" : "p2p") : "p2p" };
                         runtime.StartAsync(args[1], options, CancellationToken.None).GetAwaiter().GetResult();
                         var answer = runtime.ChatAsync("Reply in Chinese with one short sentence: what is 2 plus 2?", CancellationToken.None).GetAwaiter().GetResult();
                         if (string.IsNullOrWhiteSpace(answer)) throw new Exception("No answer returned");
@@ -475,7 +487,7 @@ namespace NInferWindows {
                 }
                 Application.Run(new Launcher()); return 0;
             } catch (Exception error) {
-                if (args.Length == 4 && args[0] == "--smoke") File.AppendAllText(args[2], error.ToString());
+                if (args.Length >= 4 && args[0] == "--smoke") File.AppendAllText(args[2], error.ToString());
                 else MessageBox.Show(error.Message, "NInfer 启动失败");
                 return 1;
             }
