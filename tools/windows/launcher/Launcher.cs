@@ -277,7 +277,7 @@ namespace NInferWindows {
         readonly NumericUpDown context = Number(1024, 262144, 131072, 108, 1024);
         readonly NumericUpDown outputTokens = Number(16, 262144, 2048, 90, 256);
         readonly NumericUpDown prefill = Number(128, 1024, 256, 72, 128);
-        readonly NumericUpDown port = Number(0, 65535, 0, 78, 1);
+        readonly NumericUpDown port = Number(0, 65535, 6666, 78, 1);
         readonly NumericUpDown concurrency = Number(1, 8, 1, 50, 1);
         readonly NumericUpDown drafts = Number(1, 3, 3, 50, 1);
         readonly ComboBox backend = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 155 };
@@ -293,8 +293,8 @@ namespace NInferWindows {
         readonly Button wddm = new Button { Text = "恢复 WDDM", AutoSize = true };
         readonly TextBox prompt = new TextBox { Multiline = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical };
         readonly TextBox answer = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical };
-        readonly TextBox logs = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical };
         readonly Label status = new Label { AutoSize = true, Text = "正在检查环境…", Padding = new Padding(0, 8, 0, 8) };
+        readonly Button logsButton = new Button { Text = "运行日志", AutoSize = true };
         readonly TextBox address = new TextBox { ReadOnly = true, Width = 330, Text = "服务启动后显示 API 地址" };
         readonly Button start = new Button { Text = "启动模型", AutoSize = true };
         readonly Button stop = new Button { Text = "停止 / 取消", AutoSize = true };
@@ -302,6 +302,7 @@ namespace NInferWindows {
         readonly Button download = new Button { Text = "下载推荐模型（23.8 GB）", AutoSize = true };
         readonly Button browse = new Button { Text = "选择本地模型…", AutoSize = true };
         readonly Runtime runtime;
+        Form logWindow; TextBox logWinText;
         CancellationTokenSource operation = new CancellationTokenSource();
         readonly string settings = Path.Combine(Runtime.StateDir, "settings.json");
         readonly object logLock = new object();
@@ -315,7 +316,7 @@ namespace NInferWindows {
                 (appVersion.Major == 0 && appVersion.Minor == 0 ? "源码构建" : appVersion.ToString(3) + " 预览版");
             Font = new Font("Microsoft YaHei UI", 10); Size = new Size(1100, 960); MinimumSize = new Size(1060, 900);
             StartPosition = FormStartPosition.CenterScreen;
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 10 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20), ColumnCount = 1, RowCount = 9 };
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
@@ -324,8 +325,7 @@ namespace NInferWindows {
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 90));
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 55));
-            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 45));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
             Controls.Add(layout);
             layout.Controls.Add(new Label { Text = "本地运行 Qwen · 双 V100 · 无需开发环境", Font = new Font(Font.FontFamily, 17, FontStyle.Bold), AutoSize = true });
             layout.Controls.Add(new Label { Text = "默认普通解码与思考开启；MTP / DFlash 为实验功能，严格校验仍有 1/64 差异。\r\nDFlash 建议 96K / 单请求；容量不代表占用。WDDM 小消息优化自动启用，TCC 不保证 P2P。", AutoSize = true });
@@ -336,25 +336,26 @@ namespace NInferWindows {
             kv.Items.AddRange(new object[] { "INT8", "BF16" }); kv.SelectedIndex = 0;
             channel.Items.AddRange(new object[] { "P2P 直连（默认）", "STAGING（UVA-D2D）" }); channel.SelectedIndex = 0;
             channelCheck.Click += (sender, args) => CheckChannel();
+            port.Enabled = false;   // 固定 API 端口 6666，外部地址 http://127.0.0.1:6666/v1 不变
             optionsPanel.RowCount = 4;
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
             optionsPanel.Controls.Add(OptionRow("解码", backend, "草稿数", drafts, thinking, mtpHead));
-            optionsPanel.Controls.Add(OptionRow("上下文容量", context, "输出上限", outputTokens, "预填充分块", prefill, "端口（0=自动）", port));
+            optionsPanel.Controls.Add(OptionRow("上下文容量", context, "输出上限", outputTokens, "预填充分块", prefill, "端口（固定6666）", port));
             optionsPanel.Controls.Add(OptionRow("KV 格式", kv, "并发", concurrency, graph, prefix));
             optionsPanel.Controls.Add(OptionRow("跨卡通道", channel, channelCheck));
             layout.Controls.Add(Section("模型启动选项（停止服务后修改；输出上限包含思考与回答）", optionsPanel));
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill };
-            actions.Controls.Add(start); actions.Controls.Add(stop); actions.Controls.Add(download); actions.Controls.Add(tcc); actions.Controls.Add(wddm); layout.Controls.Add(actions);
+            actions.Controls.Add(start); actions.Controls.Add(stop); actions.Controls.Add(download); actions.Controls.Add(tcc); actions.Controls.Add(wddm); actions.Controls.Add(logsButton); layout.Controls.Add(actions);
             layout.Controls.Add(status);
             var api = new FlowLayoutPanel { Dock = DockStyle.Fill };
             var copy = new Button { Text = "复制 API 地址", AutoSize = true };
             copy.Click += (s, e) => { if (runtime.Endpoint != null) Clipboard.SetText(runtime.Endpoint + "/v1"); };
             api.Controls.Add(address); api.Controls.Add(copy); api.Controls.Add(send); layout.Controls.Add(api);
             prompt.Text = "用中文简单介绍一下你能帮助我做什么。";
-            layout.Controls.Add(Section("输入问题", prompt)); layout.Controls.Add(Section("回答（每次独立问答）", answer)); layout.Controls.Add(Section("运行日志", logs));
+            layout.Controls.Add(Section("输入问题", prompt)); layout.Controls.Add(Section("回答（每次独立问答）", answer));
             backend.SelectedIndexChanged += (s, e) => {
                 drafts.Maximum = backend.SelectedIndex == 2 ? 7 : 3;
                 drafts.Value = drafts.Maximum;
@@ -390,6 +391,7 @@ namespace NInferWindows {
             };
             tcc.Click += (s, e) => SwitchMode("enable-tcc.cmd");
             wddm.Click += (s, e) => SwitchMode("restore-wddm.cmd");
+            logsButton.Click += (s, e) => OpenLogWindow();
             if (!preview) Shown += async (s, e) => await Work(async token => { AddLog(await runtime.CheckAsync()); status.Text = "环境就绪 · 选择模型后启动，或下载推荐模型"; });
             else status.Text = "选择本地模型，或点击“下载推荐模型”；启动前可调整以上选项。";
             FormClosing += (s, e) => { if (!preview) SaveSettings(); operation.Cancel(); runtime.Stop(); };
@@ -410,7 +412,7 @@ namespace NInferWindows {
         }
         LaunchOptions ReadOptions() {
             return new LaunchOptions { Backend = new[] { "none", "mtp", "dflash" }[backend.SelectedIndex], Drafts = (int)drafts.Value,
-                Context = (int)context.Value, OutputTokens = (int)outputTokens.Value, PrefillChunk = (int)prefill.Value, Port = (int)port.Value,
+                Context = (int)context.Value, OutputTokens = (int)outputTokens.Value, PrefillChunk = (int)prefill.Value, Port = 6666,
                 Concurrency = (int)concurrency.Value, Kv = kv.SelectedIndex == 0 ? "int8" : "bf16", Thinking = thinking.Checked,
                 Channel = channel.SelectedIndex == 0 ? "p2p" : "staging",
                 Graph = graph.Checked, PrefixReuse = prefix.Checked, OptimizedMtpHead = mtpHead.Checked };
@@ -426,7 +428,7 @@ namespace NInferWindows {
                 var o = saved.Options; o.Validate(); model.Text = saved.Model;
                 backend.SelectedIndex = Array.IndexOf(new[] { "none", "mtp", "dflash" }, o.Backend);
                 drafts.Value = o.Drafts; context.Value = o.Context; outputTokens.Value = o.OutputTokens; prefill.Value = o.PrefillChunk;
-                port.Value = o.Port; concurrency.Value = o.Concurrency; kv.SelectedIndex = o.Kv == "int8" ? 0 : 1;
+                concurrency.Value = o.Concurrency; kv.SelectedIndex = o.Kv == "int8" ? 0 : 1;
                 thinking.Checked = o.Thinking; graph.Checked = o.Graph; prefix.Checked = o.PrefixReuse; mtpHead.Checked = o.OptimizedMtpHead;
                 channel.SelectedIndex = o.Channel == "staging" ? 1 : 0;
             } catch (Exception error) { AddLog("无法恢复保存的设置，请重新选择：" + error.Message); }
@@ -478,13 +480,15 @@ namespace NInferWindows {
         }
 
         string ReadServeChannel() {
-            if (logs == null || !IsHandleCreated) return null;
-            string t;
-            try { t = logs.Text; } catch { return null; }
-            int idx = t.LastIndexOf("[NInferChannel]", StringComparison.Ordinal);
-            if (idx < 0) return null;
-            int eol = t.IndexOf('\n', idx);
-            return (eol > idx ? t.Substring(idx, eol - idx) : t.Substring(idx)).Trim();
+            try {
+                string path = Path.Combine(Runtime.StateDir, "launcher.log");
+                if (!File.Exists(path)) return null;
+                string t = File.ReadAllText(path, Encoding.UTF8);
+                int idx = t.LastIndexOf("[NInferChannel]", StringComparison.Ordinal);
+                if (idx < 0) return null;
+                int eol = t.IndexOf('\n', idx);
+                return (eol > idx ? t.Substring(idx, eol - idx) : t.Substring(idx)).Trim();
+            } catch { return null; }
         }
 
         void SwitchMode(string name) {
@@ -515,8 +519,20 @@ namespace NInferWindows {
         void AddLog(string message) {
             lock (logLock) { File.AppendAllText(Path.Combine(Runtime.StateDir, "launcher.log"), message + Environment.NewLine, Encoding.UTF8); }
             if (IsDisposed || !IsHandleCreated) return;
-            try { BeginInvoke((Action)(() => { if (logs.TextLength > 100000) logs.Clear(); logs.AppendText(message + Environment.NewLine); })); }
+            try { BeginInvoke((Action)(() => { if (logWindow != null && !logWindow.IsDisposed && logWinText != null) { if (logWinText.TextLength > 200000) logWinText.Clear(); logWinText.AppendText(message + Environment.NewLine); logWinText.SelectionStart = logWinText.TextLength; logWinText.ScrollToCaret(); } })); }
             catch (InvalidOperationException) { }
+        }
+        void OpenLogWindow() {
+            if (logWindow != null && !logWindow.IsDisposed) { logWindow.Activate(); return; }
+            logWinText = new TextBox { Multiline = true, ReadOnly = true, Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical, Font = new Font("Consolas", 9) };
+            logWindow = new Form { Text = "NInfer 运行日志监视", Width = 900, Height = 560, StartPosition = FormStartPosition.CenterScreen, Font = Font };
+            logWindow.Controls.Add(logWinText);
+            try {
+                string path = Path.Combine(Runtime.StateDir, "launcher.log");
+                if (File.Exists(path)) { logWinText.Text = File.ReadAllText(path, Encoding.UTF8); logWinText.SelectionStart = logWinText.TextLength; logWinText.ScrollToCaret(); }
+            } catch { }
+            logWindow.FormClosed += (s, e) => { logWinText = null; logWindow = null; };
+            logWindow.Show(this);
         }
     }
 
